@@ -5,7 +5,7 @@ from .environment import InverseKinematicsEnv
 from .mappo import MAPPOAgent
 
 # Import the reward functions for computing position and orientation rewards
-from .reward_function import compute_combined_reward
+from .reward_function import compute_reward, compute_cosine_distance
 
 
 

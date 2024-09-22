@@ -2,214 +2,88 @@ import numpy as np
 
 def compute_position_error(current_position, target_position):
     """
-    Computes the Euclidean distance (L2 norm) between the current and target positions.
+    Computes the Euclidean distance between the current and target positions.
 
     Args:
         current_position (np.array): The current position of the end-effector.
         target_position (np.array): The target position of the end-effector.
 
     Returns:
-        float: The position error.
+        float: The Euclidean distance.
     """
     return np.linalg.norm(current_position - target_position)
 
-def compute_orientation_error(current_orientation, target_orientation):
+def compute_cosine_distance(current_orientation, target_orientation):
     """
-    Computes the angular difference between the current and target orientations using quaternions.
+    Computes the cosine distance between two orientations represented as quaternions.
 
     Args:
-        current_orientation (np.array): The current orientation quaternion.
-        target_orientation (np.array): The target orientation quaternion.
+        current_orientation (np.array): Current orientation quaternion [w, x, y, z].
+        target_orientation (np.array): Target orientation quaternion [w, x, y, z].
 
     Returns:
-        float: The orientation error in radians.
+        float: Cosine distance, adjusted to range [1, 3].
     """
-    dot_product = np.clip(np.abs(np.dot(current_orientation, target_orientation)), -1.0, 1.0)
-    return 2 * np.arccos(dot_product)
+    # Compute the dot product between the quaternions
+    dot_product = np.clip(np.dot(current_orientation, target_orientation), -1.0, 1.0)
+    cosine_similarity = dot_product
 
-def compute_joint_error(current_joint_angles, target_joint_angles):
+    # Cosine distance
+    cosine_distance = 1 - cosine_similarity  # Range [0, 2]
+    cosine_distance += 1  # Adjust to range [1, 3]
+
+    return cosine_distance
+
+def compute_overall_distance(current_position, target_position, current_orientation, target_orientation):
     """
-    Computes the absolute difference between the current and target joint angles.
+    Computes the overall distance combining Euclidean and cosine distances.
+
+    Returns:
+        float: The overall distance.
+    """
+    # Euclidean (Gaussian) distance between positions
+    euclidean_distance = compute_position_error(current_position, target_position)
+
+    # Cosine distance between orientations
+    cosine_distance = compute_cosine_distance(current_orientation, target_orientation)
+
+    # Compute offset b
+    b = cosine_distance - 1  # Range [0, 2]
+
+    # Compute overall distance
+    overall_distance = euclidean_distance * cosine_distance + b
+
+    return overall_distance
+
+def compute_reward(distance, begin_distance, prev_best, success_threshold=0.006):
+    """
+    Computes the reward or punishment based on the current distance.
 
     Args:
-        current_joint_angles (np.array): Current joint angles.
-        target_joint_angles (np.array): Target joint angles.
+        distance (float): The current overall distance.
+        begin_distance (float): The initial overall distance at the start of the iteration.
+        prev_best (float): The closest distance achieved so far in the iteration.
+        success_threshold (float): The distance threshold for success.
 
     Returns:
-        np.array: The joint angle errors.
+        tuple:
+            reward (float): The computed reward or punishment.
+            prev_best (float): Updated closest distance.
+            success (bool): Indicates if the target was reached.
     """
-    return np.abs(current_joint_angles - target_joint_angles)
+    success = False
 
-def smooth_reward(new_reward, previous_reward, smoothing_factor=0.9):
-    """
-    Applies exponential smoothing to the reward to reduce fluctuations.
-
-    Args:
-        new_reward (float): The new computed reward.
-        previous_reward (float): The previous smoothed reward.
-        smoothing_factor (float): Weight for the previous reward (default is 0.9).
-
-    Returns:
-        float: Smoothed reward.
-    """
-    return smoothing_factor * previous_reward + (1 - smoothing_factor) * new_reward
-
-def compute_joint_limit_penalty(joint_angles, joint_limits):
-    """
-    Computes a penalty for joint limit violations.
-
-    Args:
-        joint_angles (np.array): Current joint angles.
-        joint_limits (list): List of tuples representing joint limits (min, max) for each joint.
-
-    Returns:
-        float: The total penalty for joint limit violations.
-    """
-    penalty = 0.0
-    for angle, (min_limit, max_limit) in zip(joint_angles, joint_limits):
-        if angle < min_limit or angle > max_limit:
-            penalty += 0.5  # Arbitrary penalty value for joint limit violations
-    return penalty
-
-
-def compute_combined_reward(
-    current_position,
-    target_position,
-    current_orientation,
-    target_orientation,
-    current_joint_angles,
-    target_joint_angles,
-    joint_limits,
-    previous_joint_angles,
-    iteration,
-    position_weight=0,
-    orientation_weight=0,
-    joint_weight=1,
-    smoothness_weight=0,
-    joint_limit_penalty_weight=0,
-    success_bonus=5.0,
-    max_reward=1.0,
-    min_reward=0.0
-):
-    """
-    Computes the total reward by combining position, orientation, and joint errors,
-    and applies penalties for joint limit violations and large joint movements.
-
-    Returns:
-        tuple: (total_reward, position_error, orientation_error, joint_error, success)
-    """
-    # Compute errors
-    position_error = compute_position_error(current_position, target_position)
-    orientation_error = compute_orientation_error(current_orientation, target_orientation)
-    joint_error = compute_joint_error(current_joint_angles, target_joint_angles)
-
-    # Calculate negative errors as rewards
-    position_reward = -position_error
-    orientation_reward = -orientation_error
-    joint_reward = -np.mean(joint_error)
-
-    # Smoothness penalty
-    if previous_joint_angles is not None:
-        smoothness_penalty = np.mean(np.abs(current_joint_angles - previous_joint_angles))
+    if distance > prev_best:
+        # The agent moved away from the target, apply punishment
+        reward = prev_best - distance  # Negative value
     else:
-        smoothness_penalty = 0.0
+        # The agent moved closer to the target, provide reward
+        reward = begin_distance - distance
+        prev_best = distance  # Update prev_best
 
-    # Compute joint limit penalty
-    joint_limit_penalty = 0.0
-    for angle, (min_limit, max_limit) in zip(current_joint_angles, joint_limits):
-        if angle < min_limit:
-            penalty = joint_limit_penalty_weight * (min_limit - angle)
-            joint_limit_penalty += penalty
-        elif angle > max_limit:
-            penalty = joint_limit_penalty_weight * (angle - max_limit)
-            joint_limit_penalty += penalty
+    # Check if the agent has reached the target
+    if distance <= success_threshold:
+        reward = 2.0 + (success_threshold - distance) * 1000
+        success = True
 
-    # Total reward computation
-    total_reward = (
-        position_weight * position_reward +
-        orientation_weight * orientation_reward +
-        joint_weight * joint_reward -
-        smoothness_weight * smoothness_penalty -
-        joint_limit_penalty  # Subtract joint limit penalty
-    )
-
-    # Success condition with thresholds
-    position_threshold = 0.05  # Adjust as needed
-    orientation_threshold = 0.2  # Adjust as needed
-    joint_threshold = 0.05  # Adjust as needed
-
-    success = (
-        position_error < position_threshold and
-        orientation_error < orientation_threshold and
-        np.all(joint_error < joint_threshold)
-    )
-
-    # Apply success bonus
-    if success:
-        total_reward += success_bonus
-
-    # Clip total reward
-    total_reward = np.clip(total_reward, min_reward, max_reward)
-
-    return total_reward, position_error, orientation_error, joint_error, success
-
-
-
-def calculate_joint_contribution(joint_idx, position_error, orientation_error):
-    """
-    Calculates the contribution of a specific joint based on the position and orientation errors.
-
-    Args:
-        joint_idx (int): Index of the joint.
-        position_error (np.array): The position error of the end-effector.
-        orientation_error (np.array): The orientation error of the end-effector.
-
-    Returns:
-        float: Contribution of the joint to the overall error.
-    """
-    contribution = -np.linalg.norm(position_error) - np.linalg.norm(orientation_error)
-    return contribution
-
-
-def calculate_joint_limit_penalty(joint_idx, joint_angles, joint_limits):
-    """
-    Calculates a penalty if a specific joint is near its limit.
-
-    Args:
-        joint_idx (int): Index of the joint.
-        joint_angles (np.array): Array of current joint angles.
-        joint_limits (list of tuples): List of joint limits [(lower_limit, upper_limit)] for each joint.
-
-    Returns:
-        float: Penalty if the joint is near its limits.
-    """
-    joint_angle = joint_angles[joint_idx]
-    lower_limit, upper_limit = joint_limits[joint_idx]
-    
-    # Penalty if the joint angle is outside its limit
-    penalty = max(0, joint_angle - upper_limit) + max(0, lower_limit - joint_angle)
-    return penalty
-
-
-def calculate_joint_smoothness(joint_idx, joint_angles, previous_joint_angles):
-    """
-    Calculates a smoothness penalty for a specific joint, penalizing large changes in joint angle.
-
-    Args:
-        joint_idx (int): Index of the joint.
-        joint_angles (np.array): Array of current joint angles.
-        previous_joint_angles (np.array): Array of previous joint angles.
-
-    Returns:
-        float: Smoothness penalty based on the difference between the current and previous joint angles.
-    """
-    if previous_joint_angles is None:
-        return 0  # No penalty for the first step
-
-    current_angle = joint_angles[joint_idx]
-    previous_angle = previous_joint_angles[joint_idx]
-    
-    smoothness_penalty = np.abs(current_angle - previous_angle)
-    return smoothness_penalty
-
-
+    return reward, prev_best, success

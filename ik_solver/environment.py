@@ -2,13 +2,16 @@ import gym
 import pybullet as p
 import pybullet_data
 import numpy as np
-from ik_solver.reward_function import (
-    compute_combined_reward, 
-    calculate_joint_contribution, 
-    calculate_joint_limit_penalty, 
-    calculate_joint_smoothness
-)
+import logging
 
+from .reward_function import (
+    compute_position_error,
+    compute_cosine_distance,
+    compute_overall_distance,
+    compute_reward
+)
+# Set up basic logging configuration
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 class InverseKinematicsEnv(gym.Env):
     """
     Custom environment for inverse kinematics control of a robotic arm in PyBullet.
@@ -82,6 +85,8 @@ class InverseKinematicsEnv(gym.Env):
         self.max_episode_steps = max_episode_steps
         self.position_threshold = 0.01  # Define appropriate value
         self.orientation_threshold = 0.1  # Define appropriate value in radians
+        # Set the success threshold for the distance
+        self.success_threshold = 0.01  # Adjust this value as needed
         print(f"Number of joints in the robot: {self.num_joints}")
 
 
@@ -94,7 +99,9 @@ class InverseKinematicsEnv(gym.Env):
             list: A list of observations for each agent.
         """
         # Reset joint angles to random values within joint limits
-        self.joint_angles = np.array([np.random.uniform(limit[0], limit[1]) for limit in self.joint_limits])
+        self.joint_angles = np.array([
+            np.random.uniform(limit[0], limit[1]) for limit in self.joint_limits
+        ])
         for i, angle in zip(self.joint_indices, self.joint_angles):
             p.resetJointState(self.robot_id, i, angle)
 
@@ -102,23 +109,49 @@ class InverseKinematicsEnv(gym.Env):
         self.previous_joint_angles = np.copy(self.joint_angles)
 
         # Generate a new random target pose for the end-effector
-        self.target_position = np.random.uniform([0.1, 0.1, 0.1], [0.5, 0.5, 0.5])
-        self.target_orientation = p.getQuaternionFromEuler(np.random.uniform(-np.pi, np.pi, 3))
+        # Ensure the target is within reachable workspace
+        self.target_position = np.random.uniform(
+            [0.1, -0.5, 0.1], [0.5, 0.5, 0.5]
+        )
+        # Random target orientation as a quaternion
+        random_euler = np.random.uniform(-np.pi, np.pi, 3)
+        self.target_orientation = p.getQuaternionFromEuler(random_euler)
 
-        # Set target joint angles to random values (within limits) or predefined angles
-        self.target_joint_angles = np.array([np.random.uniform(limit[0], limit[1]) for limit in self.joint_limits])
+        # Optionally, visualize the target position in the simulation
+        if hasattr(self, 'target_marker'):
+            p.removeBody(self.target_marker)
+        self.target_marker = p.loadURDF(
+            "sphere_small.urdf",
+            self.target_position,
+            globalScaling=0.05,
+            useFixedBase=True
+        )
 
         # Reset step counter
         self.current_step = 0
 
-        # Compute initial position and orientation errors
+        # Get the current end-effector pose
         self.current_position, self.current_orientation = self.get_current_pose()
+
+        # Compute initial position and orientation errors
         self.position_error = self.current_position - self.target_position
-        self.orientation_error = self.compute_orientation_difference(self.current_orientation, self.target_orientation)
+        self.orientation_error = self.compute_orientation_difference(
+            self.current_orientation, self.target_orientation
+        )
+
+        # Compute the initial overall distance
+        self.begin_distance = compute_overall_distance(
+            current_position=self.current_position,
+            target_position=self.target_position,
+            current_orientation=self.current_orientation,
+            target_orientation=self.target_orientation
+        )
+
+        # Initialize prev_best with a large value or begin_distance
+        self.prev_best = float('inf')  # or self.begin_distance
 
         # Return the initial observations for all agents
         return self.get_all_agent_observations()
-
 
     def step(self, actions):
         # Apply the actions and step the simulation
@@ -128,27 +161,185 @@ class InverseKinematicsEnv(gym.Env):
 
         p.stepSimulation()
 
+        # Update current step
+        self.current_step += 1
+
         # Get the current state
         self.joint_angles = np.array([p.getJointState(self.robot_id, i)[0] for i in range(self.num_joints)])
         current_position, current_orientation = self.get_current_pose()
-        position_error = current_position - self.target_position
-        orientation_error = self.compute_orientation_difference(current_orientation, self.target_orientation)
+        self.position_error = current_position - self.target_position
+        self.orientation_error = self.compute_orientation_difference(
+            current_orientation, self.target_orientation
+        )
 
+        # Compute the overall distance
+        euclidean_distance = compute_position_error(current_position, self.target_position)
+        cosine_distance = compute_cosine_distance(current_orientation, self.target_orientation)
+        b = cosine_distance - 1
+        distance = euclidean_distance * cosine_distance + b
+
+        # Compute the overall reward
+        if distance > self.prev_best:
+            overall_reward = self.prev_best - distance  # Punishment
+        else:
+            overall_reward = self.begin_distance - distance  # Reward
+            self.prev_best = distance
+
+        if distance <= self.success_threshold:
+            overall_reward = 2.0 + (self.success_threshold - distance) * 1000
+            success = True
+        else:
+            success = False
+
+        # Compute the Jacobian matrices
+        zero_vec = [0.0] * self.num_joints
+        jacobian_linear, jacobian_angular = p.calculateJacobian(
+            bodyUniqueId=self.robot_id,
+            linkIndex=self.joint_indices[-1],
+            localPosition=[0, 0, 0],
+            objPositions=self.joint_angles.tolist(),
+            objVelocities=zero_vec,
+            objAccelerations=zero_vec
+        )
+
+        jacobian_linear = np.array(jacobian_linear)  # Shape: (3, num_joints)
+        jacobian_angular = np.array(jacobian_angular)  # Shape: (3, num_joints)
+
+        # Compute normalized errors
+        delta_position = current_position - self.target_position
+        delta_position_norm = delta_position / (np.linalg.norm(delta_position) + 1e-8)
+
+        delta_orientation = self.orientation_error
+        delta_orientation_norm = delta_orientation / (np.linalg.norm(delta_orientation) + 1e-8)
+
+        # Compute gradients
+        grad_position = jacobian_linear.T @ delta_position_norm  # Shape: (num_joints,)
+        grad_orientation = jacobian_angular.T @ delta_orientation_norm  # Shape: (num_joints,)
+
+        grad_total = grad_position + grad_orientation
+        grad_norm = np.linalg.norm(grad_total) + 1e-8
+
+        # Assign individual rewards and compute joint errors
         rewards = []
+        joint_errors = []
         for i in range(self.num_joints):
-            # Call the method using self
-            joint_contribution = calculate_joint_contribution(joint_idx=i, position_error=position_error, orientation_error=orientation_error)
-            joint_limit_penalty = calculate_joint_limit_penalty(joint_idx=i, joint_angles=self.joint_angles, joint_limits=self.joint_limits)
-            joint_smoothness = calculate_joint_smoothness(joint_idx=i, joint_angles=self.joint_angles, previous_joint_angles=self.previous_joint_angles)
-
-            # Individual joint reward
-            joint_reward = joint_contribution - joint_limit_penalty - joint_smoothness
+            joint_contribution = -grad_total[i] / grad_norm
+            joint_reward = overall_reward * joint_contribution
             rewards.append(joint_reward)
 
-        done = self.current_step >= self.max_episode_steps or self.is_success(position_error, orientation_error)
+            # Compute joint error (absolute difference in joint angles)
+            joint_error = abs(self.joint_angles[i] - self.previous_joint_angles[i])
+            joint_errors.append(joint_error)
+
+            # Log the error and reward for each joint
+            logging.info(f"Step {self.current_step}, Joint {i} - Error: {joint_error:.6f}, Reward: {joint_reward:.6f}")
+
+        # Update previous joint angles
+        self.previous_joint_angles = np.copy(self.joint_angles)
+
+        # Update the done flag
+        done = self.current_step >= self.max_episode_steps or success
+
+        # Get observations
+        observations = self.get_all_agent_observations()
+
+        # Store joint errors for access in the training loop
+        self.joint_errors = joint_errors
+
+        return observations, rewards, done, {}
+    def step(self, actions):
+        # Apply the actions and step the simulation
+        for i, action in enumerate(actions):
+            action = np.clip(action, self.joint_limits[i][0], self.joint_limits[i][1])
+            p.setJointMotorControl2(self.robot_id, i, p.POSITION_CONTROL, targetPosition=action)
+
+        p.stepSimulation()
+
+        # Update current step
         self.current_step += 1
 
+        # Get the current state
+        self.joint_angles = np.array([p.getJointState(self.robot_id, i)[0] for i in range(self.num_joints)])
+        current_position, current_orientation = self.get_current_pose()
+        self.position_error = current_position - self.target_position
+        self.orientation_error = self.compute_orientation_difference(
+            current_orientation, self.target_orientation
+        )
+
+        # Compute the overall distance
+        euclidean_distance = compute_position_error(current_position, self.target_position)
+        cosine_distance = compute_cosine_distance(current_orientation, self.target_orientation)
+        b = cosine_distance - 1
+        distance = euclidean_distance * cosine_distance + b
+
+        # Compute the overall reward
+        if distance > self.prev_best:
+            overall_reward = self.prev_best - distance  # Punishment
+        else:
+            overall_reward = self.begin_distance - distance  # Reward
+            self.prev_best = distance
+
+        if distance <= self.success_threshold:
+            overall_reward = 2.0 + (self.success_threshold - distance) * 5000
+            success = True
+        else:
+            success = False
+
+        # Compute the Jacobian matrices
+        zero_vec = [0.0] * self.num_joints
+        jacobian_linear, jacobian_angular = p.calculateJacobian(
+            bodyUniqueId=self.robot_id,
+            linkIndex=self.joint_indices[-1],
+            localPosition=[0, 0, 0],
+            objPositions=self.joint_angles.tolist(),
+            objVelocities=zero_vec,
+            objAccelerations=zero_vec
+        )
+
+        jacobian_linear = np.array(jacobian_linear)  # Shape: (3, num_joints)
+        jacobian_angular = np.array(jacobian_angular)  # Shape: (3, num_joints)
+
+        # Compute normalized errors
+        delta_position = current_position - self.target_position
+        delta_position_norm = delta_position / (np.linalg.norm(delta_position) + 1e-8)
+
+        delta_orientation = self.orientation_error
+        delta_orientation_norm = delta_orientation / (np.linalg.norm(delta_orientation) + 1e-8)
+
+        # Compute gradients
+        grad_position = jacobian_linear.T @ delta_position_norm  # Shape: (num_joints,)
+        grad_orientation = jacobian_angular.T @ delta_orientation_norm  # Shape: (num_joints,)
+
+        grad_total = grad_position + grad_orientation
+        grad_norm = np.linalg.norm(grad_total) + 1e-8
+
+        # Assign individual rewards and compute joint errors
+        rewards = []
+        joint_errors = []
+        for i in range(self.num_joints):
+            joint_contribution = -grad_total[i] / grad_norm
+            joint_reward = overall_reward * joint_contribution
+            rewards.append(joint_reward)
+
+            # Compute joint error (absolute difference in joint angles)
+            joint_error = abs(self.joint_angles[i] - self.previous_joint_angles[i])
+            joint_errors.append(joint_error)
+
+            # Log the error and reward for each joint
+            logging.info(f"Step {self.current_step}, Joint {i} - Error: {joint_error:.6f}, Reward: {joint_reward:.6f}")
+
+        # Update previous joint angles
+        self.previous_joint_angles = np.copy(self.joint_angles)
+
+        # Update the done flag
+        done = self.current_step >= self.max_episode_steps or success
+
+        # Get observations
         observations = self.get_all_agent_observations()
+
+        # Store joint errors for access in the training loop
+        self.joint_errors = joint_errors
+
         return observations, rewards, done, {}
 
 

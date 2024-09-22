@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from collections import deque
 
 # Assuming compute_combined_reward and TrainingMetrics are defined elsewhere
-from .reward_function import compute_combined_reward
+from .reward_function import compute_reward, compute_cosine_distance, compute_overall_distance, compute_position_error
 from .training_metrics import TrainingMetrics
 
 class JointActor(nn.Module):
@@ -264,66 +264,45 @@ class MAPPOAgent:
             done = False
             step = 0
             total_rewards = [[] for _ in range(self.num_agents)]  # Store rewards per joint
-            total_joint_errors = [[] for _ in range(self.num_agents)]  # Store joint errors per joint
-            previous_joint_angles = None
-            success = 0  # Track success rate
+            total_errors = [[] for _ in range(self.num_agents)]   # Store errors per joint
+            success = False
             trajectories = [{'states': [], 'actions': [], 'log_probs': [], 'rewards': [], 'dones': []} for _ in range(self.num_agents)]
 
             while not done and step < max_steps_per_episode:
                 actions, log_probs = self.get_actions(state)
                 next_state, rewards, done, _ = self.env.step(actions)
 
-                # Collect joint angles, positions, and orientations
-                current_joint_angles = [agent_state['joint_angle'] for agent_state in state]
-                current_position, current_orientation = self.env.get_current_pose()  # Assuming this method exists
+                # Retrieve joint errors from the environment
+                joint_errors = self.env.joint_errors
 
-                # Convert joint angles to NumPy arrays
-                current_joint_angles = np.array(current_joint_angles).flatten()
-
-                # Initialize previous_joint_angles on the first step
-                if previous_joint_angles is None:
-                    previous_joint_angles = np.array(current_joint_angles)
-
-                # Compute combined reward
-                total_reward, position_error, orientation_error, joint_error, success = compute_combined_reward(
-                    current_position=current_position,
-                    target_position=self.env.target_position,
-                    current_orientation=current_orientation,
-                    target_orientation=self.env.target_orientation,
-                    current_joint_angles=current_joint_angles,
-                    target_joint_angles=self.env.target_joint_angles,
-                    joint_limits=self.env.joint_limits,
-                    previous_joint_angles=previous_joint_angles,
-                    iteration=step,
-                    max_reward=1,
-                    min_reward=-1
-                )
-
-                # Log rewards and errors per joint
+                # For each agent
                 for agent_idx in range(self.num_agents):
-                    total_rewards[agent_idx].append(rewards[agent_idx])  # Individual rewards per joint
-                    total_joint_errors[agent_idx].append(joint_error[agent_idx])  # Joint error per joint
+                    total_rewards[agent_idx].append(rewards[agent_idx])
+                    total_errors[agent_idx].append(joint_errors[agent_idx])
 
                     # Store experiences in trajectories
                     agent_state = self._process_state(state)[agent_idx]
                     trajectories[agent_idx]['states'].append(agent_state)
                     trajectories[agent_idx]['actions'].append(torch.tensor(actions[agent_idx], dtype=torch.float32).to(self.device))
                     trajectories[agent_idx]['log_probs'].append(torch.tensor(log_probs[agent_idx], dtype=torch.float32).to(self.device))
-                    trajectories[agent_idx]['rewards'].append(torch.tensor(total_reward, dtype=torch.float32).to(self.device))
+                    trajectories[agent_idx]['rewards'].append(torch.tensor(rewards[agent_idx], dtype=torch.float32).to(self.device))
                     trajectories[agent_idx]['dones'].append(done)
-
-                # Update previous joint angles for the next step
-                previous_joint_angles = np.copy(current_joint_angles)
 
                 state = next_state
                 step += 1
 
+            # After each episode, log the average error and reward per joint
+            for agent_idx in range(self.num_agents):
+                avg_error = np.mean(total_errors[agent_idx])
+                avg_reward = np.mean(total_rewards[agent_idx])
+                logging.info(f"Episode {episode}, Joint {agent_idx} - Avg Error: {avg_error:.6f}, Avg Reward: {avg_reward:.6f}")
+
             # Update policy
             actor_loss, critic_loss, entropy = self.update_policy(trajectories)
 
-            # Log episode metrics
+            # Log additional metrics if needed
             self.training_metrics.log_episode(
-                joint_errors=total_joint_errors,
+                joint_errors=total_errors,
                 rewards=total_rewards,
                 success=success,
                 entropy=entropy,
@@ -331,24 +310,12 @@ class MAPPOAgent:
                 critic_loss=critic_loss
             )
 
-            # Log joint errors and rewards per joint for this episode
-            for agent_idx in range(self.num_agents):
-                avg_joint_error = np.mean(total_joint_errors[agent_idx])
-                avg_joint_reward = np.mean(total_rewards[agent_idx])
-                self.logger.info(f"Episode {episode}, Joint {agent_idx+1} - Avg Error: {avg_joint_error:.4f}, Avg Reward: {avg_joint_reward:.4f}")
-
-            # Log overall episode metrics every 10 episodes
-            if episode % 10 == 0:
-                avg_reward = sum([sum(agent_rewards) for agent_rewards in total_rewards]) / self.num_agents
-                for agent_idx in range(self.num_agents):
-                    avg_joint_error = np.mean(total_joint_errors[agent_idx])
-                    avg_joint_reward = np.mean(total_rewards[agent_idx])
-                    self.logger.info(f"Episode {episode}, Joint {agent_idx+1} - Avg Error: {avg_joint_error:.4f}, Avg Reward: {avg_joint_reward:.4f}")
+            # Optional: Log overall episode metrics
+            avg_episode_reward = sum([sum(agent_rewards) for agent_rewards in total_rewards]) / self.num_agents
+            logging.info(f"Episode {episode} - Avg Episode Reward: {avg_episode_reward:.6f}, Success: {success}")
 
         # After training, save logs and plot metrics
         self.training_metrics.save_logs("training_logs.json")
-
-        # Calculate metrics and plot them
         metrics = self.training_metrics.calculate_metrics()
         self.training_metrics.plot_metrics(metrics, num_episodes, self.env)
 
