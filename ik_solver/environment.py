@@ -13,7 +13,10 @@ from .reward_function import (
     compute_jacobian_angular        # To compute the angular Jacobian matrix for the end-effector
 )
 
+<<<<<<< HEAD
 
+=======
+>>>>>>> IK_RL/main
 # Set up basic logging configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -183,6 +186,7 @@ class InverseKinematicsEnv(gym.Env):
         current_position, current_orientation = self.get_current_pose()
         self.position_error = current_position - self.target_position
         self.orientation_error = self.compute_orientation_difference(current_orientation, self.target_orientation)
+<<<<<<< HEAD
 
         # Compute the overall distance using position and orientation errors
         distance = compute_overall_distance(
@@ -197,12 +201,29 @@ class InverseKinematicsEnv(gym.Env):
             self.begin_distance = distance
             self.prev_best = float('inf')  # Or self.begin_distance
 
+=======
+
+        # Compute the overall distance
+        euclidean_distance = compute_position_error(current_position, self.target_position)
+        cosine_distance = compute_cosine_distance(current_orientation, self.target_orientation)
+        distance = euclidean_distance * cosine_distance + (cosine_distance - 1)
+
+        # Initialize begin_distance and prev_best on the first step
+        if self.current_step == 1:
+            self.begin_distance = distance
+            self.prev_best = float('inf')  # Or self.begin_distance
+
+>>>>>>> IK_RL/main
         # Compute the overall reward using compute_reward
         overall_reward, self.prev_best, success = compute_reward(
             distance=distance,
             begin_distance=self.begin_distance,
             prev_best=self.prev_best,
+<<<<<<< HEAD
             success_threshold=self.success_threshold
+=======
+            success_threshold=self.success_threshold  # Ensure this is defined
+>>>>>>> IK_RL/main
         )
 
         # Compute the Jacobian matrices
@@ -246,6 +267,7 @@ class InverseKinematicsEnv(gym.Env):
             joint_error = abs(self.joint_angles[i] - self.previous_joint_angles[i])
             joint_errors.append(joint_error)
 
+<<<<<<< HEAD
             # Log the agent's reward, error, and success
             logging.info(f"Step {self.current_step}, Joint {i} - Reward: {joint_reward:.6f}, "
                         f"Joint Error: {joint_error:.6f}")
@@ -258,9 +280,29 @@ class InverseKinematicsEnv(gym.Env):
 
         # Determine overall success using the updated is_success method with joint_errors
         overall_success = self.is_success(self.joint_errors)
+=======
+            # Determine agent-specific position and orientation error
+            joint_position_error = np.linalg.norm(self.position_error)  # Replace with joint-specific error if needed
+            joint_orientation_error = np.linalg.norm(self.orientation_error)  # Replace with joint-specific error
+
+            # Determine if the joint is successful based on its contribution and errors
+            agent_success = self.is_agent_success(i, joint_contribution, joint_position_error, joint_orientation_error)
+            agent_successes.append(agent_success)
+
+            # Log the agent's reward, error, and success
+            logging.info(f"Step {self.current_step}, Joint {i} - Reward: {joint_reward:.6f}, "
+                        f"Joint Error: {joint_error:.6f}, Success: {agent_success}")
+
+        # Store joint errors and agent successes for access in the training loop
+        self.joint_errors = joint_errors
+        self.agent_successes = agent_successes
+>>>>>>> IK_RL/main
 
         # Update previous joint angles
         self.previous_joint_angles = np.copy(self.joint_angles)
+
+        # Calculate overall success based on individual agent successes
+        overall_success = all(agent_successes)  # Change this to a more flexible condition if needed
 
         # Update the done flag
         done = self.current_step >= self.max_episode_steps or overall_success
@@ -355,16 +397,28 @@ class InverseKinematicsEnv(gym.Env):
         angle = 2 * np.arccos(np.clip(dot_product, -1.0, 1.0))
         return angle
 
+<<<<<<< HEAD
     def is_success(self, joint_errors):
+=======
+    def is_success(self, position_error, orientation_error, joint_idx=None):
+>>>>>>> IK_RL/main
         """
         Check if the current state is successful based on the mean of joint errors.
 
         Args:
+<<<<<<< HEAD
             joint_errors (np.array): Array of joint errors for each joint.
 
+=======
+            position_error (float): The current position error.
+            orientation_error (float): The current orientation error.
+            joint_idx (int, optional): If specified, returns the success for a particular joint.
+        
+>>>>>>> IK_RL/main
         Returns:
             bool: True if the mean joint error is below the success threshold.
         """
+<<<<<<< HEAD
         # Calculate the mean of joint errors
         mean_joint_error = np.mean(joint_errors)
 
@@ -401,3 +455,57 @@ class InverseKinematicsEnv(gym.Env):
         logging.info(f"Joint {joint_index} - Joint Error: {joint_error:.6f} (Threshold: {error_threshold}), Success: {joint_success}")
 
         return joint_success
+=======
+        position_threshold = 0.01  # 1 cm threshold for position error
+        orientation_threshold = 0.1  # 0.1 rad threshold for orientation error (about 5.7 degrees)
+
+        # Compute the norm of the errors
+        position_error_norm = np.linalg.norm(position_error)
+        orientation_error_norm = np.linalg.norm(orientation_error)
+
+        # Check if the errors are below the thresholds
+        is_position_success = position_error_norm < position_threshold
+        is_orientation_success = orientation_error_norm < orientation_threshold
+
+        # Return the overall success based on individual conditions
+        is_success = is_position_success and is_orientation_success
+        
+        logging.info(f"Joint {joint_idx} - Position Error: {position_error_norm:.6f} "
+                    f"(Threshold: {position_threshold}), Orientation Error: {orientation_error_norm:.6f} "
+                    f"(Threshold: {orientation_threshold}), Success: {is_success}")
+        
+        return is_success
+
+
+    def is_agent_success(self, joint_index, joint_contribution, joint_position_error, joint_orientation_error):
+        """
+        Determines if an agent (joint) is successful based on its contribution and errors.
+
+        Args:
+            joint_index (int): Index of the joint (agent).
+            joint_contribution (float): The agent's contribution to reducing the overall error.
+            joint_position_error (float): Position error for this joint.
+            joint_orientation_error (float): Orientation error for this joint.
+
+        Returns:
+            bool: True if the agent is successful, False otherwise.
+        """
+        # Define success criteria for each joint based on position and orientation error
+        position_threshold = 0.005  # Increase to 5 mm
+        orientation_threshold = 0.2  # Increase to 0.2 rad (11.5 degrees)
+        contribution_threshold = 0.0  # Contribution should be positive
+
+        # Determine success based on error and contribution
+        position_success = joint_position_error < position_threshold
+        orientation_success = joint_orientation_error < orientation_threshold
+        contribution_success = joint_contribution > contribution_threshold
+
+        # Log details about each criterion
+        logging.info(f"Joint {joint_index} - Position Error: {joint_position_error:.6f} "
+                    f"(Threshold: {position_threshold}), Orientation Error: {joint_orientation_error:.6f} "
+                    f"(Threshold: {orientation_threshold}), Contribution: {joint_contribution:.6f}, "
+                    f"Success Criteria Met: {position_success} and {orientation_success} and {contribution_success}")
+
+        return position_success and orientation_success and contribution_success
+
+>>>>>>> IK_RL/main
