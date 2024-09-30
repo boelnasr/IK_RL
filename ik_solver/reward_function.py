@@ -1,4 +1,5 @@
 import numpy as np
+import pybullet as p
 
 def compute_position_error(current_position, target_position):
     """
@@ -13,46 +14,45 @@ def compute_position_error(current_position, target_position):
     """
     return np.linalg.norm(current_position - target_position)
 
-def compute_cosine_distance(current_orientation, target_orientation):
+def compute_quaternion_distance(current_orientation, target_orientation):
     """
-    Computes the cosine distance between two orientations represented as quaternions.
+    Computes the quaternion distance between two quaternions.
 
     Args:
         current_orientation (np.array): Current orientation quaternion [w, x, y, z].
         target_orientation (np.array): Target orientation quaternion [w, x, y, z].
 
     Returns:
-        float: Cosine distance, adjusted to range [1, 3].
+        float: Quaternion distance in radians.
     """
-    # Compute the dot product between the quaternions
+    # Compute the dot product of the quaternions
     dot_product = np.clip(np.dot(current_orientation, target_orientation), -1.0, 1.0)
-    cosine_similarity = dot_product
-
-    # Cosine distance
-    cosine_distance = 1 - cosine_similarity  # Range [0, 2]
-    cosine_distance += 1  # Adjust to range [1, 3]
-
-    return cosine_distance
+    
+    # Calculate the angular distance using arccos of the dot product
+    distance = 2 * np.arccos(np.abs(dot_product))
+    return distance
 
 def compute_overall_distance(current_position, target_position, current_orientation, target_orientation):
     """
-    Computes the overall distance combining Euclidean and cosine distances.
+    Computes the overall distance combining Euclidean distance for position and quaternion distance for orientation.
+
+    Args:
+        current_position (np.array): Current position of the end-effector.
+        target_position (np.array): Target position of the end-effector.
+        current_orientation (np.array): Current orientation quaternion of the end-effector.
+        target_orientation (np.array): Target orientation quaternion of the end-effector.
 
     Returns:
-        float: The overall distance.
+        float: The overall distance metric.
     """
-    # Euclidean (Gaussian) distance between positions
+    # Euclidean distance between positions
     euclidean_distance = compute_position_error(current_position, target_position)
 
-    # Cosine distance between orientations
-    cosine_distance = compute_cosine_distance(current_orientation, target_orientation)
+    # Quaternion distance between orientations
+    quaternion_distance = compute_quaternion_distance(current_orientation, target_orientation)
 
-    # Compute offset b
-    b = cosine_distance - 1  # Range [0, 2]
-
-    # Compute overall distance
-    overall_distance = euclidean_distance * cosine_distance + b
-
+    # Combine the Euclidean and Quaternion distances
+    overall_distance = euclidean_distance + quaternion_distance
     return overall_distance
 
 def compute_reward(distance, begin_distance, prev_best, success_threshold=0.006):
@@ -87,3 +87,49 @@ def compute_reward(distance, begin_distance, prev_best, success_threshold=0.006)
         success = True
 
     return reward, prev_best, success
+
+def compute_jacobian_linear(robot_id, joint_indices, joint_angles):
+    """
+    Computes the linear Jacobian for the end-effector.
+
+    Args:
+        robot_id (int): The ID of the robot in the PyBullet simulation.
+        joint_indices (list): The indices of the joints to consider.
+        joint_angles (list): The angles of the joints to compute the Jacobian.
+
+    Returns:
+        np.array: Linear Jacobian matrix.
+    """
+    zero_vec = [0.0] * len(joint_indices)
+    jacobian_linear, _ = p.calculateJacobian(
+        bodyUniqueId=robot_id,
+        linkIndex=joint_indices[-1],
+        localPosition=[0, 0, 0],
+        objPositions=joint_angles,
+        objVelocities=zero_vec,
+        objAccelerations=zero_vec
+    )
+    return np.array(jacobian_linear)
+
+def compute_jacobian_angular(robot_id, joint_indices, joint_angles):
+    """
+    Computes the angular Jacobian for the end-effector.
+
+    Args:
+        robot_id (int): The ID of the robot in the PyBullet simulation.
+        joint_indices (list): The indices of the joints to consider.
+        joint_angles (list): The angles of the joints to compute the Jacobian.
+
+    Returns:
+        np.array: Angular Jacobian matrix.
+    """
+    zero_vec = [0.0] * len(joint_indices)
+    _, jacobian_angular = p.calculateJacobian(
+        bodyUniqueId=robot_id,
+        linkIndex=joint_indices[-1],
+        localPosition=[0, 0, 0],
+        objPositions=joint_angles,
+        objVelocities=zero_vec,
+        objAccelerations=zero_vec
+    )
+    return np.array(jacobian_angular)

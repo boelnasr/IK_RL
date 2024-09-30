@@ -5,7 +5,14 @@ from .environment import InverseKinematicsEnv
 from .mappo import MAPPOAgent
 
 # Import the reward functions for computing position and orientation rewards
-from .reward_function import compute_reward, compute_cosine_distance
+from .reward_function import (
+    compute_position_error,         # To compute position errors between current and target positions
+    compute_quaternion_distance,    # To compute quaternion distance between current and target orientations
+    compute_overall_distance,       # To compute the combined distance metric
+    compute_reward,                 # To compute the overall reward based on the distance metrics
+    compute_jacobian_linear,        # To compute the linear Jacobian matrix for the end-effector
+    compute_jacobian_angular        # To compute the angular Jacobian matrix for the end-effector
+)
 
 
 
