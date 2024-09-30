@@ -133,3 +133,45 @@ def compute_jacobian_angular(robot_id, joint_indices, joint_angles):
         objAccelerations=zero_vec
     )
     return np.array(jacobian_angular)
+
+def assign_joint_weights(jacobian_linear, jacobian_angular):
+    """
+    Assign weights to joints based on their contributions to linear and angular movements.
+
+    Args:
+        jacobian_linear (np.array): The linear Jacobian matrix.
+        jacobian_angular (np.array): The angular Jacobian matrix.
+
+    Returns:
+        tuple: Linear and angular weights for each joint.
+    """
+    # Compute the norm of each column (joint) to get its contribution to the linear and angular movements
+    linear_weights = np.linalg.norm(jacobian_linear, axis=0)
+    angular_weights = np.linalg.norm(jacobian_angular, axis=0)
+
+    # Normalize the weights so that they sum to 1
+    linear_weights /= (np.sum(linear_weights) + 1e-8)
+    angular_weights /= (np.sum(angular_weights) + 1e-8)
+
+    return linear_weights, angular_weights
+
+def compute_weighted_joint_rewards(joint_errors, linear_weights, angular_weights, overall_reward):
+    """
+    Compute individual joint rewards based on their contribution and the overall reward.
+
+    Args:
+        joint_errors (list): Errors for each joint.
+        linear_weights (np.array): Linear weights for each joint.
+        angular_weights (np.array): Angular weights for each joint.
+        overall_reward (float): The overall reward for the step.
+
+    Returns:
+        list: Individual rewards for each joint.
+    """
+    # Normalize the joint errors to compute their relative contribution
+    joint_error_norms = np.linalg.norm(joint_errors)
+    normalized_joint_errors = joint_errors / (joint_error_norms + 1e-8)
+
+    # Compute individual rewards by considering the weighted errors
+    joint_rewards = overall_reward * (linear_weights + angular_weights) * normalized_joint_errors
+    return joint_rewards

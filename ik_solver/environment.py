@@ -91,13 +91,16 @@ class InverseKinematicsEnv(gym.Env):
         self.position_threshold = 0.1  # Define appropriate value
         self.orientation_threshold = 0.1  # Define appropriate value in radians
         # Set the success threshold for the distance
-        self.success_threshold = 0.01  # Adjust this value as needed
+        self.success_threshold = 0.05  # Adjust this value as needed
         print(f"Number of joints in the robot: {self.num_joints}")
 
-    def reset(self):
+    def reset(self, episode_number=0, total_episodes=1000):
         """
-        Resets the environment by setting the robot's joint angles to random values
-        and generating a new random target pose for the end-effector.
+        Resets the environment and adjusts difficulty based on the episode number.
+
+        Args:
+            episode_number (int): Current episode number.
+            total_episodes (int): Total number of episodes for training.
 
         Returns:
             list: A list of observations for each agent.
@@ -112,13 +115,16 @@ class InverseKinematicsEnv(gym.Env):
         # Track the initial joint angles as the previous joint angles
         self.previous_joint_angles = np.copy(self.joint_angles)
 
-        # Generate a new random target pose for the end-effector
-        # Ensure the target is within reachable workspace
+        # Adjust target position difficulty: increase range over episodes
+        position_range = 0.3 + 0.4 * (episode_number / total_episodes)  # Increase range from 0.3 to 0.7
         self.target_position = np.random.uniform(
-            [0.1, -0.5, 0.1], [0.5, 0.5, 0.5]
+            [0.1 - position_range, -0.5, 0.1],
+            [0.1 + position_range, 0.5, 0.5]
         )
-        # Random target orientation as a quaternion
-        random_euler = np.random.uniform(-np.pi, np.pi, 3)
+
+        # Adjust target orientation difficulty: increase variability over episodes
+        orientation_variability = np.pi / 8 + (np.pi / 4) * (episode_number / total_episodes)  # Increase variability
+        random_euler = np.random.uniform(-orientation_variability, orientation_variability, 3)
         self.target_orientation = p.getQuaternionFromEuler(random_euler)
 
         # Optionally, visualize the target position in the simulation
@@ -154,8 +160,21 @@ class InverseKinematicsEnv(gym.Env):
         # Initialize prev_best with a large value or begin_distance
         self.prev_best = float('inf')  # or self.begin_distance
 
+        # Adjust success thresholds based on episode number
+        self.success_threshold = 0.05
+        #self.success_threshold = max(0.05 - (episode_number / total_episodes) * 0.04, 0.01)  # Decrease threshold
+
+        # Adjust maximum episode steps to increase difficulty over time
+        self.max_episode_steps = int(self.max_episode_steps * (1 - episode_number / total_episodes))
+
+        # Optionally, change environment dynamics like gravity or external forces
+        # Increase gravity slightly over time to simulate a more challenging environment
+        #gravity_factor = 1 + (episode_number / total_episodes) * 0.5  # Increase gravity by up to 50%
+        p.setGravity(0, 0, -9.8 )
+
         # Return the initial observations for all agents
         return self.get_all_agent_observations()
+
 
     def step(self, actions):
         """
@@ -340,20 +359,7 @@ class InverseKinematicsEnv(gym.Env):
         if p.isConnected():
             p.disconnect()
 
-    def compute_orientation_error(self, current_orientation, target_orientation):
-        """
-        Computes the angular distance between the current and target orientations using quaternions.
 
-        Args:
-            current_orientation (np.array): The current orientation quaternion.
-            target_orientation (np.array): The target orientation quaternion.
-
-        Returns:
-            float: The angular difference (in radians) between the two orientations.
-        """
-        dot_product = np.abs(np.dot(current_orientation, target_orientation))
-        angle = 2 * np.arccos(np.clip(dot_product, -1.0, 1.0))
-        return angle
 
     def is_success(self, joint_errors):
         """

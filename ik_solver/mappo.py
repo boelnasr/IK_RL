@@ -8,6 +8,14 @@ import json
 import matplotlib.pyplot as plt
 from collections import deque
 
+# Initialize device based on CUDA availability
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Check if CUDA is available and print device name
+if torch.cuda.is_available():
+    print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+else:
+    print("CUDA not available. Using CPU.")
 # Assuming compute_combined_reward and TrainingMetrics are defined elsewhere
 from .training_metrics import TrainingMetrics
 
