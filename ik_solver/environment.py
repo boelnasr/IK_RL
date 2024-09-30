@@ -10,8 +10,10 @@ from .reward_function import (
     compute_overall_distance,
     compute_reward
 )
+
 # Set up basic logging configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 class InverseKinematicsEnv(gym.Env):
     """
     Custom environment for inverse kinematics control of a robotic arm in PyBullet.
@@ -83,12 +85,11 @@ class InverseKinematicsEnv(gym.Env):
         # Initialize step counter and thresholds
         self.current_step = 0
         self.max_episode_steps = max_episode_steps
-        self.position_threshold = 0.01  # Define appropriate value
+        self.position_threshold = 0.1  # Define appropriate value
         self.orientation_threshold = 0.1  # Define appropriate value in radians
         # Set the success threshold for the distance
         self.success_threshold = 0.01  # Adjust this value as needed
         print(f"Number of joints in the robot: {self.num_joints}")
-
 
     def reset(self):
         """
@@ -154,6 +155,16 @@ class InverseKinematicsEnv(gym.Env):
         return self.get_all_agent_observations()
 
     def step(self, actions):
+        """
+        Applies the given actions to the environment, steps the simulation,
+        computes rewards, checks for success, and returns observations.
+
+        Args:
+            actions (tuple): A tuple of actions for each agent.
+
+        Returns:
+            tuple: (observations, rewards, done, info)
+        """
         # Apply the actions and step the simulation
         for i, action in enumerate(actions):
             action = np.clip(action, self.joint_limits[i][0], self.joint_limits[i][1])
@@ -168,28 +179,25 @@ class InverseKinematicsEnv(gym.Env):
         self.joint_angles = np.array([p.getJointState(self.robot_id, i)[0] for i in range(self.num_joints)])
         current_position, current_orientation = self.get_current_pose()
         self.position_error = current_position - self.target_position
-        self.orientation_error = self.compute_orientation_difference(
-            current_orientation, self.target_orientation
-        )
+        self.orientation_error = self.compute_orientation_difference(current_orientation, self.target_orientation)
 
         # Compute the overall distance
         euclidean_distance = compute_position_error(current_position, self.target_position)
         cosine_distance = compute_cosine_distance(current_orientation, self.target_orientation)
-        b = cosine_distance - 1
-        distance = euclidean_distance * cosine_distance + b
+        distance = euclidean_distance * cosine_distance + (cosine_distance - 1)
 
-        # Compute the overall reward
-        if distance > self.prev_best:
-            overall_reward = self.prev_best - distance  # Punishment
-        else:
-            overall_reward = self.begin_distance - distance  # Reward
-            self.prev_best = distance
+        # Initialize begin_distance and prev_best on the first step
+        if self.current_step == 1:
+            self.begin_distance = distance
+            self.prev_best = float('inf')  # Or self.begin_distance
 
-        if distance <= self.success_threshold:
-            overall_reward = 2.0 + (self.success_threshold - distance) * 1000
-            success = True
-        else:
-            success = False
+        # Compute the overall reward using compute_reward
+        overall_reward, self.prev_best, success = compute_reward(
+            distance=distance,
+            begin_distance=self.begin_distance,
+            prev_best=self.prev_best,
+            success_threshold=self.success_threshold  # Ensure this is defined
+        )
 
         # Compute the Jacobian matrices
         zero_vec = [0.0] * self.num_joints
@@ -202,27 +210,28 @@ class InverseKinematicsEnv(gym.Env):
             objAccelerations=zero_vec
         )
 
-        jacobian_linear = np.array(jacobian_linear)  # Shape: (3, num_joints)
-        jacobian_angular = np.array(jacobian_angular)  # Shape: (3, num_joints)
+        jacobian_linear = np.array(jacobian_linear)
+        jacobian_angular = np.array(jacobian_angular)
 
         # Compute normalized errors
-        delta_position = current_position - self.target_position
-        delta_position_norm = delta_position / (np.linalg.norm(delta_position) + 1e-8)
-
-        delta_orientation = self.orientation_error
-        delta_orientation_norm = delta_orientation / (np.linalg.norm(delta_orientation) + 1e-8)
+        delta_position_norm = self.position_error / (np.linalg.norm(self.position_error) + 1e-8)
+        delta_orientation_norm = self.orientation_error / (np.linalg.norm(self.orientation_error) + 1e-8)
 
         # Compute gradients
-        grad_position = jacobian_linear.T @ delta_position_norm  # Shape: (num_joints,)
-        grad_orientation = jacobian_angular.T @ delta_orientation_norm  # Shape: (num_joints,)
+        grad_position = jacobian_linear.T @ delta_position_norm
+        grad_orientation = jacobian_angular.T @ delta_orientation_norm
 
+        # Total gradient
         grad_total = grad_position + grad_orientation
-        grad_norm = np.linalg.norm(grad_total) + 1e-8
 
-        # Assign individual rewards and compute joint errors
+        # Assign individual rewards and determine agent success
+        grad_norm = np.linalg.norm(grad_total) + 1e-8
         rewards = []
         joint_errors = []
+        agent_successes = []
+
         for i in range(self.num_joints):
+            # Determine the agent's contribution
             joint_contribution = -grad_total[i] / grad_norm
             joint_reward = overall_reward * joint_contribution
             rewards.append(joint_reward)
@@ -231,116 +240,36 @@ class InverseKinematicsEnv(gym.Env):
             joint_error = abs(self.joint_angles[i] - self.previous_joint_angles[i])
             joint_errors.append(joint_error)
 
-            # Log the error and reward for each joint
-            logging.info(f"Step {self.current_step}, Joint {i} - Error: {joint_error:.6f}, Reward: {joint_reward:.6f}")
+            # Determine agent-specific position and orientation error
+            joint_position_error = np.linalg.norm(self.position_error)  # Replace with joint-specific error if needed
+            joint_orientation_error = np.linalg.norm(self.orientation_error)  # Replace with joint-specific error
+
+            # Determine if the joint is successful based on its contribution and errors
+            agent_success = self.is_agent_success(i, joint_contribution, joint_position_error, joint_orientation_error)
+            agent_successes.append(agent_success)
+
+            # Log the agent's reward, error, and success
+            logging.info(f"Step {self.current_step}, Joint {i} - Reward: {joint_reward:.6f}, "
+                        f"Joint Error: {joint_error:.6f}, Success: {agent_success}")
+
+        # Store joint errors and agent successes for access in the training loop
+        self.joint_errors = joint_errors
+        self.agent_successes = agent_successes
 
         # Update previous joint angles
         self.previous_joint_angles = np.copy(self.joint_angles)
 
+        # Calculate overall success based on individual agent successes
+        overall_success = all(agent_successes)  # Change this to a more flexible condition if needed
+
         # Update the done flag
-        done = self.current_step >= self.max_episode_steps or success
+        done = self.current_step >= self.max_episode_steps or overall_success
 
         # Get observations
         observations = self.get_all_agent_observations()
 
-        # Store joint errors for access in the training loop
-        self.joint_errors = joint_errors
-
-        return observations, rewards, done, {}
-    def step(self, actions):
-        # Apply the actions and step the simulation
-        for i, action in enumerate(actions):
-            action = np.clip(action, self.joint_limits[i][0], self.joint_limits[i][1])
-            p.setJointMotorControl2(self.robot_id, i, p.POSITION_CONTROL, targetPosition=action)
-
-        p.stepSimulation()
-
-        # Update current step
-        self.current_step += 1
-
-        # Get the current state
-        self.joint_angles = np.array([p.getJointState(self.robot_id, i)[0] for i in range(self.num_joints)])
-        current_position, current_orientation = self.get_current_pose()
-        self.position_error = current_position - self.target_position
-        self.orientation_error = self.compute_orientation_difference(
-            current_orientation, self.target_orientation
-        )
-
-        # Compute the overall distance
-        euclidean_distance = compute_position_error(current_position, self.target_position)
-        cosine_distance = compute_cosine_distance(current_orientation, self.target_orientation)
-        b = cosine_distance - 1
-        distance = euclidean_distance * cosine_distance + b
-
-        # Compute the overall reward
-        if distance > self.prev_best:
-            overall_reward = self.prev_best - distance  # Punishment
-        else:
-            overall_reward = self.begin_distance - distance  # Reward
-            self.prev_best = distance
-
-        if distance <= self.success_threshold:
-            overall_reward = 2.0 + (self.success_threshold - distance) * 5000
-            success = True
-        else:
-            success = False
-
-        # Compute the Jacobian matrices
-        zero_vec = [0.0] * self.num_joints
-        jacobian_linear, jacobian_angular = p.calculateJacobian(
-            bodyUniqueId=self.robot_id,
-            linkIndex=self.joint_indices[-1],
-            localPosition=[0, 0, 0],
-            objPositions=self.joint_angles.tolist(),
-            objVelocities=zero_vec,
-            objAccelerations=zero_vec
-        )
-
-        jacobian_linear = np.array(jacobian_linear)  # Shape: (3, num_joints)
-        jacobian_angular = np.array(jacobian_angular)  # Shape: (3, num_joints)
-
-        # Compute normalized errors
-        delta_position = current_position - self.target_position
-        delta_position_norm = delta_position / (np.linalg.norm(delta_position) + 1e-8)
-
-        delta_orientation = self.orientation_error
-        delta_orientation_norm = delta_orientation / (np.linalg.norm(delta_orientation) + 1e-8)
-
-        # Compute gradients
-        grad_position = jacobian_linear.T @ delta_position_norm  # Shape: (num_joints,)
-        grad_orientation = jacobian_angular.T @ delta_orientation_norm  # Shape: (num_joints,)
-
-        grad_total = grad_position + grad_orientation
-        grad_norm = np.linalg.norm(grad_total) + 1e-8
-
-        # Assign individual rewards and compute joint errors
-        rewards = []
-        joint_errors = []
-        for i in range(self.num_joints):
-            joint_contribution = -grad_total[i] / grad_norm
-            joint_reward = overall_reward * joint_contribution
-            rewards.append(joint_reward)
-
-            # Compute joint error (absolute difference in joint angles)
-            joint_error = abs(self.joint_angles[i] - self.previous_joint_angles[i])
-            joint_errors.append(joint_error)
-
-            # Log the error and reward for each joint
-            logging.info(f"Step {self.current_step}, Joint {i} - Error: {joint_error:.6f}, Reward: {joint_reward:.6f}")
-
-        # Update previous joint angles
-        self.previous_joint_angles = np.copy(self.joint_angles)
-
-        # Update the done flag
-        done = self.current_step >= self.max_episode_steps or success
-
-        # Get observations
-        observations = self.get_all_agent_observations()
-
-        # Store joint errors for access in the training loop
-        self.joint_errors = joint_errors
-
-        return observations, rewards, done, {}
+        # Return observations, rewards, done flag, and individual successes
+        return observations, rewards, done, {'success_per_agent': agent_successes}
 
 
     def get_all_agent_observations(self):
@@ -373,7 +302,6 @@ class InverseKinematicsEnv(gym.Env):
             'orientation_error': self.orientation_error.astype(np.float32),
         }
         return obs
-
 
     def get_current_pose(self):
         """
@@ -409,11 +337,9 @@ class InverseKinematicsEnv(gym.Env):
 
     def close(self):
         """ Closes the environment and disconnects from the PyBullet simulation. """
-        
         if p.isConnected():
             p.disconnect()
 
-    # Optionally, include the compute_orientation_error method if used elsewhere
     def compute_orientation_error(self, current_orientation, target_orientation):
         """
         Computes the angular distance between the current and target orientations using quaternions.
@@ -429,21 +355,67 @@ class InverseKinematicsEnv(gym.Env):
         angle = 2 * np.arccos(np.clip(dot_product, -1.0, 1.0))
         return angle
 
-    def is_success(self, position_error, orientation_error):
+    def is_success(self, position_error, orientation_error, joint_idx=None):
         """
         Check if the current state is successful, based on position and orientation error thresholds.
         
         Args:
             position_error (float): The current position error.
             orientation_error (float): The current orientation error.
-
+            joint_idx (int, optional): If specified, returns the success for a particular joint.
+        
         Returns:
             bool: True if both position and orientation errors are below the success thresholds.
         """
-        position_threshold = 0.01  # Define your threshold for position error
-        orientation_threshold = 0.1  # Define your threshold for orientation error (in radians)
+        position_threshold = 0.01  # 1 cm threshold for position error
+        orientation_threshold = 0.1  # 0.1 rad threshold for orientation error (about 5.7 degrees)
 
-    # Compute the norm of the errors
+        # Compute the norm of the errors
         position_error_norm = np.linalg.norm(position_error)
         orientation_error_norm = np.linalg.norm(orientation_error)
-        return position_error_norm < position_threshold and orientation_error_norm < orientation_threshold
+
+        # Check if the errors are below the thresholds
+        is_position_success = position_error_norm < position_threshold
+        is_orientation_success = orientation_error_norm < orientation_threshold
+
+        # Return the overall success based on individual conditions
+        is_success = is_position_success and is_orientation_success
+        
+        logging.info(f"Joint {joint_idx} - Position Error: {position_error_norm:.6f} "
+                    f"(Threshold: {position_threshold}), Orientation Error: {orientation_error_norm:.6f} "
+                    f"(Threshold: {orientation_threshold}), Success: {is_success}")
+        
+        return is_success
+
+
+    def is_agent_success(self, joint_index, joint_contribution, joint_position_error, joint_orientation_error):
+        """
+        Determines if an agent (joint) is successful based on its contribution and errors.
+
+        Args:
+            joint_index (int): Index of the joint (agent).
+            joint_contribution (float): The agent's contribution to reducing the overall error.
+            joint_position_error (float): Position error for this joint.
+            joint_orientation_error (float): Orientation error for this joint.
+
+        Returns:
+            bool: True if the agent is successful, False otherwise.
+        """
+        # Define success criteria for each joint based on position and orientation error
+        position_threshold = 0.005  # Increase to 5 mm
+        orientation_threshold = 0.2  # Increase to 0.2 rad (11.5 degrees)
+        contribution_threshold = 0.0  # Contribution should be positive
+
+        # Determine success based on error and contribution
+        position_success = joint_position_error < position_threshold
+        orientation_success = joint_orientation_error < orientation_threshold
+        contribution_success = joint_contribution > contribution_threshold
+
+        # Log details about each criterion
+        logging.info(f"Joint {joint_index} - Position Error: {joint_position_error:.6f} "
+                    f"(Threshold: {position_threshold}), Orientation Error: {joint_orientation_error:.6f} "
+                    f"(Threshold: {orientation_threshold}), Contribution: {joint_contribution:.6f}, "
+                    f"Success Criteria Met: {position_success} and {orientation_success} and {contribution_success}")
+
+        return position_success and orientation_success and contribution_success
+

@@ -87,3 +87,4 @@ def compute_reward(distance, begin_distance, prev_best, success_threshold=0.006)
         success = True
 
     return reward, prev_best, success
+

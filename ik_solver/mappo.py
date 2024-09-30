@@ -265,15 +265,15 @@ class MAPPOAgent:
             step = 0
             total_rewards = [[] for _ in range(self.num_agents)]  # Store rewards per joint
             total_errors = [[] for _ in range(self.num_agents)]   # Store errors per joint
-            success = False
             trajectories = [{'states': [], 'actions': [], 'log_probs': [], 'rewards': [], 'dones': []} for _ in range(self.num_agents)]
 
             while not done and step < max_steps_per_episode:
                 actions, log_probs = self.get_actions(state)
-                next_state, rewards, done, _ = self.env.step(actions)
+                next_state, rewards, done, info = self.env.step(actions)
 
-                # Retrieve joint errors from the environment
+                # Retrieve joint errors and success status from the environment
                 joint_errors = self.env.joint_errors
+                success_per_agent = info['success_per_agent']
 
                 # For each agent
                 for agent_idx in range(self.num_agents):
@@ -291,33 +291,37 @@ class MAPPOAgent:
                 state = next_state
                 step += 1
 
-            # After each episode, log the average error and reward per joint
+            # Update policy
+            actor_loss, critic_loss, entropy = self.update_policy(trajectories)
+
+            # Log metrics
+            self.training_metrics.log_episode(
+                joint_errors=joint_errors,
+                rewards=rewards,
+                success=success_per_agent,
+                entropy=entropy,
+                actor_loss=actor_loss,
+                critic_loss=critic_loss,
+                env=self.env
+            )
+
+            # Log additional metrics if needed
             for agent_idx in range(self.num_agents):
                 avg_error = np.mean(total_errors[agent_idx])
                 avg_reward = np.mean(total_rewards[agent_idx])
                 logging.info(f"Episode {episode}, Joint {agent_idx} - Avg Error: {avg_error:.6f}, Avg Reward: {avg_reward:.6f}")
 
-            # Update policy
-            actor_loss, critic_loss, entropy = self.update_policy(trajectories)
-
-            # Log additional metrics if needed
-            self.training_metrics.log_episode(
-                joint_errors=total_errors,
-                rewards=total_rewards,
-                success=success,
-                entropy=entropy,
-                actor_loss=actor_loss,
-                critic_loss=critic_loss
-            )
-
             # Optional: Log overall episode metrics
             avg_episode_reward = sum([sum(agent_rewards) for agent_rewards in total_rewards]) / self.num_agents
-            logging.info(f"Episode {episode} - Avg Episode Reward: {avg_episode_reward:.6f}, Success: {success}")
+            overall_success = all(success_per_agent)
+            logging.info(f"Episode {episode} - Avg Episode Reward: {avg_episode_reward:.6f}, Overall Success: {overall_success}")
 
         # After training, save logs and plot metrics
         self.training_metrics.save_logs("training_logs.json")
-        metrics = self.training_metrics.calculate_metrics()
+        metrics = self.training_metrics.calculate_metrics(env=self.env)
         self.training_metrics.plot_metrics(metrics, num_episodes, self.env)
+
+
 
     def test_agent(self, env, num_episodes, max_steps=1000):
         """
