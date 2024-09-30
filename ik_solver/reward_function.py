@@ -88,7 +88,6 @@ def compute_reward(distance, begin_distance, prev_best, success_threshold=0.006)
 
     return reward, prev_best, success
 
-<<<<<<< HEAD
 def compute_jacobian_linear(robot_id, joint_indices, joint_angles):
     """
     Computes the linear Jacobian for the end-effector.
@@ -134,5 +133,3 @@ def compute_jacobian_angular(robot_id, joint_indices, joint_angles):
         objAccelerations=zero_vec
     )
     return np.array(jacobian_angular)
-=======
->>>>>>> IK_RL/main
