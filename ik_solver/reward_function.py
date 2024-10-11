@@ -88,51 +88,77 @@ def compute_reward(distance, begin_distance, prev_best, success_threshold=0.006)
 
     return reward, prev_best, success
 
-def compute_jacobian_linear(robot_id, joint_indices, joint_angles):
+def compute_jacobian_linear(robot_id, joint_indices, joint_angles, delta=1e-5):
     """
-    Computes the linear Jacobian for the end-effector.
-
-    Args:
-        robot_id (int): The ID of the robot in the PyBullet simulation.
-        joint_indices (list): The indices of the joints to consider.
-        joint_angles (list): The angles of the joints to compute the Jacobian.
-
-    Returns:
-        np.array: Linear Jacobian matrix.
+    Computes the linear Jacobian for the robot's end-effector using numerical differentiation.
     """
-    zero_vec = [0.0] * len(joint_indices)
-    jacobian_linear, _ = p.calculateJacobian(
-        bodyUniqueId=robot_id,
-        linkIndex=joint_indices[-1],
-        localPosition=[0, 0, 0],
-        objPositions=joint_angles,
-        objVelocities=zero_vec,
-        objAccelerations=zero_vec
-    )
-    return np.array(jacobian_linear)
+    link_index = joint_indices[-1]  # End-effector link index
 
-def compute_jacobian_angular(robot_id, joint_indices, joint_angles):
+    # Define the forward kinematics function for the specific robot configuration
+    def forward_kinematics(joint_angles):
+        return forward_kinematics_pyb(robot_id, joint_angles, link_index)
+    
+    # Compute the Jacobian using numerical differentiation
+    jacobian = numerical_jacobian(forward_kinematics, joint_angles, delta)
+
+    # Return only the linear part of the Jacobian (first 3 rows)
+    return jacobian[0:3, :]
+def compute_jacobian_angular(robot_id, joint_indices, joint_angles, delta=1e-5):
     """
-    Computes the angular Jacobian for the end-effector.
-
-    Args:
-        robot_id (int): The ID of the robot in the PyBullet simulation.
-        joint_indices (list): The indices of the joints to consider.
-        joint_angles (list): The angles of the joints to compute the Jacobian.
-
-    Returns:
-        np.array: Angular Jacobian matrix.
+    Computes the angular Jacobian for the robot's end-effector using numerical differentiation.
     """
-    zero_vec = [0.0] * len(joint_indices)
-    _, jacobian_angular = p.calculateJacobian(
-        bodyUniqueId=robot_id,
-        linkIndex=joint_indices[-1],
-        localPosition=[0, 0, 0],
-        objPositions=joint_angles,
-        objVelocities=zero_vec,
-        objAccelerations=zero_vec
-    )
-    return np.array(jacobian_angular)
+    link_index = joint_indices[-1]  # End-effector link index
+
+    # Define the forward kinematics function for the specific robot configuration
+    def forward_kinematics(joint_angles):
+        return forward_kinematics_pyb(robot_id, joint_angles, link_index)
+    
+    # Compute the Jacobian using numerical differentiation
+    jacobian = numerical_jacobian(forward_kinematics, joint_angles, delta)
+
+    # Return only the angular part of the Jacobian (last 3 rows)
+    return jacobian[3:6, :]
+
+def numerical_jacobian(robot_forward_kinematics, joint_angles, delta=1e-5):
+    """
+    Computes the Jacobian matrix using numerical differentiation.
+    """
+    num_joints = len(joint_angles)
+    jacobian = np.zeros((6, num_joints))
+
+    # Get the current end-effector pose (position and orientation)
+    current_position, current_orientation = robot_forward_kinematics(joint_angles)
+
+    # Iterate over each joint to compute the partial derivatives
+    for i in range(num_joints):
+        # Create a perturbed joint angle array
+        perturbed_joint_angles = np.copy(joint_angles)
+        perturbed_joint_angles[i] += delta
+
+        # Get the perturbed end-effector pose
+        perturbed_position, perturbed_orientation = robot_forward_kinematics(perturbed_joint_angles)
+
+        # Compute numerical derivatives for position and orientation
+        position_derivative = (perturbed_position - current_position) / delta
+        orientation_derivative = (perturbed_orientation - current_orientation) / delta
+
+        # Assign the derivatives to the corresponding column in the Jacobian
+        jacobian[0:3, i] = position_derivative  # Linear part
+        jacobian[3:6, i] = orientation_derivative  # Angular part
+
+    return jacobian
+
+
+def forward_kinematics_pyb(robot_id, joint_angles, link_index):
+    """
+    Compute the end-effector position and orientation using PyBullet's kinematics.
+    """
+    for i, angle in enumerate(joint_angles):
+        p.resetJointState(robot_id, i, angle)
+    link_state = p.getLinkState(robot_id, link_index)
+    position = np.array(link_state[4])
+    orientation = np.array(p.getEulerFromQuaternion(link_state[5]))
+    return position, orientation
 
 def assign_joint_weights(jacobian_linear, jacobian_angular):
     """

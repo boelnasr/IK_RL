@@ -3,7 +3,7 @@ import pybullet as p
 import pybullet_data
 import numpy as np
 import logging
-
+from config import config
 from .reward_function import (
     compute_position_error,         # To compute position errors between current and target positions
     compute_quaternion_distance,    # To compute quaternion distance between current and target orientations
@@ -32,7 +32,8 @@ class InverseKinematicsEnv(gym.Env):
             max_episode_steps (int): Maximum number of steps per episode.
         """
         super(InverseKinematicsEnv, self).__init__()
-
+        # Initialize episode counter
+        self.episode_number = 0
         # PyBullet setup
         self.physics_client = p.connect(p.GUI)  # Use p.DIRECT for headless simulation
         p.setAdditionalSearchPath(pybullet_data.getDataPath())  # PyBullet data path
@@ -94,45 +95,50 @@ class InverseKinematicsEnv(gym.Env):
         self.success_threshold = 0.05  # Adjust this value as needed
         print(f"Number of joints in the robot: {self.num_joints}")
 
-    def reset(self, episode_number=0, total_episodes=1000):
+
+    def reset(self, total_episodes=1000):
         """
-        Resets the environment and adjusts difficulty based on the episode number.
+        Resets the environment and generates a target using forward kinematics.
 
         Args:
-            episode_number (int): Current episode number.
             total_episodes (int): Total number of episodes for training.
 
         Returns:
             list: A list of observations for each agent.
         """
-        # Reset joint angles to random values within joint limits
+        self.episode_number += 1
+
+        # Generate random joint angles for the target
+        target_joint_angles = np.array([
+            np.random.uniform(limit[0], limit[1]) for limit in self.joint_limits
+        ])
+
+        # Set the robot to the target joint angles and get the end-effector pose
+        for i, angle in enumerate(target_joint_angles):
+            p.resetJointState(self.robot_id, i, angle)
+        p.stepSimulation()
+        target_state = p.getLinkState(self.robot_id, self.joint_indices[-1])
+        self.target_position = np.array(target_state[4])
+
+        self.target_orientation = np.array(target_state[5])
+
+        # Generate random joint angles for the initial state
         self.joint_angles = np.array([
             np.random.uniform(limit[0], limit[1]) for limit in self.joint_limits
         ])
-        for i, angle in zip(self.joint_indices, self.joint_angles):
+        for i, angle in enumerate(self.joint_angles):
             p.resetJointState(self.robot_id, i, angle)
 
         # Track the initial joint angles as the previous joint angles
         self.previous_joint_angles = np.copy(self.joint_angles)
 
-        # Adjust target position difficulty: increase range over episodes
-        position_range = 0.3 + 0.4 * (episode_number / total_episodes)  # Increase range from 0.3 to 0.7
-        self.target_position = np.random.uniform(
-            [0.1 - position_range, -0.5, 0.1],
-            [0.1 + position_range, 0.5, 0.5]
-        )
-
-        # Adjust target orientation difficulty: increase variability over episodes
-        orientation_variability = np.pi / 8 + (np.pi / 4) * (episode_number / total_episodes)  # Increase variability
-        random_euler = np.random.uniform(-orientation_variability, orientation_variability, 3)
-        self.target_orientation = p.getQuaternionFromEuler(random_euler)
-
-        # Optionally, visualize the target position in the simulation
+        # Visualize the target position in the simulation
         if hasattr(self, 'target_marker'):
             p.removeBody(self.target_marker)
         self.target_marker = p.loadURDF(
             "sphere_small.urdf",
             self.target_position,
+            self.target_orientation,
             globalScaling=0.05,
             useFixedBase=True
         )
@@ -160,17 +166,14 @@ class InverseKinematicsEnv(gym.Env):
         # Initialize prev_best with a large value or begin_distance
         self.prev_best = float('inf')  # or self.begin_distance
 
-        # Adjust success thresholds based on episode number
-        self.success_threshold = 0.05
-        #self.success_threshold = max(0.05 - (episode_number / total_episodes) * 0.04, 0.01)  # Decrease threshold
+        # Adjust success threshold based on episode number (optional)
+        self.success_threshold = max(0.1 - (self.episode_number / total_episodes) * 0.099, 0.01)
 
-        # Adjust maximum episode steps to increase difficulty over time
-        self.max_episode_steps = int(self.max_episode_steps * (1 - episode_number / total_episodes))
+        # Adjust maximum episode steps to increase difficulty over time (optional)
+        self.max_episode_steps = int(self.max_episode_steps * (1 - self.episode_number / total_episodes))
 
-        # Optionally, change environment dynamics like gravity or external forces
-        # Increase gravity slightly over time to simulate a more challenging environment
-        #gravity_factor = 1 + (episode_number / total_episodes) * 0.5  # Increase gravity by up to 50%
-        p.setGravity(0, 0, -9.8 )
+        # Optionally, change environment dynamics
+        # p.setGravity(0, 0, -9.8 * (1 + (self.episode_number / total_episodes) * 0.5))
 
         # Return the initial observations for all agents
         return self.get_all_agent_observations()
@@ -266,7 +269,7 @@ class InverseKinematicsEnv(gym.Env):
             joint_errors.append(joint_error)
 
             # Log the agent's reward, error, and success
-            logging.info(f"Step {self.current_step}, Joint {i} - Reward: {joint_reward:.6f}, "
+            logging.info(f"Step {self.episode_number}, Joint {i} - Reward: {joint_reward:.6f}, "
                         f"Joint Error: {joint_error:.6f}")
 
         # Store joint errors for access in the training loop

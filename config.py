@@ -17,8 +17,8 @@ config = {
     'batch_size': 1024,                      # Batch size for training
     'buffer_size': 4096,                   # Size of the replay buffer
 
-    'num_episodes': 1000,                  # Number of episodes to train
-    'max_steps_per_episode': 200,          # Maximum number of steps per episode
+    'num_episodes': 10,                  # Number of episodes to train
+    'max_steps_per_episode': 3,          # Maximum number of steps per episode
 
     'test_agent_after_training': True,     # Whether to test the agent after training
     'num_tests': 5,                        # Number of test episodes to run after training
