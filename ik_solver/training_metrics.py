@@ -180,7 +180,30 @@ class TrainingMetrics:
 
     def plot_metrics(self, metrics, num_episodes, env):
         logging.info("Starting to plot metrics")
-        
+        # Use MATLAB-like style
+        plt.style.use('classic')
+
+        # Set global parameters to resemble MATLAB-like look
+            # Enable LaTeX-like style
+        plt.rcParams.update({
+            'text.usetex': False,  # Disable LaTeX rendering
+            'font.family': 'serif',  # Use a serif font like LaTeX
+            'font.serif': 'Times New Roman',
+            'axes.labelsize': 14,
+            'axes.titlesize': 16,
+            'font.size': 12,
+            'legend.fontsize': 12,
+            'xtick.labelsize': 12,
+            'ytick.labelsize': 12,
+            'figure.figsize': (10, 6),
+            'axes.grid': True,
+            'grid.linestyle': '--',
+            'grid.alpha': 0.6,
+            'legend.frameon': True,
+            'legend.framealpha': 0.9,
+            'savefig.dpi': 300,
+            'savefig.bbox': 'tight'
+        })
         # Check that the metrics dictionary has required keys
         if not metrics or 'mean_joint_errors' not in metrics or 'max_joint_errors' not in metrics:
             logging.error("Metrics dictionary is missing required keys")
