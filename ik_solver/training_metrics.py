@@ -184,26 +184,22 @@ class TrainingMetrics:
         plt.style.use('classic')
 
         # Set global parameters to resemble MATLAB-like look
-            # Enable LaTeX-like style
         plt.rcParams.update({
-            'text.usetex': False,  # Disable LaTeX rendering
-            'font.family': 'serif',  # Use a serif font like LaTeX
-            'font.serif': 'Times New Roman',
-            'axes.labelsize': 14,
-            'axes.titlesize': 16,
-            'font.size': 12,
-            'legend.fontsize': 12,
-            'xtick.labelsize': 12,
-            'ytick.labelsize': 12,
-            'figure.figsize': (10, 6),
-            'axes.grid': True,
-            'grid.linestyle': '--',
-            'grid.alpha': 0.6,
-            'legend.frameon': True,
-            'legend.framealpha': 0.9,
-            'savefig.dpi': 300,
-            'savefig.bbox': 'tight'
+            'lines.linewidth': 2,  # Set default line width
+            'axes.labelsize': 14,  # Set label font size
+            'axes.titlesize': 16,  # Set title font size
+            'axes.grid': True,     # Enable grid by default
+            'grid.alpha': 0.7,     # Set grid transparency
+            'grid.linestyle': '--',  # Set dashed grid line style
+            'legend.fontsize': 12,  # Set legend font size
+            'legend.frameon': True,  # Add frame around legend
+            'font.family': 'sans-serif',  # Set font to sans-serif
+            'font.sans-serif': 'Arial',   # Set default font family
+            'xtick.labelsize': 12,  # X-axis tick label size
+            'ytick.labelsize': 12,  # Y-axis tick label size
+            'figure.figsize': (10, 6)  # Default figure size
         })
+
         # Check that the metrics dictionary has required keys
         if not metrics or 'mean_joint_errors' not in metrics or 'max_joint_errors' not in metrics:
             logging.error("Metrics dictionary is missing required keys")
