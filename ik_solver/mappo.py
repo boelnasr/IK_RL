@@ -1,12 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F  # Import functional module for ELU and other activations
 from torch.distributions import Normal
 import numpy as np
 import logging
-import json
-import matplotlib.pyplot as plt
-from collections import deque
 from config import config
 
 # Initialize device based on CUDA availability
@@ -23,15 +21,13 @@ from .training_metrics import TrainingMetrics
 class JointActor(nn.Module):
     def __init__(self, input_dim, hidden_dim, action_dim):
         super(JointActor, self).__init__()
-        self.actor = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim),
-            nn.Tanh()  # Use Tanh to bound actions between -1 and 1
-        )
-        # Use a single scalar log_std parameter for simplicity
+        # Define the layers with LayerNorm and ELU activations
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, action_dim)
+        # Log standard deviation as a parameter
         self.log_std = nn.Parameter(torch.zeros(1))
 
         # Initialize weights
@@ -43,22 +39,23 @@ class JointActor(nn.Module):
             nn.init.zeros_(m.bias)
 
     def forward(self, state):
-        action_mean = self.actor(state)  # Output is bounded between -1 and 1
-        action_std = self.log_std.exp().expand_as(action_mean)
-        # Ensure std is not too small
-        action_std = torch.clamp(action_std, min=1e-3)
+        # Use torch.nn.functional.elu instead of torch.elu
+        x = F.elu(self.ln1(self.fc1(state)))
+        x = F.elu(self.ln2(self.fc2(x)))
+        action_mean = torch.tanh(self.fc3(x))  # Bounded output between -1 and 1
+        action_std = F.softplus(self.log_std).expand_as(action_mean)  # Ensure std is positive
         return action_mean, action_std
+
 
 class CentralizedCritic(nn.Module):
     def __init__(self, state_dim, hidden_dim):
         super(CentralizedCritic, self).__init__()
-        self.critic = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
-        )
+        # Define layers with LayerNorm and ELU activations
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, 1)  # Output a single value for state-value estimation
 
         # Initialize weights
         self.apply(self.init_weights)
@@ -69,7 +66,10 @@ class CentralizedCritic(nn.Module):
             nn.init.zeros_(m.bias)
 
     def forward(self, states):
-        return self.critic(states)
+        # Use torch.nn.functional.elu instead of torch.elu
+        x = F.elu(self.ln1(self.fc1(states)))
+        x = F.elu(self.ln2(self.fc2(x)))
+        return self.fc3(x)
 
 class MAPPOAgent:
     def __init__(self, env, config):
@@ -284,7 +284,7 @@ class MAPPOAgent:
             log_probs.append(log_prob.item())
         return actions, log_probs
 
-        
+
     def compute_gae(self, rewards, dones, values):
         advantages = []
         returns = []
