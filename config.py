@@ -16,7 +16,9 @@ config = {
     'ppo_epochs': 200,                      # Number of PPO epochs per update
     'batch_size': 1024,                      # Batch size for training
     'buffer_size': 4096,                   # Size of the replay buffer
-
+    'initial_epsilon': 1.0,
+    'epsilon_decay': 0.995,
+    'min_epsilon':0.01,
     'num_episodes': 100,                  # Number of episodes to train
     'max_steps_per_episode': 50,          # Maximum number of steps per episode
 

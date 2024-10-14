@@ -34,6 +34,13 @@ class InverseKinematicsEnv(gym.Env):
         super(InverseKinematicsEnv, self).__init__()
         self.episode_number=0
         self.total_episodes=config.get('num_episodes', 1000)
+        # Define minimum and maximum success thresholds
+        self.min_success_threshold = 0.01  # Minimum threshold (more strict)
+        self.max_success_threshold = 0.1   # Maximum threshold (more lenient)
+        
+        # Initialize success threshold to the maximum value
+        self.success_threshold = self.max_success_threshold
+        
         # PyBullet setup
         self.physics_client = p.connect(p.GUI)  # Use p.DIRECT for headless simulation
         p.setAdditionalSearchPath(pybullet_data.getDataPath())  # PyBullet data path
@@ -120,17 +127,20 @@ class InverseKinematicsEnv(gym.Env):
         orientation = link_state[1]  # (qx, qy, qz, qw)
         
         return np.concatenate([position, orientation])
+    
     def reset(self):
         """
-        Resets the environment and adjusts difficulty based on the episode number.
-
-        Args:
-            episode_number (int): Current episode number.
-            total_episodes (int): Total number of episodes for training.
+        Resets the environment by setting the robot's joint angles to random values
+        and generating a new random target pose for the end-effector.
 
         Returns:
             list: A list of observations for each agent.
         """
+        # Adjust the success threshold for the new episode
+        episode_progress = self.episode_number / self.total_episodes
+        self.success_threshold = self.max_success_threshold - episode_progress * (self.max_success_threshold - self.min_success_threshold)
+        
+
         # Reset joint angles to random values within joint limits
         self.joint_angles = np.array([
             np.random.uniform(limit[0], limit[1]) for limit in self.joint_limits
@@ -141,32 +151,14 @@ class InverseKinematicsEnv(gym.Env):
         # Track the initial joint angles as the previous joint angles
         self.previous_joint_angles = np.copy(self.joint_angles)
 
-        # Compute the current end-effector pose using forward kinematics
-        current_pose = self.compute_forward_kinematics(self.joint_angles)
-        current_position = current_pose[:3]
-        current_orientation = current_pose[3:]  # Assuming quaternion
-
-        # Adjust target position difficulty: increase offset range over episodes
-        max_position_offset = 0.1 + 0.3 * (self.episode_number / self.total_episodes)  # From 0.1 to 0.4
-        position_offset = np.random.uniform(
-            low=-max_position_offset,
-            high=max_position_offset,
-            size=3
+        # Generate a new random target pose for the end-effector
+        # Ensure the target is within reachable workspace
+        self.target_position = np.random.uniform(
+            [0.1, -0.5, 0.1], [0.5, 0.5, 0.5]
         )
-        self.target_position = current_position + position_offset
-
-        # Adjust target orientation difficulty: increase variability over episodes
-        max_orientation_offset = (np.pi / 8) + (np.pi / 4) * (self.episode_number / self.total_episodes)
-        orientation_offset_euler = np.random.uniform(
-            low=-max_orientation_offset,
-            high=max_orientation_offset,
-            size=3
-        )
-        orientation_offset_quat = p.getQuaternionFromEuler(orientation_offset_euler)
-        self.target_orientation = p.multiplyTransforms(
-            [0, 0, 0], current_orientation,
-            [0, 0, 0], orientation_offset_quat
-        )[1]  # Extract the resulting orientation
+        # Random target orientation as a quaternion
+        random_euler = np.random.uniform(-np.pi, np.pi, 3)
+        self.target_orientation = p.getQuaternionFromEuler(random_euler)
 
         # Optionally, visualize the target position in the simulation
         if hasattr(self, 'target_marker'):
@@ -181,9 +173,8 @@ class InverseKinematicsEnv(gym.Env):
         # Reset step counter
         self.current_step = 0
 
-        # Update current position and orientation
-        self.current_position = current_position
-        self.current_orientation = current_orientation
+        # Get the current end-effector pose
+        self.current_position, self.current_orientation = self.get_current_pose()
 
         # Compute initial position and orientation errors
         self.position_error = self.current_position - self.target_position
@@ -201,20 +192,10 @@ class InverseKinematicsEnv(gym.Env):
 
         # Initialize prev_best with a large value or begin_distance
         self.prev_best = float('inf')  # or self.begin_distance
-
-        # Adjust success thresholds based on episode number
-        #self.success_threshold = 0.05  
-        self.success_threshold = max(0.1 - ((self.episode_number) / self.total_episodes) * 0.099, 0.01)
-
-        # Adjust maximum episode steps to increase difficulty over time
-        self.max_episode_steps = int(self.max_episode_steps * (1 - self.episode_number / self.total_episodes))
-
-        # Set gravity (if needed)
-        p.setGravity(0, 0, -9.8)
         self.episode_number += 1
+
         # Return the initial observations for all agents
         return self.get_all_agent_observations()
-
 
 
     def step(self, actions):
@@ -404,25 +385,18 @@ class InverseKinematicsEnv(gym.Env):
 
     def is_success(self, joint_errors):
         """
-        Check if the current state is successful based on the mean of joint errors.
-
-        Args:
-            joint_errors (np.array): Array of joint errors for each joint.
-
-        Returns:
-            bool: True if the mean joint error is below the success threshold.
+        Check if the current state is successful based on the mean of joint errors and variable success threshold.
         """
         # Calculate the mean of joint errors
         mean_joint_error = np.mean(joint_errors)
 
-        # Determine if the mean joint error is below a predefined threshold
+        # Determine if the mean joint error is below the current success threshold
         success = mean_joint_error < self.success_threshold
 
         # Log the success criteria
-        logging.info(f"Mean Joint Error: {mean_joint_error:.6f} (Threshold: {self.success_threshold}), Success: {success}")
+        logging.info(f"Mean Joint Error: {mean_joint_error:.6f} (Threshold: {self.success_threshold:.4f}), Success: {success}")
 
         return success
-
 
     def is_agent_success(self, joint_index, joint_errors):
         """

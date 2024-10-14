@@ -21,13 +21,15 @@ from .training_metrics import TrainingMetrics
 class JointActor(nn.Module):
     def __init__(self, input_dim, hidden_dim, action_dim):
         super(JointActor, self).__init__()
-        # Define the layers with LayerNorm and ELU activations
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.ln1 = nn.LayerNorm(hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.ln2 = nn.LayerNorm(hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, action_dim)
-        # Log standard deviation as a parameter
+        self.actor = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim),
+            nn.Tanh()  # Use Tanh to bound actions between -1 and 1
+        )
+        # Use a single scalar log_std parameter for simplicity
         self.log_std = nn.Parameter(torch.zeros(1))
 
         # Initialize weights
@@ -39,23 +41,22 @@ class JointActor(nn.Module):
             nn.init.zeros_(m.bias)
 
     def forward(self, state):
-        # Use torch.nn.functional.elu instead of torch.elu
-        x = F.elu(self.ln1(self.fc1(state)))
-        x = F.elu(self.ln2(self.fc2(x)))
-        action_mean = torch.tanh(self.fc3(x))  # Bounded output between -1 and 1
-        action_std = F.softplus(self.log_std).expand_as(action_mean)  # Ensure std is positive
+        action_mean = self.actor(state)  # Output is bounded between -1 and 1
+        action_std = self.log_std.exp().expand_as(action_mean)
+        # Ensure std is not too small
+        action_std = torch.clamp(action_std, min=1e-3)
         return action_mean, action_std
-
 
 class CentralizedCritic(nn.Module):
     def __init__(self, state_dim, hidden_dim):
         super(CentralizedCritic, self).__init__()
-        # Define layers with LayerNorm and ELU activations
-        self.fc1 = nn.Linear(state_dim, hidden_dim)
-        self.ln1 = nn.LayerNorm(hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.ln2 = nn.LayerNorm(hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, 1)  # Output a single value for state-value estimation
+        self.critic = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
 
         # Initialize weights
         self.apply(self.init_weights)
@@ -66,10 +67,7 @@ class CentralizedCritic(nn.Module):
             nn.init.zeros_(m.bias)
 
     def forward(self, states):
-        # Use torch.nn.functional.elu instead of torch.elu
-        x = F.elu(self.ln1(self.fc1(states)))
-        x = F.elu(self.ln2(self.fc2(x)))
-        return self.fc3(x)
+        return self.critic(states)
 
 class MAPPOAgent:
     def __init__(self, env, config):
@@ -80,6 +78,10 @@ class MAPPOAgent:
         self.num_agents = env.num_joints  # Assuming one agent per joint
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.hidden_dim = config.get('hidden_dim', 128)
+        # Initialize epsilon and decay rate for exploration noise
+        self.epsilon = config.get('initial_epsilon', 1.0)  # Starting exploration factor
+        self.epsilon_decay = config.get('epsilon_decay', 0.995)  # Decay rate for epsilon
+        self.min_epsilon = config.get('min_epsilon', 0.01)  # Minimum value for epsilon
         
         # Global default learning rate and clip parameter
         self.global_lr = config.get('lr', 1e-4)
@@ -173,12 +175,12 @@ class MAPPOAgent:
 
         # Normalize advantages safely
         advantages_mean = advantages.mean()
-        advantages_std = advantages.std()
+        advantages_std = advantages.std() if advantages.numel() > 1 else torch.tensor(1.0, device=advantages.device)
+        # Ensure the standard deviation is not too small to avoid division by zero
         if advantages_std > 1e-6:
             advantages = (advantages - advantages_mean) / (advantages_std + 1e-8)
         else:
             self.logger.warning("Advantages not normalized due to small std")
-
         # Prepare data for training
         dataset = torch.utils.data.TensorDataset(
             states_cat, actions_cat, log_probs_old_cat, advantages, returns
@@ -193,7 +195,8 @@ class MAPPOAgent:
                 batch_states, batch_actions, batch_log_probs_old, batch_advantages, batch_returns = batch
 
                 # Critic update
-                values = self.critic(batch_states).squeeze()
+                if values.shape != batch_returns.shape:
+                    batch_returns = batch_returns.view_as(values)
                 critic_loss = nn.MSELoss()(values, batch_returns)
                 self.critic_optimizer.zero_grad()
                 critic_loss.backward()
@@ -276,6 +279,7 @@ class MAPPOAgent:
             state_tensor = processed_states[agent_idx].unsqueeze(0)
             with torch.no_grad():
                 mean, std = agent(state_tensor)
+            std = std * self.epsilon  # Scale exploration noise by epsilon
             dist = Normal(mean, std)
             action = dist.sample()
             action = action.clamp(-1, 1)  # Ensure action bounds
