@@ -13,26 +13,26 @@ config = {
     'gamma': 0.98,                         # Discount factor for rewards
     'tau': 0.92,                           # GAE parameter for advantage estimation
     'clip_param': 0.2,                     # Global default PPO clip parameter
-    'ppo_epochs': 200,                      # Number of PPO epochs per update
-    'batch_size': 1024,                      # Batch size for training
+    'ppo_epochs': 50,                      # Number of PPO epochs per update
+    'batch_size': 32,                      # Batch size for training
     'buffer_size': 4096,                   # Size of the replay buffer
     'initial_epsilon': 1.0,
     'epsilon_decay': 0.995,
     'min_epsilon':0.01,
     'num_episodes': 100,                  # Number of episodes to train
-    'max_steps_per_episode': 50,          # Maximum number of steps per episode
+    'max_steps_per_episode': 5000,          # Maximum number of steps per episode
 
     'test_agent_after_training': True,     # Whether to test the agent after training
     'num_tests': 5,                        # Number of test episodes to run after training
 
     # Per-joint learning rates (optional, fall back to global 'lr' if not provided)
-    'lr_joint_0': 1e-4,                    # Learning rate for joint 0
-    'lr_joint_1': 3e-4,                    # Learning rate for joint 1
-    'lr_joint_2': 5e-4,                    # Learning rate for joint 2
-    'lr_joint_3': 3e-4,                    # Learning rate for joint 3
-    'lr_joint_4': 1e-4,                    # Learning rate for joint 4
-    'lr_joint_5': 3e-4,                    # Learning rate for joint 5
-    'lr_joint_6': 5e-4,                    # Learning rate for joint 6
+    'lr_joint_0': 1e-5,                    # Learning rate for joint 0
+    'lr_joint_1': 3e-5,                    # Learning rate for joint 1
+    'lr_joint_2': 1e-5,                    # Learning rate for joint 2
+    'lr_joint_3': 1e-5,                    # Learning rate for joint 3
+    'lr_joint_4': 1e-5,                    # Learning rate for joint 4
+    'lr_joint_5': 1e-5,                    # Learning rate for joint 5
+    'lr_joint_6': 1e-5,                    # Learning rate for joint 6
 
     # Per-joint PPO clip parameters (optional, fall back to global 'clip_param' if not provided)
     'clip_joint_0': 0.1,                   # PPO clip parameter for joint 0

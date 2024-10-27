@@ -46,7 +46,7 @@ def main():
         traceback.print_exc()  # This will print the full error stack trace to the console
 
     finally:
-        # Ensure that the environment is always closed properly
+        # Ensure that the environment is alw.ays closed properly
         if env is not None:
             env.close()  # Properly close the environment
         logging.info("Environment closed.")

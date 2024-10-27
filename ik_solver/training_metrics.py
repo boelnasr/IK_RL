@@ -30,7 +30,7 @@ class TrainingMetrics:
         Log metrics for a single episode, ensuring that joint errors and success list match the environment's joint count.
 
         Args:
-            joint_errors (list): Joint errors for each joint.
+            joint_errors (list): Joint errors for each time step (list of lists or arrays).
             rewards (list): Rewards for each step.
             success (list): Success status of the episode per joint (list of booleans).
             entropy (float): Entropy value for the episode.
@@ -39,6 +39,10 @@ class TrainingMetrics:
             policy_loss (float): Policy loss for the episode.
             env (InverseKinematicsEnv): Instance of the environment.
         """
+        # Ensure joint_errors is a list of lists (steps x joints)
+        if not isinstance(joint_errors, list) or not all(isinstance(je, list) or isinstance(je, np.ndarray) for je in joint_errors):
+            raise ValueError("joint_errors should be a list of lists or arrays, with each inner list representing joint errors at a step.")
+
         # Ensure success is a list with a value for each joint
         if not isinstance(success, (list, np.ndarray)):
             raise ValueError(f"Expected success to be a list or array, but got {type(success)}. Value: {success}")
@@ -47,25 +51,18 @@ class TrainingMetrics:
             raise ValueError(f"Expected success list length to match number of joints ({env.num_joints}), "
                             f"but got {len(success)}. Success values: {success}")
 
-        # Ensure joint_errors length matches the environment's joint count
-        if len(joint_errors) != env.num_joints:
-            logging.warning(f"Mismatch in joint_errors length. Expected {env.num_joints}, but got {len(joint_errors)}.")
-            return  # Skip logging for this episode if there's a mismatch
-
         # Log the metrics for the episode
         self.logs.append({
             "joint_errors": joint_errors,
             "rewards": rewards,
-            "success": success,  # Now a list of successes per joint
+            "success": success,
             "entropy": entropy,
             "actor_loss": actor_loss,
             "critic_loss": critic_loss,
-            "policy_loss": policy_loss  # Log policy loss
+            "policy_loss": policy_loss
         })
 
-        logging.info(f"Episode data logged successfully. Joint Errors: {joint_errors}, Success: {success}")
-
-
+        logging.info(f"Episode data logged successfully. Joint Errors collected over {len(joint_errors)} steps.")
 
     def save_logs(self, log_file=None):
         """
@@ -120,31 +117,29 @@ class TrainingMetrics:
             "max_joint_errors": [],
             "cumulative_rewards": [],
             "mean_episode_rewards": [],
-            "success_rate_per_agent": [[] for _ in range(env.num_joints)],  # Success rate per agent
+            "success_rate_per_agent": [[] for _ in range(env.num_joints)],
             "entropy": [],
             "actor_loss": [],
             "critic_loss": [],
-            "policy_loss": []  # Track policy loss
+            "policy_loss": []
         }
 
         for episode_idx, episode_log in enumerate(self.logs):
-            joint_errors = np.array(episode_log['joint_errors'])
+            joint_errors = np.array(episode_log['joint_errors'])  # Shape: (num_steps, num_joints)
 
             # Validate joint error dimensions
             if joint_errors.size == 0:
                 logging.warning(f"Empty joint errors for episode {episode_idx}. Skipping.")
                 continue
 
-            if joint_errors.ndim == 1:
-                joint_errors = joint_errors.reshape(1, -1)
-
-            # Ensure joint_errors has the correct number of joints
-            if joint_errors.shape[1] != env.num_joints:
-                logging.warning(f"Mismatch in joint error dimensions for episode {episode_idx}. "
-                                f"Expected {env.num_joints}, got {joint_errors.shape[1]}. Skipping this episode.")
+            # Ensure joint_errors has the correct shape
+            if joint_errors.ndim != 2 or joint_errors.shape[1] != env.num_joints:
+                logging.warning(f"Invalid joint error dimensions for episode {episode_idx}. "
+                                f"Expected 2D array with shape (num_steps, {env.num_joints}), "
+                                f"but got shape {joint_errors.shape}. Skipping this episode.")
                 continue
 
-            # Compute mean and max joint errors for the episode
+            # Compute mean and max joint errors across steps for the episode
             metrics["mean_joint_errors"].append(np.mean(joint_errors, axis=0))
             metrics["max_joint_errors"].append(np.max(joint_errors, axis=0))
 
@@ -178,7 +173,7 @@ class TrainingMetrics:
         return metrics
 
 
-    def plot_metrics(self, metrics, num_episodes, env):
+    def plot_metrics(self, metrics, env, show_plots=False):
         logging.info("Starting to plot metrics")
         # Use MATLAB-like style
         plt.style.use('classic')
@@ -197,7 +192,7 @@ class TrainingMetrics:
             'font.sans-serif': 'Arial',   # Set default font family
             'xtick.labelsize': 12,  # X-axis tick label size
             'ytick.labelsize': 12,  # Y-axis tick label size
-            'figure.figsize': (10, 6)  # Default figure size
+            'figure.figsize': (12, 8)  # Default figure size
         })
 
         # Check that the metrics dictionary has required keys
@@ -227,117 +222,118 @@ class TrainingMetrics:
         if max_errors.ndim == 1:
             max_errors = max_errors.reshape(-1, 1)
 
-        # Verify the number of episodes
-        if mean_errors.shape[0] != num_episodes or max_errors.shape[0] != num_episodes:
-            logging.warning(f"Mismatch in number of episodes. Expected {num_episodes}, got {mean_errors.shape[0]}")
-        
+        # Derive number of episodes from data
+        num_episodes = mean_errors.shape[0]
+        episodes = np.arange(1, num_episodes + 1)
+
         # Check if mean_errors and max_errors match the number of joints in the environment
         if mean_errors.shape[1] != env.num_joints or max_errors.shape[1] != env.num_joints:
             logging.error(f"Mismatch in number of joints. Expected {env.num_joints}, got {mean_errors.shape[1]}")
             return
 
-        # Define x-axis values for plotting
-        episodes = np.arange(1, num_episodes + 1)
+        # Plot Mean and Max Joint Errors for each joint in subplots
+        num_joints = env.num_joints
+        fig, axes = plt.subplots(nrows=num_joints, ncols=1, figsize=(12, 4 * num_joints))
+        if num_joints == 1:
+            axes = [axes]  # Ensure axes is iterable
 
+        for joint_idx in range(num_joints):
+            ax = axes[joint_idx]
+            ax.plot(episodes, mean_errors[:, joint_idx], label=f'Joint {joint_idx+1} Mean Error', color='b')
+            ax.plot(episodes, max_errors[:, joint_idx], label=f'Joint {joint_idx+1} Max Error', color='r')
+            ax.set_xlabel('Episodes')
+            ax.set_ylabel('Joint Error')
+            ax.set_title(f'Joint {joint_idx+1} Mean and Max Errors Over Time')
+            ax.legend()
+            ax.grid(True)
 
-        try:
-            # Plot Mean Joint Errors
-            plt.figure(figsize=(10, 6))
-            for joint_idx in range(env.num_joints):
-                plt.plot(episodes, mean_errors[:, joint_idx], label=f'Joint {joint_idx+1} Mean Error')
-            plt.xlabel('Episodes')
-            plt.ylabel('Mean Joint Errors')
-            plt.title('Mean Joint Errors Over Time')
-            plt.legend()
-            plt.grid(True)
-            plt.savefig('mean_joint_errors.png')
-            logging.info("Mean joint errors plot saved successfully.")
+        plt.tight_layout()
+        plt.savefig('joint_errors_per_joint.png')
+        logging.info("Joint errors per joint plot saved successfully.")
+        if show_plots:
             plt.show()
+        plt.close()
 
-            # Plot Max Joint Errors
-            plt.figure(figsize=(10, 6))
-            for joint_idx in range(env.num_joints):
-                plt.plot(episodes, max_errors[:, joint_idx], label=f'Joint {joint_idx+1} Max Error')
-            plt.xlabel('Episodes')
-            plt.ylabel('Max Joint Errors')
-            plt.title('Max Joint Errors Over Time')
-            plt.legend()
-            plt.grid(True)
-            plt.savefig('max_joint_errors.png')
-            logging.info("Max joint errors plot saved successfully.")
+        # Continue with the rest of your plotting code...
+        # Plot Cumulative Rewards
+        plt.figure(figsize=(10, 6))
+        plt.plot(episodes, metrics['cumulative_rewards'], label='Cumulative Rewards', color='b')
+        plt.xlabel('Episodes')
+        plt.ylabel('Cumulative Rewards')
+        plt.title('Cumulative Rewards Over Time')
+        plt.grid(True)
+        plt.savefig('cumulative_rewards.png')
+        logging.info("Cumulative rewards plot saved successfully.")
+        if show_plots:
             plt.show()
+        plt.close()
 
-            # Plot Cumulative Rewards
-            plt.figure(figsize=(10, 6))
-            plt.plot(episodes, metrics['cumulative_rewards'], label='Cumulative Rewards', color='b')
-            plt.xlabel('Episodes')
-            plt.ylabel('Cumulative Rewards')
-            plt.title('Cumulative Rewards Over Time')
-            plt.grid(True)
-            plt.savefig('cumulative_rewards.png')
-            logging.info("Cumulative rewards plot saved successfully.")
+        # Plot Mean Episode Rewards
+        plt.figure(figsize=(10, 6))
+        plt.plot(episodes, metrics['mean_episode_rewards'], label='Mean Episode Rewards', color='g')
+        plt.xlabel('Episodes')
+        plt.ylabel('Mean Episode Rewards')
+        plt.title('Mean Episode Rewards Over Time')
+        plt.grid(True)
+        plt.savefig('mean_episode_rewards.png')
+        logging.info("Mean episode rewards plot saved successfully.")
+        if show_plots:
             plt.show()
+        plt.close()
 
-            # Plot Mean Episode Rewards
-            plt.figure(figsize=(10, 6))
-            plt.plot(episodes, metrics['mean_episode_rewards'], label='Mean Episode Rewards', color='g')
-            plt.xlabel('Episodes')
-            plt.ylabel('Mean Episode Rewards')
-            plt.title('Mean Episode Rewards Over Time')
-            plt.grid(True)
-            plt.savefig('mean_episode_rewards.png')
-            logging.info("Mean episode rewards plot saved successfully.")
+        # Plot Success Rate per Agent
+        plt.figure(figsize=(10, 6))
+        for joint_idx in range(env.num_joints):
+            agent_success_rate = np.cumsum(metrics['success_rate_per_agent'][joint_idx]) / np.arange(1, num_episodes + 1)
+            plt.plot(episodes, agent_success_rate, label=f'Joint {joint_idx+1} Success Rate')
+        plt.xlabel('Episodes')
+        plt.ylabel('Success Rate')
+        plt.title('Success Rate Per Agent Over Time')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig('success_rate_per_agent.png')
+        logging.info("Success rate per agent plot saved successfully.")
+        if show_plots:
             plt.show()
+        plt.close()
 
-            # Plot Success Rate per Agent
-            plt.figure(figsize=(10, 6))
-            for joint_idx in range(env.num_joints):
-                agent_success_rate = np.cumsum(metrics['success_rate_per_agent'][joint_idx]) / np.arange(1, num_episodes + 1)
-                plt.plot(episodes, agent_success_rate, label=f'Joint {joint_idx+1} Success Rate')
-            plt.xlabel('Episodes')
-            plt.ylabel('Success Rate')
-            plt.title('Success Rate Per Agent Over Time')
-            plt.legend()
-            plt.grid(True)
-            plt.savefig('success_rate_per_agent.png')
-            logging.info("Success rate per agent plot saved successfully.")
+        # Plot Entropy
+        plt.figure(figsize=(10, 6))
+        plt.plot(episodes, metrics['entropy'], label='Entropy', color='c')
+        plt.xlabel('Episodes')
+        plt.ylabel('Entropy')
+        plt.title('Entropy Over Time')
+        plt.grid(True)
+        plt.savefig('entropy.png')
+        logging.info("Entropy plot saved successfully.")
+        if show_plots:
             plt.show()
+        plt.close()
 
-            # Plot Entropy
-            plt.figure(figsize=(10, 6))
-            plt.plot(episodes, metrics['entropy'], label='Entropy', color='c')
-            plt.xlabel('Episodes')
-            plt.ylabel('Entropy')
-            plt.title('Entropy Over Time')
-            plt.grid(True)
-            plt.savefig('entropy.png')
-            logging.info("Entropy plot saved successfully.")
+        # Plot Actor and Critic Loss
+        plt.figure(figsize=(10, 6))
+        plt.plot(episodes, metrics['actor_loss'], label='Actor Loss', color='m')
+        plt.plot(episodes, metrics['critic_loss'], label='Critic Loss', color='y')
+        plt.xlabel('Episodes')
+        plt.ylabel('Loss')
+        plt.title('Actor and Critic Loss Over Time')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig('actor_critic_loss.png')
+        logging.info("Actor and critic loss plot saved successfully.")
+        if show_plots:
             plt.show()
+        plt.close()
 
-            # Plot Actor and Critic Loss
-            plt.figure(figsize=(10, 6))
-            plt.plot(episodes, metrics['actor_loss'], label='Actor Loss', color='m')
-            plt.plot(episodes, metrics['critic_loss'], label='Critic Loss', color='y')
-            plt.xlabel('Episodes')
-            plt.ylabel('Loss')
-            plt.title('Actor and Critic Loss Over Time')
-            plt.legend()
-            plt.grid(True)
-            plt.savefig('actor_critic_loss.png')
-            logging.info("Actor and critic loss plot saved successfully.")
+        # Plot Policy Loss
+        plt.figure(figsize=(10, 6))
+        plt.plot(episodes, metrics['policy_loss'], label='Policy Loss', color='orange')
+        plt.xlabel('Episodes')
+        plt.ylabel('Policy Loss')
+        plt.title('Policy Loss Over Time')
+        plt.grid(True)
+        plt.savefig('policy_loss.png')
+        logging.info("Policy loss plot saved successfully.")
+        if show_plots:
             plt.show()
-
-            # Plot Policy Loss
-            plt.figure(figsize=(10, 6))
-            plt.plot(episodes, metrics['policy_loss'], label='Policy Loss', color='orange')
-            plt.xlabel('Episodes')
-            plt.ylabel('Policy Loss')
-            plt.title('Policy Loss Over Time')
-            plt.grid(True)
-            plt.savefig('policy_loss.png')
-            logging.info("Policy loss plot saved successfully.")
-            plt.show()
-
-        except Exception as e:
-            logging.error(f"Error occurred while plotting metrics: {e}")
-            raise
+        plt.close()

@@ -32,17 +32,18 @@ class InverseKinematicsEnv(gym.Env):
             max_episode_steps (int): Maximum number of steps per episode.
         """
         super(InverseKinematicsEnv, self).__init__()
-        self.episode_number=0
-        self.total_episodes=config.get('num_episodes', 1000)
+        self.episode_number = 0
+        self.total_episodes = config.get('num_episodes', 1000)
+
         # Define minimum and maximum success thresholds
-        self.min_success_threshold = 0.01  # Minimum threshold (more strict)
+        self.min_success_threshold = 0.001  # Minimum threshold (more strict)
         self.max_success_threshold = 0.1   # Maximum threshold (more lenient)
-        
+
         # Initialize success threshold to the maximum value
         self.success_threshold = self.max_success_threshold
-        
+
         # PyBullet setup
-        self.physics_client = p.connect(p.GUI)  # Use p.DIRECT for headless simulation
+        self.physics_client = p.connect(p.DIRECT)  # Use p.DIRECT for headless simulation
         p.setAdditionalSearchPath(pybullet_data.getDataPath())  # PyBullet data path
         p.setGravity(0, 0, -9.8)  # Set gravity for the simulation
         self.sim_timestep = sim_timestep
@@ -98,6 +99,7 @@ class InverseKinematicsEnv(gym.Env):
         self.max_episode_steps = max_episode_steps
         self.position_threshold = 0.1  # Define appropriate value
         self.orientation_threshold = 0.1  # Define appropriate value in radians
+
         # Set the success threshold for the distance
         self.success_threshold = 0.05  # Adjust this value as needed
         print(f"Number of joints in the robot: {self.num_joints}")
@@ -394,7 +396,7 @@ class InverseKinematicsEnv(gym.Env):
         success = mean_joint_error < self.success_threshold
 
         # Log the success criteria
-        logging.info(f"Mean Joint Error: {mean_joint_error:.6f} (Threshold: {self.success_threshold:.4f}), Success: {success}")
+        #print(f"Mean Joint Error: {mean_joint_error:.6f} (Threshold: {self.success_threshold:.4f}), Success: {success}")
 
         return success
 

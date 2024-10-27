@@ -194,14 +194,16 @@ class MAPPOAgent:
             for batch in loader:
                 batch_states, batch_actions, batch_log_probs_old, batch_advantages, batch_returns = batch
 
+                # Compute values for the current batch
+                values = self.critic(batch_states).squeeze()
+
                 # Critic update
-                if values.shape != batch_returns.shape:
-                    batch_returns = batch_returns.view_as(values)
                 critic_loss = nn.MSELoss()(values, batch_returns)
                 self.critic_optimizer.zero_grad()
                 critic_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=0.5)
                 self.critic_optimizer.step()
+
 
                 # Actor update
                 for agent_idx, agent in enumerate(self.agents):
@@ -324,8 +326,6 @@ class MAPPOAgent:
         
         return advantages.detach(), returns.detach()
 
-
-
     def train(self, num_episodes, max_steps_per_episode=100):
         logging.info(f"Starting training for {num_episodes} episodes")
 
@@ -335,6 +335,10 @@ class MAPPOAgent:
             step = 0
             total_rewards = [[] for _ in range(self.num_agents)]  # Store rewards per joint
             total_errors = [[] for _ in range(self.num_agents)]   # Store errors per joint
+
+            # Initialize total_joint_errors to collect joint errors over the episode
+            total_joint_errors = []
+
             trajectories = [{'states': [], 'actions': [], 'log_probs': [], 'rewards': [], 'dones': []} for _ in range(self.num_agents)]
             logging.info(f"Episode {episode} - Initializing episode variables")
 
@@ -343,8 +347,11 @@ class MAPPOAgent:
                 next_state, rewards, done, info = self.env.step(actions)
 
                 # Retrieve joint errors and success status from the environment
-                joint_errors = self.env.joint_errors
+                joint_errors = self.env.joint_errors.copy()  # Copy the joint errors to avoid referencing the same array
                 success_per_agent = info['success_per_agent']
+
+                # Append joint_errors to total_joint_errors
+                total_joint_errors.append(joint_errors)
 
                 # For each agent, store experiences
                 for agent_idx in range(self.num_agents):
@@ -377,9 +384,9 @@ class MAPPOAgent:
                     torch.save(self.best_agents_state_dict[agent_idx], f"best_agent_joint_{agent_idx}.pth")
                     logging.info(f"New best agent for joint {agent_idx} saved with Mean Joint Error: {mean_joint_error:.6f}")
 
-            # Log metrics for this episode
+            # Log metrics for this episode, passing all joint errors
             self.training_metrics.log_episode(
-                joint_errors=joint_errors,
+                joint_errors=total_joint_errors,  # Pass the list of joint errors over the episode
                 rewards=rewards,
                 success=success_per_agent,
                 entropy=entropy,
@@ -403,7 +410,8 @@ class MAPPOAgent:
         # After training, save logs and plot metrics
         self.training_metrics.save_logs("training_logs.json")
         metrics = self.training_metrics.calculate_metrics(env=self.env)
-        self.training_metrics.plot_metrics(metrics, num_episodes, self.env)
+        self.training_metrics.plot_metrics(metrics, self.env, show_plots=True)
+
 
     def test_agent(self, env, num_episodes, max_steps=1000):
         """
