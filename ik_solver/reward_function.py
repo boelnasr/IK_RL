@@ -83,7 +83,7 @@ def compute_reward(distance, begin_distance, prev_best, success_threshold=0.006)
 
     # Check if the agent has reached the target
     if distance <= success_threshold:
-        reward = 2000.0 + (success_threshold - distance)*1000
+        reward = 200.0 + (success_threshold - distance)*1000
         success = True
 
     return reward, prev_best, success

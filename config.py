@@ -20,7 +20,7 @@ config = {
     'epsilon_decay': 0.995,
     'min_epsilon':0.01,
     'num_episodes': 100,                  # Number of episodes to train
-    'max_steps_per_episode': 5000,          # Maximum number of steps per episode
+    'max_steps_per_episode': 100,          # Maximum number of steps per episode
 
     'test_agent_after_training': True,     # Whether to test the agent after training
     'num_tests': 5,                        # Number of test episodes to run after training
@@ -42,4 +42,22 @@ config = {
     'clip_joint_4': 0.1,                   # PPO clip parameter for joint 4
     'clip_joint_5': 0.2,                   # PPO clip parameter for joint 5
     'clip_joint_6': 0.3                    # PPO clip parameter for joint 6
+}
+attention_config = {
+    'num_heads': 4,               # Number of attention heads
+    'head_dim': 64,              # Dimension of each attention head
+    'attention_dropout': 0.1,     # Dropout rate for attention
+    'key_dim': 64,               # Key dimension
+    'value_dim': 64,             # Value dimension
+    'query_dim': 64,             # Query dimension
+    'output_dim': 256,           # Output dimension after attention
+    'use_bias': True             # Whether to use bias in projections
+}
+encoder_config = {
+    'input_dim': 7,        # 1 joint angle + 3 position error + 3 orientation error
+    'hidden_dim': 128,     # Hidden layer dimension
+    'embedding_dim': 64,   # Embedding dimension
+    'num_layers': 2,       # Number of encoder layers
+    'dropout': 0.1,        # Dropout rate
+    'use_layer_norm': True # Whether to use layer normalization
 }
