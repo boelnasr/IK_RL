@@ -3,34 +3,31 @@ import pybullet as p
 
 def compute_position_error(current_position, target_position):
     """
-    Computes the Euclidean distance between the current and target positions.
-
-    Args:
-        current_position (np.array): The current position of the end-effector.
-        target_position (np.array): The target position of the end-effector.
-
-    Returns:
-        float: The Euclidean distance.
+    Enhanced position error calculation with debugging.
     """
-    return np.linalg.norm(current_position - target_position)
+    error = np.linalg.norm(current_position - target_position)
+    print(f"Debug - Position Error: {error:.6f}")
+    print(f"Debug - Current Position: {current_position}")
+    print(f"Debug - Target Position: {target_position}")
+    return max(error, 1e-6)  # Ensure non-zero error
 
 def compute_quaternion_distance(current_orientation, target_orientation):
     """
-    Computes the quaternion distance between two quaternions.
-
-    Args:
-        current_orientation (np.array): Current orientation quaternion [w, x, y, z].
-        target_orientation (np.array): Target orientation quaternion [w, x, y, z].
-
-    Returns:
-        float: Quaternion distance in radians.
+    Enhanced quaternion distance calculation with debugging.
     """
-    # Compute the dot product of the quaternions
-    dot_product = np.clip(np.dot(current_orientation, target_orientation), -1.0, 1.0)
+    # Ensure inputs are numpy arrays
+    current_orientation = np.array(current_orientation)
+    target_orientation = np.array(target_orientation)
     
-    # Calculate the angular distance using arccos of the dot product
+    print(f"Debug - Current Orientation: {current_orientation}")
+    print(f"Debug - Target Orientation: {target_orientation}")
+    
+    # Compute dot product with safety checks
+    dot_product = np.clip(np.dot(current_orientation, target_orientation), -1.0 + 1e-6, 1.0 - 1e-6)
     distance = 2 * np.arccos(np.abs(dot_product))
-    return distance
+    
+    print(f"Debug - Quaternion Distance: {distance:.6f}")
+    return max(distance, 1e-6)  # Ensure non-zero distance
 
 def compute_overall_distance(current_position, target_position, current_orientation, target_orientation):
     """
@@ -55,6 +52,7 @@ def compute_overall_distance(current_position, target_position, current_orientat
     overall_distance = euclidean_distance + quaternion_distance
     return overall_distance
 
+
 def compute_reward(distance, begin_distance, prev_best, success_threshold=0.006):
     """
     Computes the reward or punishment based on the current distance.
@@ -78,12 +76,12 @@ def compute_reward(distance, begin_distance, prev_best, success_threshold=0.006)
         reward = prev_best - distance  # Negative value
     else:
         # The agent moved closer to the target, provide reward
-        reward = begin_distance - distance
+        reward = abs(begin_distance - distance)/10
         prev_best = distance  # Update prev_best
 
     # Check if the agent has reached the target
     if distance <= success_threshold:
-        reward = 200.0 + (success_threshold - distance)*1000
+        reward = 2000 + (success_threshold - distance)*1000
         success = True
 
     return reward, prev_best, success
@@ -157,21 +155,35 @@ def assign_joint_weights(jacobian_linear, jacobian_angular):
 
 def compute_weighted_joint_rewards(joint_errors, linear_weights, angular_weights, overall_reward):
     """
-    Compute individual joint rewards based on their contribution and the overall reward.
-
-    Args:
-        joint_errors (list): Errors for each joint.
-        linear_weights (np.array): Linear weights for each joint.
-        angular_weights (np.array): Angular weights for each joint.
-        overall_reward (float): The overall reward for the step.
-
-    Returns:
-        list: Individual rewards for each joint.
+    Enhanced joint reward calculation with debugging and minimum values.
     """
-    # Normalize the joint errors to compute their relative contribution
-    joint_error_norms = np.linalg.norm(joint_errors)
-    normalized_joint_errors = joint_errors / (joint_error_norms + 1e-8)
-
-    # Compute individual rewards by considering the weighted errors
-    joint_rewards = overall_reward * (linear_weights + angular_weights) * normalized_joint_errors
+    epsilon = 1e-6
+    
+    # Print debug information
+    print("Debug - Joint Errors:", joint_errors)
+    print("Debug - Overall Reward:", overall_reward)
+    
+    # Ensure joint errors aren't zero
+    joint_errors = np.array(joint_errors)
+    joint_errors = np.maximum(np.abs(joint_errors), epsilon)
+    
+    # Calculate error norm with minimum value
+    joint_error_norms = max(np.linalg.norm(joint_errors), epsilon)
+    normalized_joint_errors = joint_errors / joint_error_norms
+    
+    print("Debug - Normalized Joint Errors:", normalized_joint_errors)
+    
+    # Combine weights with minimum values
+    combined_weights = np.maximum(linear_weights + angular_weights, epsilon)
+    
+    # Calculate rewards with minimum value
+    joint_rewards = overall_reward * combined_weights * normalized_joint_errors
+    
+    # Ensure at least some small reward/penalty
+    joint_rewards = np.where(joint_rewards == 0, 
+                           np.sign(overall_reward) * epsilon,
+                           joint_rewards)
+    
+    print("Debug - Final Joint Rewards:", joint_rewards)
+    
     return joint_rewards

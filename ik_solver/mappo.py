@@ -7,8 +7,9 @@ import numpy as np
 import logging
 from config import config
 from collections import deque
-import random
+from .reward_function import (compute_jacobian_angular, compute_jacobian_linear, compute_position_error, compute_quaternion_distance, compute_reward, compute_overall_distance,assign_joint_weights,compute_weighted_joint_rewards)
 from torch.distributions import Normal
+import pybullet as p
 
 # Initialize device based on CUDA availability
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -542,6 +543,8 @@ class MAPPOAgent:
         returns = torch.tensor(returns, dtype=torch.float32).to(self.device)
         
         return advantages.detach(), returns.detach()
+
+
     def train(self, num_episodes, max_steps_per_episode=100):
         logging.info(f"Starting training for {num_episodes} episodes")
 
@@ -553,57 +556,151 @@ class MAPPOAgent:
             total_errors = [[] for _ in range(self.num_agents)]
             total_joint_errors = []
 
-            # Initialize trajectories
-            trajectories = [{'states': [], 'actions': [], 'log_probs': [], 'rewards': [], 'dones': []} for _ in range(self.num_agents)]
+            # Initialize tracking variables
+            begin_distance = None
+            prev_best = float('inf')
+            cumulative_reward = 0
+
+            # Get initial joint angles
+            initial_joint_angles = [p.getJointState(self.env.robot_id, i)[0] 
+                                for i in self.env.joint_indices]
+            print(f"Episode {episode} - Initial joint angles: {initial_joint_angles}")
+
+            # Initialize trajectories for each agent
+            trajectories = [{'states': [], 'actions': [], 'log_probs': [], 'rewards': [], 'dones': []} 
+                            for _ in range(self.num_agents)]
             logging.info(f"Episode {episode} - Initializing episode variables")
 
             while not done and step < max_steps_per_episode:
+                # Get current joint angles before action
+                pre_action_angles = [p.getJointState(self.env.robot_id, i)[0] 
+                                for i in self.env.joint_indices]
+                
                 actions, log_probs = self.get_actions(state)
                 next_state, rewards, done, info = self.env.step(actions)
 
-                # Ensure rewards and joint_errors have the correct shape and length
-                joint_errors = self.env.joint_errors.copy()
-                success_per_agent = info.get('success_per_agent', [False] * self.num_agents)
+                # Get post-action joint angles
+                post_action_angles = [p.getJointState(self.env.robot_id, i)[0] 
+                                    for i in self.env.joint_indices]
 
-                # Track joint errors across steps
+                # Debug joint movement
+                print(f"\nStep {step} Joint Movement:")
+                for i in range(self.num_agents):
+                    movement = abs(post_action_angles[i] - pre_action_angles[i])
+                    print(f"Joint {i}: {movement:.6f} radians")
+
+                # Fetch current and target poses for distance calculation
+                current_position, current_orientation = self.get_end_effector_pose()
+                target_position, target_orientation = self.get_target_pose()
+
+                # Calculate distance and update begin_distance
+                distance = compute_overall_distance(current_position, target_position, 
+                                                current_orientation, target_orientation)
+                if begin_distance is None:
+                    begin_distance = distance
+
+                # Compute Jacobians
+                jacobian_linear = compute_jacobian_linear(self.env.robot_id, 
+                                                        self.env.joint_indices, 
+                                                        post_action_angles)
+                jacobian_angular = compute_jacobian_angular(self.env.robot_id, 
+                                                        self.env.joint_indices, 
+                                                        post_action_angles)
+                
+                # Calculate weights and verify they're non-zero
+                linear_weights, angular_weights = assign_joint_weights(jacobian_linear, jacobian_angular)
+                print(f"\nWeights - Linear: {linear_weights}, Angular: {angular_weights}")
+
+                # Calculate joint errors with enhanced tracking
+                joint_errors = []
+                for i in range(self.num_agents):
+                    # Calculate error relative to previous position
+                    position_error = abs(post_action_angles[i] - pre_action_angles[i])
+                    
+                    # Calculate error relative to target
+                    target_error = abs(post_action_angles[i] - initial_joint_angles[i])
+                    
+                    # Combine errors with weighting
+                    combined_error = 0.3 * position_error + 0.7 * target_error
+                    joint_errors.append(max(combined_error, 1e-6))  # Ensure non-zero error
+                
+                print(f"Step {step} - Joint Errors: {joint_errors}")
                 total_joint_errors.append(joint_errors)
 
-                # Log rewards and joint errors for each agent
+                # Calculate rewards
+                overall_reward, prev_best, success = compute_reward(distance, begin_distance, prev_best)
+                joint_rewards = compute_weighted_joint_rewards(joint_errors, linear_weights, 
+                                                            angular_weights, overall_reward)
+                
+                print(f"Step {step} - Rewards: Overall={overall_reward:.4f}, Joint={joint_rewards}")
+
+                # Update cumulative reward
+                cumulative_reward = 0.95 * cumulative_reward + overall_reward
+
+                # Log rewards and errors for each agent
                 for agent_idx in range(self.num_agents):
-                    total_rewards[agent_idx].append(rewards[agent_idx])
+                    total_rewards[agent_idx].append(joint_rewards[agent_idx])
                     total_errors[agent_idx].append(joint_errors[agent_idx])
 
                     # Record experience in trajectories
                     agent_state = self._process_state(state)[agent_idx]
                     trajectories[agent_idx]['states'].append(agent_state)
-                    trajectories[agent_idx]['actions'].append(torch.tensor(actions[agent_idx], dtype=torch.float32).to(self.device))
-                    trajectories[agent_idx]['log_probs'].append(torch.tensor(log_probs[agent_idx], dtype=torch.float32).to(self.device))
-                    trajectories[agent_idx]['rewards'].append(torch.tensor(rewards[agent_idx], dtype=torch.float32).to(self.device))
+                    trajectories[agent_idx]['actions'].append(torch.tensor(actions[agent_idx], 
+                                                            dtype=torch.float32).to(self.device))
+                    trajectories[agent_idx]['log_probs'].append(torch.tensor(log_probs[agent_idx], 
+                                                            dtype=torch.float32).to(self.device))
+                    trajectories[agent_idx]['rewards'].append(torch.tensor(joint_rewards[agent_idx], 
+                                                            dtype=torch.float32).to(self.device))
                     trajectories[agent_idx]['dones'].append(done)
+
+                # Print trajectory statistics
+                if step % 10 == 0:
+                    for agent_idx in range(self.num_agents):
+                        traj = trajectories[agent_idx]
+                        print(f"\nAgent {agent_idx} Trajectory Stats:")
+                        print(f"States: min={torch.min(torch.stack(traj['states'])):.4f}, "
+                            f"max={torch.max(torch.stack(traj['states'])):.4f}")
+                        print(f"Actions: min={torch.min(torch.stack(traj['actions'])):.4f}, "
+                            f"max={torch.max(torch.stack(traj['actions'])):.4f}")
+                        print(f"Rewards: min={torch.min(torch.stack(traj['rewards'])):.4f}, "
+                            f"max={torch.max(torch.stack(traj['rewards'])):.4f}")
 
                 state = next_state
                 step += 1
 
-            # Update policy using accumulated trajectories
+            # Update policy and get losses
             actor_loss, critic_loss, entropy, policy_loss = self.update_policy(trajectories)
 
-            # Log and save the best-performing agents
+            # Calculate and log episode statistics
             for agent_idx in range(self.num_agents):
                 mean_joint_error = np.mean(total_errors[agent_idx])
-                logging.info(f"Episode {episode}, Joint {agent_idx} - Mean Joint Error: {mean_joint_error:.6f}")
+                max_joint_error = np.max(total_errors[agent_idx])
+                min_joint_error = np.min(total_errors[agent_idx])
+                
+                print(f"\nEpisode {episode}, Joint {agent_idx} Statistics:")
+                print(f"Mean Error: {mean_joint_error:.6f}")
+                print(f"Max Error: {max_joint_error:.6f}")
+                print(f"Min Error: {min_joint_error:.6f}")
+                print(f"Mean Reward: {np.mean(total_rewards[agent_idx]):.6f}")
 
-                # Update best agent's model if current mean_joint_error is better
+                # Save best model if improved
                 if mean_joint_error < self.best_joint_errors[agent_idx]:
                     self.best_joint_errors[agent_idx] = mean_joint_error
                     self.best_agents_state_dict[agent_idx] = self.agents[agent_idx].state_dict()
-                    torch.save(self.best_agents_state_dict[agent_idx], f"best_agent_joint_{agent_idx}.pth")
-                    logging.info(f"New best agent for joint {agent_idx} saved with Mean Joint Error: {mean_joint_error:.6f}")
+                    torch.save(self.best_agents_state_dict[agent_idx], 
+                            f"best_agent_joint_{agent_idx}.pth")
+                    logging.info(f"New best agent for joint {agent_idx} saved with "
+                            f"Mean Joint Error: {mean_joint_error:.6f}")
 
-            # Log training metrics for this episode
+            # Log episode metrics
+            success_status = info.get('success_per_agent', [False] * self.num_agents)
+            if isinstance(success_status, bool):
+                success_status = [success_status] * self.num_agents
+
             self.training_metrics.log_episode(
                 joint_errors=total_joint_errors,
                 rewards=[sum(reward_list) for reward_list in total_rewards],
-                success=success_per_agent,
+                success=success_status,
                 entropy=entropy,
                 actor_loss=actor_loss,
                 critic_loss=critic_loss,
@@ -611,22 +708,63 @@ class MAPPOAgent:
                 env=self.env
             )
 
-            # Log aggregated metrics per joint
-            for agent_idx in range(self.num_agents):
-                avg_error = np.mean(total_errors[agent_idx])
-                avg_reward = np.mean(total_rewards[agent_idx])
-                logging.info(f"Episode {episode}, Joint {agent_idx} - Avg Error: {avg_error:.6f}, Avg Reward: {avg_reward:.6f}")
-
-            # Log overall episode metrics
+            # Log episode summary
             avg_episode_reward = sum([sum(agent_rewards) for agent_rewards in total_rewards]) / self.num_agents
-            overall_success = all(success_per_agent)
-            logging.info(f"Episode {episode} - Avg Episode Reward: {avg_episode_reward:.6f}, Overall Success: {overall_success}")
+            overall_success = all(success_status)
+            logging.info(f"Episode {episode} Summary:")
+            logging.info(f"Average Reward: {avg_episode_reward:.6f}")
+            logging.info(f"Success: {overall_success}")
+            logging.info(f"Actor Loss: {actor_loss:.6f}")
+            logging.info(f"Critic Loss: {critic_loss:.6f}")
+            logging.info(f"Policy Loss: {policy_loss:.6f}")
+            logging.info(f"Entropy: {entropy:.6f}")
 
-        # After training, save logs and plot metrics
+        # Save final metrics and generate plots
         self.training_metrics.save_logs("training_logs.json")
         metrics = self.training_metrics.calculate_metrics(env=self.env)
         self.training_metrics.plot_metrics(metrics, self.env, show_plots=True)
 
+        return metrics
+
+    # Helper functions to retrieve the end-effector and target pose
+    def get_end_effector_pose(self):
+        """
+        Retrieve the current position and orientation of the end-effector.
+        """
+        end_effector_state = p.getLinkState(self.env.robot_id, self.env.joint_indices[-1])
+        current_position = np.array(end_effector_state[4])
+        current_orientation = np.array(end_effector_state[5])
+        return current_position, current_orientation
+
+    def get_target_pose(self):
+        """
+        Retrieve the target position and orientation (assumes target is stored as attributes).
+        """
+        return self.env.target_position, self.env.target_orientation
+
+    def calculate_joint_errors(current_angles, previous_angles, target_angles):
+        """
+        Calculate joint errors with respect to both previous position and target position.
+        """
+        # Calculate change in joint angles
+        delta_errors = np.abs(np.array(current_angles) - np.array(previous_angles))
+        
+        # Calculate error relative to target
+        target_errors = np.abs(np.array(current_angles) - np.array(target_angles))
+        
+        # Combine errors with weighting
+        joint_errors = 0.3 * delta_errors + 0.7 * target_errors
+        
+        # Add small epsilon to avoid zero errors
+        epsilon = 1e-6
+        joint_errors = np.maximum(joint_errors, epsilon)
+        
+        print(f"Debug - Current angles: {current_angles}")
+        print(f"Debug - Previous angles: {previous_angles}")
+        print(f"Debug - Target angles: {target_angles}")
+        print(f"Debug - Joint errors: {joint_errors}")
+        
+        return joint_errors
 
     def test_agent(self, env, num_episodes, max_steps=1000):
         """

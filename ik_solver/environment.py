@@ -37,7 +37,7 @@ class InverseKinematicsEnv(gym.Env):
 
         # Define minimum and maximum success thresholds
         self.min_success_threshold = 0.001  # Minimum threshold (more strict)
-        self.max_success_threshold = 0.1   # Maximum threshold (more lenient)
+        self.max_success_threshold = 0.01   # Maximum threshold (more lenient)
 
         # Initialize success threshold to the maximum value
         self.success_threshold = self.max_success_threshold
@@ -424,3 +424,19 @@ class InverseKinematicsEnv(gym.Env):
         logging.info(f"Joint {joint_index} - Joint Error: {joint_error:.6f} (Threshold: {error_threshold}), Success: {joint_success}")
 
         return joint_success
+    
+
+    def get_end_effector_pose(self):
+        """
+        Retrieve the current position and orientation of the end-effector.
+        """
+        end_effector_state = p.getLinkState(self.robot_id, self.joint_indices[-1])
+        current_position = np.array(end_effector_state[4])
+        current_orientation = np.array(end_effector_state[5])
+        return current_position, current_orientation
+
+    def get_target_pose(self):
+        """
+        Retrieve the target position and orientation for the end-effector.
+        """
+        return self.target_position, self.target_orientation

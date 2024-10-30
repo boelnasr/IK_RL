@@ -105,7 +105,6 @@ class TrainingMetrics:
         except Exception as e:
             logging.error(f"Failed to save logs to {log_file}. Error: {e}")
 
-
     def calculate_metrics(self, env):
         logging.info("Starting metric calculation")
         if not self.logs:
@@ -115,8 +114,8 @@ class TrainingMetrics:
         metrics = {
             "mean_joint_errors": [],
             "max_joint_errors": [],
-            "cumulative_rewards": [],
-            "mean_episode_rewards": [],
+            "cumulative_rewards_per_agent": [[] for _ in range(env.num_joints)],  # Changed
+            "mean_episode_rewards_per_agent": [[] for _ in range(env.num_joints)],  # Changed
             "success_rate_per_agent": [[] for _ in range(env.num_joints)],
             "entropy": [],
             "actor_loss": [],
@@ -125,54 +124,53 @@ class TrainingMetrics:
         }
 
         for episode_idx, episode_log in enumerate(self.logs):
-            joint_errors = np.array(episode_log['joint_errors'])  # Shape: (num_steps, num_joints)
+            joint_errors = np.array(episode_log['joint_errors'])
 
             # Validate joint error dimensions
             if joint_errors.size == 0:
                 logging.warning(f"Empty joint errors for episode {episode_idx}. Skipping.")
                 continue
 
-            # Ensure joint_errors has the correct shape
             if joint_errors.ndim != 2 or joint_errors.shape[1] != env.num_joints:
                 logging.warning(f"Invalid joint error dimensions for episode {episode_idx}. "
-                                f"Expected 2D array with shape (num_steps, {env.num_joints}), "
-                                f"but got shape {joint_errors.shape}. Skipping this episode.")
+                            f"Expected 2D array with shape (num_steps, {env.num_joints}), "
+                            f"but got shape {joint_errors.shape}. Skipping this episode.")
                 continue
 
             # Compute mean and max joint errors across steps for the episode
             metrics["mean_joint_errors"].append(np.mean(joint_errors, axis=0))
             metrics["max_joint_errors"].append(np.max(joint_errors, axis=0))
 
+            # Process rewards per agent
+            rewards = np.array(episode_log['rewards']).reshape(-1, env.num_joints)  # Reshape rewards
+            for joint_idx in range(env.num_joints):
+                joint_rewards = rewards[:, joint_idx]
+                metrics["cumulative_rewards_per_agent"][joint_idx].append(np.sum(joint_rewards))
+                metrics["mean_episode_rewards_per_agent"][joint_idx].append(np.mean(joint_rewards))
+
             # Additional metrics
-            rewards = episode_log['rewards']
-            success = episode_log['success']  # List of success statuses per joint
+            success = episode_log['success']
             entropy = episode_log['entropy']
             actor_loss = episode_log['actor_loss']
             critic_loss = episode_log['critic_loss']
             policy_loss = episode_log['policy_loss']
 
-            # Calculate mean episode reward
-            mean_reward = np.mean(rewards)
-
             # Append per-agent success rates
             for joint_idx in range(env.num_joints):
                 metrics["success_rate_per_agent"][joint_idx].append(success[joint_idx])
 
-            metrics["cumulative_rewards"].append(np.sum(rewards))
-            metrics["mean_episode_rewards"].append(mean_reward)
             metrics["entropy"].append(entropy)
             metrics["actor_loss"].append(actor_loss)
             metrics["critic_loss"].append(critic_loss)
-            metrics["policy_loss"].append(policy_loss)  # Append policy loss
+            metrics["policy_loss"].append(policy_loss)
 
         # Convert lists to numpy arrays
         metrics["mean_joint_errors"] = np.array(metrics["mean_joint_errors"])
         metrics["max_joint_errors"] = np.array(metrics["max_joint_errors"])
+        metrics["cumulative_rewards_per_agent"] = [np.array(rewards) for rewards in metrics["cumulative_rewards_per_agent"]]
+        metrics["mean_episode_rewards_per_agent"] = [np.array(rewards) for rewards in metrics["mean_episode_rewards_per_agent"]]
 
-        logging.info(f"Metric calculation completed. Shapes - Mean errors: {metrics['mean_joint_errors'].shape}, Max errors: {metrics['max_joint_errors'].shape}")
         return metrics
-
-
     def plot_metrics(self, metrics, env, show_plots=False):
         logging.info("Starting to plot metrics")
         # Use MATLAB-like style
@@ -254,29 +252,69 @@ class TrainingMetrics:
             plt.show()
         plt.close()
 
-        # Continue with the rest of your plotting code...
-        # Plot Cumulative Rewards
-        plt.figure(figsize=(10, 6))
-        plt.plot(episodes, metrics['cumulative_rewards'], label='Cumulative Rewards', color='b')
-        plt.xlabel('Episodes')
-        plt.ylabel('Cumulative Rewards')
-        plt.title('Cumulative Rewards Over Time')
-        plt.grid(True)
-        plt.savefig('cumulative_rewards.png')
-        logging.info("Cumulative rewards plot saved successfully.")
+        # Plot Cumulative Rewards per Agent
+        fig, axes = plt.subplots(nrows=env.num_joints, ncols=1, figsize=(12, 4 * env.num_joints))
+        if env.num_joints == 1:
+            axes = [axes]
+
+        for joint_idx in range(env.num_joints):
+            ax = axes[joint_idx]
+            ax.plot(episodes, metrics['cumulative_rewards_per_agent'][joint_idx], 
+                    label=f'Joint {joint_idx+1} Cumulative Reward', color='b')
+            ax.set_xlabel('Episodes')
+            ax.set_ylabel('Cumulative Reward')
+            ax.set_title(f'Joint {joint_idx+1} Cumulative Reward Over Time')
+            ax.legend()
+            ax.grid(True)
+
+        plt.tight_layout()
+        plt.savefig('cumulative_rewards_per_joint.png')
+        logging.info("Cumulative rewards per joint plot saved successfully.")
         if show_plots:
             plt.show()
         plt.close()
 
-        # Plot Mean Episode Rewards
-        plt.figure(figsize=(10, 6))
-        plt.plot(episodes, metrics['mean_episode_rewards'], label='Mean Episode Rewards', color='g')
-        plt.xlabel('Episodes')
-        plt.ylabel('Mean Episode Rewards')
-        plt.title('Mean Episode Rewards Over Time')
-        plt.grid(True)
-        plt.savefig('mean_episode_rewards.png')
-        logging.info("Mean episode rewards plot saved successfully.")
+        # Plot Mean Episode Rewards per Agent
+        fig, axes = plt.subplots(nrows=env.num_joints, ncols=1, figsize=(12, 4 * env.num_joints))
+        if env.num_joints == 1:
+            axes = [axes]
+
+        for joint_idx in range(env.num_joints):
+            ax = axes[joint_idx]
+            ax.plot(episodes, metrics['mean_episode_rewards_per_agent'][joint_idx], 
+                    label=f'Joint {joint_idx+1} Mean Reward', color='g')
+            ax.set_xlabel('Episodes')
+            ax.set_ylabel('Mean Episode Reward')
+            ax.set_title(f'Joint {joint_idx+1} Mean Episode Reward Over Time')
+            ax.legend()
+            ax.grid(True)
+
+        plt.tight_layout()
+        plt.savefig('mean_episode_rewards_per_joint.png')
+        logging.info("Mean episode rewards per joint plot saved successfully.")
+        if show_plots:
+            plt.show()
+        plt.close()
+
+        # Plot Mean Episode Rewards per Agent
+        fig, axes = plt.subplots(nrows=env.num_joints, ncols=1, figsize=(12, 4 * env.num_joints))
+        if env.num_joints == 1:
+            axes = [axes]  # Ensure axes is iterable
+
+        mean_rewards_per_agent = np.array(metrics['mean_episode_rewards_per_agent']).reshape(-1, env.num_joints)
+        for joint_idx in range(env.num_joints):
+            ax = axes[joint_idx]
+            ax.plot(episodes, mean_rewards_per_agent[:, joint_idx], 
+                    label=f'Joint {joint_idx+1} Mean Reward', color='g')
+            ax.set_xlabel('Episodes')
+            ax.set_ylabel('Mean Episode Reward')
+            ax.set_title(f'Joint {joint_idx+1} Mean Episode Reward Over Time')
+            ax.legend()
+            ax.grid(True)
+
+        plt.tight_layout()
+        plt.savefig('mean_episode_rewards_per_joint.png')
+        logging.info("Mean episode rewards per joint plot saved successfully.")
         if show_plots:
             plt.show()
         plt.close()
