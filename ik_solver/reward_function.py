@@ -6,28 +6,38 @@ def compute_position_error(current_position, target_position):
     Enhanced position error calculation with debugging.
     """
     error = np.linalg.norm(current_position - target_position)
-    print(f"Debug - Position Error: {error:.6f}")
-    print(f"Debug - Current Position: {current_position}")
-    print(f"Debug - Target Position: {target_position}")
+    # print(f"Debug - Position Error: {error:.6f}")
+    # print(f"Debug - Current Position: {current_position}")
+    # print(f"Debug - Target Position: {target_position}")
     return max(error, 1e-6)  # Ensure non-zero error
+
 
 def compute_quaternion_distance(current_orientation, target_orientation):
     """
-    Enhanced quaternion distance calculation with debugging.
+    Compute quaternion distance with improved numerical stability.
+    
+    Args:
+        current_orientation (np.array): Current orientation quaternion
+        target_orientation (np.array): Target orientation quaternion
+    
+    Returns:
+        float: Angular distance in radians
     """
     # Ensure inputs are numpy arrays
     current_orientation = np.array(current_orientation)
     target_orientation = np.array(target_orientation)
     
-    print(f"Debug - Current Orientation: {current_orientation}")
-    print(f"Debug - Target Orientation: {target_orientation}")
+    # Compute dot product with improved numerical stability
+    dot_product = np.clip(
+        np.abs(np.dot(current_orientation, target_orientation)),
+        -1.0 + 1e-7,
+        1.0 - 1e-7
+    )
     
-    # Compute dot product with safety checks
-    dot_product = np.clip(np.dot(current_orientation, target_orientation), -1.0 + 1e-6, 1.0 - 1e-6)
-    distance = 2 * np.arccos(np.abs(dot_product))
+    # Convert to angle
+    distance = 2 * np.arccos(dot_product)
     
-    print(f"Debug - Quaternion Distance: {distance:.6f}")
-    return max(distance, 1e-6)  # Ensure non-zero distance
+    return max(distance, 1e-7)  # Ensure non-zero distance
 
 def compute_overall_distance(current_position, target_position, current_orientation, target_orientation):
     """
@@ -53,38 +63,54 @@ def compute_overall_distance(current_position, target_position, current_orientat
     return overall_distance
 
 
-def compute_reward(distance, begin_distance, prev_best, success_threshold=0.006):
+def compute_reward(distance, begin_distance, prev_best, current_orientation, target_orientation, 
+                  success_threshold=0.006, time_penalty=-1.0):
     """
-    Computes the reward or punishment based on the current distance.
-
+    Enhanced reward function with improved shaping and multiple components.
+    
     Args:
-        distance (float): The current overall distance.
-        begin_distance (float): The initial overall distance at the start of the iteration.
-        prev_best (float): The closest distance achieved so far in the iteration.
-        success_threshold (float): The distance threshold for success.
-
+        distance (float): Current distance to target
+        begin_distance (float): Initial distance to target
+        prev_best (float): Best distance achieved so far
+        current_orientation (np.array): Current end-effector orientation quaternion
+        target_orientation (np.array): Target orientation quaternion
+        success_threshold (float): Distance threshold for success
+        time_penalty (float): Small penalty per timestep to encourage efficiency
+    
     Returns:
-        tuple:
-            reward (float): The computed reward or punishment.
-            prev_best (float): Updated closest distance.
-            success (bool): Indicates if the target was reached.
+        tuple: (reward, prev_best, success)
     """
     success = False
-
-    if distance > prev_best:
-        # The agent moved away from the target, apply punishment
-        reward = prev_best - distance  # Negative value
-    else:
-        # The agent moved closer to the target, provide reward
-        reward = abs(begin_distance - distance)/10
-        prev_best = distance  # Update prev_best
-
-    # Check if the agent has reached the target
+    
+    # Shape the distance metrics
+    shaped_dist, shaped_begin = compute_shaped_distance(distance, begin_distance)
+    
+    # Compute progress reward
+    progress_reward = compute_progress_reward(shaped_dist, shaped_begin)
+    
+    # Compute orientation reward
+    quaternion_distance = compute_quaternion_distance(current_orientation, target_orientation)
+    orientation_reward = compute_orientation_bonus(quaternion_distance)
+    
+    # Combine rewards with time penalty
+    reward = progress_reward + orientation_reward + time_penalty
+    
+    # Update previous best if we've improved
+    if distance < prev_best:
+        prev_best = distance
+    
+    # Check for success
     if distance <= success_threshold:
-        reward = 2000 + (success_threshold - distance)*1000
+        # Exponential bonus for precision
+        precision_bonus = 20.0 * np.exp(-(distance / success_threshold))
+        reward += precision_bonus
         success = True
-
+    
+    # Add smoothing to prevent sharp reward changes
+    reward = np.clip(reward, -100 , 200)
+    
     return reward, prev_best, success
+
 
 def compute_jacobian_linear(robot_id, joint_indices, joint_angles):
     """
@@ -148,7 +174,7 @@ def assign_joint_weights(jacobian_linear, jacobian_angular):
     angular_weights = np.linalg.norm(jacobian_angular, axis=0)
 
     # Normalize the weights so that they sum to 1
-    linear_weights /= (np.sum(linear_weights) + 1e-8)
+    #linear_weights /= (np.sum(linear_weights) + 1e-8)
     angular_weights /= (np.sum(angular_weights) + 1e-8)
 
     return linear_weights, angular_weights
@@ -160,8 +186,8 @@ def compute_weighted_joint_rewards(joint_errors, linear_weights, angular_weights
     epsilon = 1e-6
     
     # Print debug information
-    print("Debug - Joint Errors:", joint_errors)
-    print("Debug - Overall Reward:", overall_reward)
+    #print("Debug - Joint Errors:", joint_errors)
+    #print("Debug - Overall Reward:", overall_reward)
     
     # Ensure joint errors aren't zero
     joint_errors = np.array(joint_errors)
@@ -171,19 +197,82 @@ def compute_weighted_joint_rewards(joint_errors, linear_weights, angular_weights
     joint_error_norms = max(np.linalg.norm(joint_errors), epsilon)
     normalized_joint_errors = joint_errors / joint_error_norms
     
-    print("Debug - Normalized Joint Errors:", normalized_joint_errors)
+    #print("Debug - Normalized Joint Errors:", normalized_joint_errors)
     
     # Combine weights with minimum values
     combined_weights = np.maximum(linear_weights + angular_weights, epsilon)
     
     # Calculate rewards with minimum value
-    joint_rewards = overall_reward * combined_weights * normalized_joint_errors
+    joint_rewards = overall_reward * combined_weights * normalized_joint_errors*10
     
     # Ensure at least some small reward/penalty
     joint_rewards = np.where(joint_rewards == 0, 
                            np.sign(overall_reward) * epsilon,
                            joint_rewards)
     
-    print("Debug - Final Joint Rewards:", joint_rewards)
+    #print("Debug - Final Joint Rewards:", joint_rewards)
     
     return joint_rewards
+
+def compute_shaped_distance(distance, begin_distance, max_distance=1.0):
+    """
+    Shapes the distance metric using a smoothed normalization.
+    
+    Args:
+        distance (float): Current distance to target
+        begin_distance (float): Initial distance to target
+        max_distance (float): Maximum expected distance for normalization
+    
+    Returns:
+        float: Shaped distance metric between 0 and 1
+    """
+    # Normalize distances to [0,1] range with smooth clipping
+    norm_dist = np.clip(distance / max_distance, 0, 1)
+    norm_begin = np.clip(begin_distance / max_distance, 0, 1)
+    
+    # Apply smooth shaping function
+    shaped_dist = 1 - np.exp(-2 * norm_dist)
+    shaped_begin = 1 - np.exp(-2 * norm_begin)
+    
+    return shaped_dist, shaped_begin
+
+def compute_progress_reward(shaped_dist, shaped_begin, scale=1000.0):
+    """
+    Computes reward based on progress toward the goal.
+    
+    Args:
+        shaped_dist (float): Current shaped distance
+        shaped_begin (float): Initial shaped distance
+        scale (float): Reward scaling factor
+    
+    Returns:
+        float: Progress reward
+    """
+    progress = shaped_begin - shaped_dist
+    
+    # Exponential reward scaling based on progress
+    if progress > 0:
+        reward = scale * (np.exp(progress) - 1)
+    else:
+        # Smaller penalty for negative progress to avoid discouraging exploration
+        reward = scale * progress * 0.5
+    
+    return reward
+
+def compute_orientation_bonus(quaternion_distance, max_angle=np.pi):
+    """
+    Computes additional reward for good orientation alignment.
+    
+    Args:
+        quaternion_distance (float): Angular distance between current and target orientation
+        max_angle (float): Maximum expected angular distance
+    
+    Returns:
+        float: Orientation bonus reward
+    """
+    # Normalize and shape the orientation reward
+    norm_angle = np.clip(quaternion_distance / max_angle, 0, 1)
+    orientation_bonus = np.exp(-3 * norm_angle) - 0.05
+    return max(orientation_bonus, 0) * 500
+
+

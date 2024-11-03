@@ -101,7 +101,7 @@ class InverseKinematicsEnv(gym.Env):
         self.orientation_threshold = 0.1  # Define appropriate value in radians
 
         # Set the success threshold for the distance
-        self.success_threshold = 0.05  # Adjust this value as needed
+        #self.success_threshold = 0.05  # Adjust this value as needed
         print(f"Number of joints in the robot: {self.num_joints}")
 
     def compute_forward_kinematics(self, joint_angles):
@@ -132,37 +132,51 @@ class InverseKinematicsEnv(gym.Env):
     
     def reset(self):
         """
-        Resets the environment by setting the robot's joint angles to random values
-        and generating a new random target pose for the end-effector.
-
-        Returns:
-            list: A list of observations for each agent.
+        Resets the environment and initializes all necessary state tracking variables.
         """
-        # Adjust the success threshold for the new episode
+        # Adjust success threshold based on episode progress
         episode_progress = self.episode_number / self.total_episodes
-        self.success_threshold = self.max_success_threshold - episode_progress * (self.max_success_threshold - self.min_success_threshold)
-        
+        self.success_threshold = self.max_success_threshold - episode_progress * (
+            self.max_success_threshold - self.min_success_threshold
+        )
 
-        # Reset joint angles to random values within joint limits
+        # Reset joint angles to random values within limits
         self.joint_angles = np.array([
             np.random.uniform(limit[0], limit[1]) for limit in self.joint_limits
         ])
         for i, angle in zip(self.joint_indices, self.joint_angles):
             p.resetJointState(self.robot_id, i, angle)
 
-        # Track the initial joint angles as the previous joint angles
+        # Track previous joint angles
         self.previous_joint_angles = np.copy(self.joint_angles)
 
-        # Generate a new random target pose for the end-effector
-        # Ensure the target is within reachable workspace
-        self.target_position = np.random.uniform(
-            [0.1, -0.5, 0.1], [0.5, 0.5, 0.5]
-        )
-        # Random target orientation as a quaternion
+        # Generate random target pose
+        self.target_position = np.random.uniform([0.1, -0.5, 0.1], [0.5, 0.5, 0.5])
         random_euler = np.random.uniform(-np.pi, np.pi, 3)
-        self.target_orientation = p.getQuaternionFromEuler(random_euler)
+        self.target_orientation = np.array(p.getQuaternionFromEuler(random_euler))
 
-        # Optionally, visualize the target position in the simulation
+        # Get initial end-effector state
+        self.current_position, self.current_orientation = self.get_end_effector_pose()
+        
+        # Store quaternions for reward calculation
+        self.current_quaternion = self.current_orientation
+        self.target_quaternion = self.target_orientation
+
+        # Initialize distance tracking
+        self.current_distance = compute_overall_distance(
+            current_position=self.current_position,
+            target_position=self.target_position,
+            current_orientation=self.current_quaternion,
+            target_orientation=self.target_quaternion
+        )
+        self.initial_distance = self.current_distance
+        self.previous_best_distance = self.current_distance
+
+        # Reset step counter and episode tracking
+        self.current_step = 0
+        self.episode_number += 1
+
+        # Visualize target (optional)
         if hasattr(self, 'target_marker'):
             p.removeBody(self.target_marker)
         self.target_marker = p.loadURDF(
@@ -172,148 +186,125 @@ class InverseKinematicsEnv(gym.Env):
             useFixedBase=True
         )
 
-        # Reset step counter
-        self.current_step = 0
-
-        # Get the current end-effector pose
-        self.current_position, self.current_orientation = self.get_current_pose()
-
-        # Compute initial position and orientation errors
+        # Calculate initial errors
         self.position_error = self.current_position - self.target_position
         self.orientation_error = self.compute_orientation_difference(
             self.current_orientation, self.target_orientation
         )
 
-        # Compute the initial overall distance
-        self.begin_distance = compute_overall_distance(
-            current_position=self.current_position,
-            target_position=self.target_position,
-            current_orientation=self.current_orientation,
-            target_orientation=self.target_orientation
-        )
-
-        # Initialize prev_best with a large value or begin_distance
-        self.prev_best = float('inf')  # or self.begin_distance
-        self.episode_number += 1
-
-        # Return the initial observations for all agents
         return self.get_all_agent_observations()
-
 
     def step(self, actions):
         """
-        Applies the given actions to the environment, steps the simulation,
-        computes rewards, checks for success, and returns observations.
-
-        Args:
-            actions (tuple): A tuple of actions for each agent.
-
-        Returns:
-            tuple: (observations, rewards, done, info)
+        Execute one environment step with safe Jacobian computations and error handling.
         """
-        # Apply the actions and step the simulation
-        for i, action in enumerate(actions):
-            action = np.clip(action, self.joint_limits[i][0], self.joint_limits[i][1])
-            p.setJointMotorControl2(self.robot_id, i, p.POSITION_CONTROL, targetPosition=action)
+        try:
+            # Apply actions with safety checks
+            for i, action in enumerate(actions):
+                if not np.isfinite(action):
+                    action = self.previous_joint_angles[i]  # Use previous angle if action is invalid
+                action = np.clip(action, self.joint_limits[i][0], self.joint_limits[i][1])
+                p.setJointMotorControl2(self.robot_id, i, p.POSITION_CONTROL, targetPosition=action)
 
-        p.stepSimulation()
+            p.stepSimulation()
+            self.current_step += 1
 
-        # Update current step
-        self.current_step += 1
+            # Safely update current state
+            self.joint_angles = np.array([p.getJointState(self.robot_id, i)[0] 
+                                        for i in range(self.num_joints)], dtype=np.float32)
+            
+            # Get current end-effector state
+            self.current_position, self.current_orientation = self.get_end_effector_pose()
+            self.current_quaternion = self.current_orientation.astype(np.float32)
 
-        # Get the current state
-        self.joint_angles = np.array([p.getJointState(self.robot_id, i)[0] for i in range(self.num_joints)])
-        current_position, current_orientation = self.get_current_pose()
-        self.position_error = current_position - self.target_position
-        self.orientation_error = self.compute_orientation_difference(current_orientation, self.target_orientation)
+            # Ensure target values are proper numpy arrays
+            self.target_position = np.array(self.target_position, dtype=np.float32)
+            self.target_quaternion = np.array(self.target_quaternion, dtype=np.float32)
 
-        # Compute the overall distance using position and orientation errors
-        distance = compute_overall_distance(
-            current_position=current_position,
-            target_position=self.target_position,
-            current_orientation=current_orientation,
-            target_orientation=self.target_orientation
-        )
+            # Safely compute distances with error checking
+            try:
+                self.current_distance = compute_overall_distance(
+                    current_position=self.current_position,
+                    target_position=self.target_position,
+                    current_orientation=self.current_quaternion,
+                    target_orientation=self.target_quaternion
+                )
+            except Exception as e:
+                logging.error(f"Error computing distance: {e}")
+                self.current_distance = np.linalg.norm(self.current_position - self.target_position)
 
-        # Initialize begin_distance and prev_best on the first step
-        if self.current_step == 1:
-            self.begin_distance = distance
-            self.prev_best = float('inf')  # Or self.begin_distance
+            # Compute reward with error handling
+            try:
+                overall_reward, self.previous_best_distance, success = compute_reward(
+                    distance=self.current_distance,
+                    begin_distance=self.initial_distance,
+                    prev_best=self.previous_best_distance,
+                    current_orientation=self.current_quaternion,
+                    target_orientation=self.target_quaternion
+                )
+            except Exception as e:
+                logging.error(f"Error computing reward: {e}")
+                overall_reward = -1.0
+                success = False
 
-        # Compute the overall reward using compute_reward
-        overall_reward, self.prev_best, success = compute_reward(
-            distance=distance,
-            begin_distance=self.begin_distance,
-            prev_best=self.prev_best,
-            success_threshold=self.success_threshold
-        )
+            # Update position and orientation errors
+            self.position_error = self.current_position - self.target_position
+            self.orientation_error = self.compute_orientation_difference(
+                self.current_orientation, self.target_orientation
+            )
 
-        # Compute the Jacobian matrices
-        zero_vec = [0.0] * self.num_joints
-        jacobian_linear, jacobian_angular = p.calculateJacobian(
-            bodyUniqueId=self.robot_id,
-            linkIndex=self.joint_indices[-1],
-            localPosition=[0, 0, 0],
-            objPositions=self.joint_angles.tolist(),
-            objVelocities=zero_vec,
-            objAccelerations=zero_vec
-        )
+            # Initialize arrays for rewards and errors
+            rewards = np.zeros(self.num_joints, dtype=np.float32)
+            joint_errors = np.zeros(self.num_joints, dtype=np.float32)
 
-        jacobian_linear = np.array(jacobian_linear)
-        jacobian_angular = np.array(jacobian_angular)
+            # Compute joint errors first
+            for i in range(self.num_joints):
+                joint_errors[i] = abs(self.joint_angles[i] - self.previous_joint_angles[i])
 
-        # Compute normalized errors
-        delta_position_norm = self.position_error / (np.linalg.norm(self.position_error) + 1e-8)
-        delta_orientation_norm = self.orientation_error / (np.linalg.norm(self.orientation_error) + 1e-8)
+            # Simple reward distribution based on joint errors
+            total_error = np.sum(joint_errors) + 1e-8
+            for i in range(self.num_joints):
+                error_contribution = joint_errors[i] / total_error
+                rewards[i] = overall_reward * (1.0 - error_contribution)
+                
+                # Log joint information
+                logging.debug(f"Joint {i}: Error={joint_errors[i]:.6f}, Reward={rewards[i]:.6f}")
 
-        # Compute gradients
-        grad_position = jacobian_linear.T @ delta_position_norm
-        grad_orientation = jacobian_angular.T @ delta_orientation_norm
+            # Update tracking variables
+            self.joint_errors = joint_errors
+            self.previous_joint_angles = np.copy(self.joint_angles)
 
-        # Total gradient
-        grad_total = grad_position + grad_orientation
+            # Check success conditions
+            agent_successes = [self.is_agent_success(i, joint_errors) for i in range(self.num_joints)]
+            overall_success = self.is_success(joint_errors)
+            
+            # Determine if episode should end
+            done = self.current_step >= self.max_episode_steps or overall_success
 
-        # Assign individual rewards and determine agent success
-        grad_norm = np.linalg.norm(grad_total) + 1e-8
-        rewards = []
-        joint_errors = []
-        agent_successes = []
+            # Create detailed info dictionary
+            info = {
+                'success_per_agent': agent_successes,
+                'current_distance': float(self.current_distance),
+                'initial_distance': float(self.initial_distance),
+                'best_distance': float(self.previous_best_distance),
+                'position_error': float(np.linalg.norm(self.position_error)),
+                'orientation_error': float(np.linalg.norm(self.orientation_error)),
+                'mean_joint_error': float(np.mean(joint_errors)),
+                'step': self.current_step,
+                'success': overall_success
+            }
 
-        for i in range(self.num_joints):
-            # Determine the agent's contribution
-            joint_contribution = -grad_total[i] / grad_norm
-            joint_reward = overall_reward * joint_contribution
-            rewards.append(joint_reward)
+            return self.get_all_agent_observations(), rewards.tolist(), done, info
 
-            # Compute joint error (absolute difference in joint angles)
-            joint_error = abs(self.joint_angles[i] - self.previous_joint_angles[i])
-            joint_errors.append(joint_error)
-
-            # Log the agent's reward, error, and success
-            logging.info(f"Step {self.current_step}, Joint {i} - Reward: {joint_reward:.6f}, "
-                        f"Joint Error: {joint_error:.6f}")
-
-        # Store joint errors for access in the training loop
-        self.joint_errors = joint_errors
-
-        # Determine agent-specific success using the updated is_agent_success method with joint_errors
-        agent_successes = [self.is_agent_success(i, self.joint_errors) for i in range(self.num_joints)]
-
-        # Determine overall success using the updated is_success method with joint_errors
-        overall_success = self.is_success(self.joint_errors)
-
-        # Update previous joint angles
-        self.previous_joint_angles = np.copy(self.joint_angles)
-
-        # Update the done flag
-        done = self.current_step >= self.max_episode_steps or overall_success
-
-        # Get observations
-        observations = self.get_all_agent_observations()
-
-        # Return observations, rewards, done flag, and individual successes
-        return observations, rewards, done, {'success_per_agent': agent_successes}
-
+        except Exception as e:
+            logging.error(f"Error in step function: {e}")
+            # Return safe fallback values
+            return (
+                self.get_all_agent_observations(),
+                [-1.0] * self.num_joints,  # Negative reward for all joints
+                True,  # End episode
+                {'error': str(e)}
+            )
 
     def get_all_agent_observations(self):
         """
@@ -327,6 +318,8 @@ class InverseKinematicsEnv(gym.Env):
             obs = self.get_agent_observation(i)
             observations.append(obs)
         return observations
+
+
 
     def get_agent_observation(self, joint_index):
         """
@@ -440,3 +433,6 @@ class InverseKinematicsEnv(gym.Env):
         Retrieve the target position and orientation for the end-effector.
         """
         return self.target_position, self.target_orientation
+    
+
+    
