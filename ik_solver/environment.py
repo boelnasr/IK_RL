@@ -130,7 +130,7 @@ class InverseKinematicsEnv(gym.Env):
         
         return np.concatenate([position, orientation])
     
-    def reset(self):
+    def reset(self, difficulty=1.0):
         """
         Resets the environment and initializes all necessary state tracking variables.
         """
@@ -139,6 +139,7 @@ class InverseKinematicsEnv(gym.Env):
         self.success_threshold = self.max_success_threshold - episode_progress * (
             self.max_success_threshold - self.min_success_threshold
         )
+        self.current_difficulty = difficulty
 
         # Reset joint angles to random values within limits
         self.joint_angles = np.array([
