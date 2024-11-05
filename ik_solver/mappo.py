@@ -136,7 +136,7 @@ class MAPPOAgent:
         self.reward_scaler = AdaptiveRewardScaler(window_size=100, initial_scale=1.0)
 
         # Initialize training metrics
-        self.training_metrics = TrainingMetrics()
+        self.training_metrics = TrainingMetrics(num_joints=self.num_joints)
 
         # Sliding window for tracking convergence
         self.convergence_window_size = config.get('convergence_window_size', 100)
@@ -370,20 +370,21 @@ class MAPPOAgent:
         agent_returns = torch.stack(agent_returns)
         
         return agent_advantages, agent_returns
-    def save_best_model(self, agent_idx, actor, episode, avg_error):
+    
+    def save_best_model(self, agent_idx, actor, episode, avg_error, criterion='mean_error'):
         """
-        Save the best model for the specified agent based on the average joint error.
-
+        Save the best model for the specified agent based on the average joint error or other criteria.
+        
         Args:
             agent_idx (int): The index of the agent (joint).
             actor (nn.Module): The actor network for the agent.
             episode (int): The episode number during which the best model was found.
             avg_error (float): The average joint error for the agent.
+            criterion (str): The criterion for saving ('mean_error' or 'reward').
         """
-        model_path = f"best_agent_joint_{agent_idx}_episode_{episode}.pth"
+        model_path = f"best_agent_joint_{agent_idx}_criterion_{criterion}_episode_{episode}.pth"
         torch.save(actor.state_dict(), model_path)
-        logging.info(f"Saved new best model for agent {agent_idx} at episode {episode} with Avg Error: {avg_error:.6f}")
-
+        logging.info(f"Saved new best model for agent {agent_idx} at episode {episode} with Avg {criterion}: {avg_error:.6f}")
 
 
     def get_actions(self, state):
@@ -441,6 +442,7 @@ class MAPPOAgent:
 
     def train(self, num_episodes, max_steps_per_episode=1000):
         logging.info(f"Starting training for {num_episodes} episodes")
+        self.training_metrics = TrainingMetrics(num_joints=self.num_joints)
 
         # Enable anomaly detection for debugging purposes
         torch.autograd.set_detect_anomaly(True)
@@ -526,28 +528,31 @@ class MAPPOAgent:
                     error = abs(post_action_angles[i] - target_joint_angle)
                     joint_errors.append(max(error, 1e-6))  # Ensure non-zero error
                 total_joint_errors.append(joint_errors)
-
-                # # Calculate rewards and update cumulative reward
-                # overall_reward, prev_best, success = compute_reward(
-                #     distance=distance,
-                #     begin_distance=begin_distance,
-                #     prev_best=prev_best,
-                #     current_orientation=current_orientation,
-                #     target_orientation=target_orientation,
-                #     joint_errors=joint_errors,
-                #     linear_weights=linear_weights,
-                #     angular_weights=angular_weights
-                # )
-                # Calculate reward using the modified compute_reward function
+                current_success_threshold = self.env.success_threshold  # Use the environment's success threshold
+                # Calculate rewards and update cumu lative reward
                 overall_reward, prev_best, success = compute_reward(
-                distance=distance,
-                begin_distance=begin_distance,
-                prev_best=prev_best,
-                joint_errors=joint_errors,
-                linear_weights=linear_weights,
-                angular_weights=angular_weights,
-                success_threshold=0.006  # Adjust as needed
-            )
+                    distance=distance,
+                    begin_distance=begin_distance,
+                    prev_best=prev_best,
+                    current_orientation=current_orientation,
+                    target_orientation=target_orientation,
+                    joint_errors=joint_errors,
+                    linear_weights=linear_weights,
+                    angular_weights=angular_weights,
+                    success_threshold=current_success_threshold
+                )
+                #Calculate reward using the modified compute_reward function
+
+            #     overall_reward, prev_best, success = compute_reward(
+            #     distance=distance,
+            #     begin_distance=begin_distance,
+            #     prev_best=prev_best,
+            #     joint_errors=joint_errors,
+            #     linear_weights=linear_weights,
+            #     angular_weights=angular_weights,
+            #     success_threshold=current_success_threshold
+
+            # )
 
 
                 # Calculate intrinsic reward using exploration module
@@ -563,6 +568,11 @@ class MAPPOAgent:
 
                 # Log rewards and errors for each agent
                 for agent_idx in range(self.num_agents):
+# Safely calculate the joint success rate
+                    if len(total_rewards[agent_idx]) > 0:
+                        joint_success_rate = sum([1 for s in total_rewards[agent_idx] if s > self.env.success_threshold]) / len(total_rewards[agent_idx])
+                    else:
+                        joint_success_rate = 0  # Or handle this case differently if needed
                     # Assign the joint reward to each agent
                     joint_reward = compute_weighted_joint_rewards(
                         [joint_errors[agent_idx]],
@@ -618,16 +628,17 @@ class MAPPOAgent:
             episode_joint_errors = np.array(total_joint_errors)
             episode_rewards = [np.sum(agent_rewards) for agent_rewards in total_rewards]
 
+                    # Save metrics and generate plots after training is complete
             self.training_metrics.log_episode(
-                joint_errors=episode_joint_errors,
-                rewards=episode_rewards,
-                success=success_status,
-                entropy=entropy,
-                actor_loss=actor_loss,
-                critic_loss=critic_loss,
-                policy_loss=policy_loss_per_agent,
-                env=self.env
-            )
+            joint_errors=total_joint_errors,
+            rewards=episode_rewards,
+            success=success_status,
+            entropy=entropy,
+            actor_loss=actor_loss,
+            critic_loss=critic_loss,
+            policy_loss=policy_loss_per_agent,
+            env=self.env
+        )
 
         # Save final metrics and generate plots
         self.training_metrics.save_logs()
@@ -728,32 +739,24 @@ class MAPPOAgent:
             print(f"Test Episode {episode+1}, Total Reward: {episode_reward}")
         env.close()
 
-
 class AdaptiveRewardScaler:
-    def __init__(self, window_size=100, initial_scale=1.0):
+    def __init__(self, window_size=100, initial_scale=1.0, adjustment_rate=0.05):
         self.window_size = window_size
-        self.reward_history = []
+        self.reward_history = deque(maxlen=window_size)
         self.scale = initial_scale
         self.min_scale = 0.1
         self.max_scale = 10.0
+        self.adjustment_rate = adjustment_rate
 
     def update_scale(self, reward):
         """Update scaling factor based on reward history."""
         self.reward_history.append(reward)
-        if len(self.reward_history) > self.window_size:
-            self.reward_history.pop(0)
-            
-            # Compute reward statistics
-            reward_std = np.std(self.reward_history)
+        if len(self.reward_history) >= self.window_size:
             reward_mean = np.mean(self.reward_history)
-            
-            # Adjust scale to keep rewards in a reasonable range
             if abs(reward_mean) > 1.0:
-                self.scale *= 0.95
+                self.scale *= (1 - self.adjustment_rate)
             elif abs(reward_mean) < 0.1:
-                self.scale *= 1.05
-                
-            # Ensure scale stays within bounds
+                self.scale *= (1 + self.adjustment_rate)
             self.scale = np.clip(self.scale, self.min_scale, self.max_scale)
-            
         return self.scale
+

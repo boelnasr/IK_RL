@@ -52,7 +52,7 @@ class ExplorationModule:
         self.curiosity_module = CuriosityModule(state_dim, action_dim, device=self.device)
         # Weighting factors
         self.count_based_weight = 1
-        self.curiosity_weight = 0
+        self.curiosity_weight = 1
 
     def get_count_based_reward(self, state):
         # Ensure state is detached and moved to CPU
