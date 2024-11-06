@@ -156,6 +156,7 @@ class TrainingMetrics:
         self.episode_metrics['critic_loss'].append(episode_data['critic_loss'])
         self.episode_metrics['policy_loss'].append(episode_data['policy_loss'])
 
+
     def calculate_metrics(self, env: Any) -> Dict:
         """
         Calculate comprehensive training metrics.
@@ -173,40 +174,67 @@ class TrainingMetrics:
         try:
             num_episodes = len(self.logs)
             num_agents = self.num_joints
-            total_rewards_per_agent = np.array([log['rewards']['total'] for log in self.logs])
-            cumulative_rewards_per_agent = np.cumsum(total_rewards_per_agent, axis=0).T
+            
+            # Calculate per-agent rewards properly
+            total_rewards_per_agent = np.array([log['rewards']['total'] for log in self.logs])  # Shape: (episodes, num_agents)
+            
+            # Initialize arrays for cumulative rewards
+            cumulative_rewards_per_agent = np.zeros((num_agents, num_episodes))
+            mean_episode_rewards_per_agent = total_rewards_per_agent.T  # Shape: (num_agents, episodes)
+            
+            # Calculate cumulative rewards per agent properly
+            for agent_idx in range(num_agents):
+                running_sum = 0
+                for episode in range(num_episodes):
+                    running_sum += total_rewards_per_agent[episode][agent_idx]
+                    cumulative_rewards_per_agent[agent_idx][episode] = running_sum
 
-            mean_episode_rewards_per_agent = total_rewards_per_agent.T
-            agent_success = np.array([log['success'] for log in self.logs])
-            cumulative_success_per_agent = np.cumsum(agent_success, axis=0).T
-            success_rate_per_agent = cumulative_success_per_agent / np.arange(1, num_episodes + 1)
+            # Calculate success metrics
+            agent_success = np.array([log['success'] for log in self.logs])  # Shape: (episodes, num_agents)
+            cumulative_success_per_agent = np.zeros((num_agents, num_episodes))
+            success_rate_per_agent = np.zeros((num_agents, num_episodes))
+            
+            # Calculate cumulative success and success rate per agent
+            for agent_idx in range(num_agents):
+                cumulative_success_per_agent[agent_idx] = np.cumsum(agent_success[:, agent_idx])
+                success_rate_per_agent[agent_idx] = cumulative_success_per_agent[agent_idx] / np.arange(1, num_episodes + 1)
+
+            # Calculate overall metrics
             overall_success_rate = np.mean(self.successes)
-
             policy_loss_per_agent = np.array(self.episode_metrics['policy_loss'])
-            average_cumulative_reward = np.mean(self.cumulative_rewards)
+            average_cumulative_reward = np.mean([cum_rew[-1] for cum_rew in cumulative_rewards_per_agent])
             average_policy_loss = np.mean(self.policy_losses)
             average_joint_error = np.mean(self.joint_errors)
-            episodes_to_converge = self.episodes_to_converge
 
-            joint_success_rates = {f'Joint_{joint_idx + 1}_success_rate': np.mean(self.joint_successes[joint_idx])
-                                   for joint_idx in range(num_agents)}
+            # Calculate joint-specific success rates
+            joint_success_rates = {
+                f'Joint_{joint_idx + 1}_success_rate': np.mean(self.joint_successes[joint_idx])
+                for joint_idx in range(num_agents)
+            }
 
+            # Compile all metrics into a structured dictionary
             metrics = {
                 'joint_errors': {
                     'mean': np.array([log['joint_errors']['mean'] for log in self.logs]),
                     'max': np.array([log['joint_errors']['max'] for log in self.logs]),
-                    'min': np.array([log['joint_errors']['min'] for log in self.logs])
+                    'min': np.array([log['joint_errors']['min'] for log in self.logs]),
+                    'std': np.array([log['joint_errors']['std'] for log in self.logs])
                 },
                 'rewards': {
                     'mean': np.array([log['rewards']['mean'] for log in self.logs]),
                     'total': total_rewards_per_agent,
-                    'cumulative': np.array(self.cumulative_rewards)
+                    'cumulative': np.array(self.cumulative_rewards),
+                    'per_agent_cumulative': cumulative_rewards_per_agent,
+                    'per_agent_mean': mean_episode_rewards_per_agent,
+                    'final_cumulative': cumulative_rewards_per_agent[:, -1],
+                    'average_per_episode': np.mean(total_rewards_per_agent, axis=1)
                 },
                 'success_rate': {
                     'per_episode': np.array([log['success_rate'] for log in self.logs]),
                     'cumulative': np.cumsum([log['success_rate'] for log in self.logs]) / np.arange(1, num_episodes + 1),
                     'overall': overall_success_rate,
-                    'per_joint': joint_success_rates
+                    'per_joint': joint_success_rates,
+                    'per_agent_over_time': success_rate_per_agent
                 },
                 'training': {
                     'entropy': np.array(self.episode_metrics['entropy']),
@@ -222,19 +250,42 @@ class TrainingMetrics:
                 'average_cumulative_reward': average_cumulative_reward,
                 'average_policy_loss': average_policy_loss,
                 'average_joint_error': average_joint_error,
-                'episodes_to_converge': episodes_to_converge,
-                'total_training_episodes': self.training_episodes
+                'episodes_to_converge': self.episodes_to_converge,
+                'total_training_episodes': self.training_episodes,
+                'convergence': {
+                    'achieved': self.converged,
+                    'episode': self.episodes_to_converge,
+                    'threshold': self.convergence_threshold
+                }
             }
-            
+
+            # Calculate moving averages if enough episodes
             window = min(100, num_episodes // 10)
             if window > 0:
                 metrics['moving_averages'] = {
-                    'reward': self._compute_moving_average(metrics['rewards']['mean'], window),
+                    'reward': self._compute_moving_average(metrics['rewards']['average_per_episode'], window),
                     'success_rate': self._compute_moving_average(metrics['success_rate']['per_episode'], window)
                 }
-            
+
+                # Add per-agent moving averages
+                metrics['moving_averages']['per_agent_rewards'] = np.array([
+                    self._compute_moving_average(mean_episode_rewards_per_agent[i], window)
+                    for i in range(num_agents)
+                ])
+
+            # Add training stability metrics
+            if len(self.actor_losses) > 1:
+                metrics['training_stability'] = {
+                    'actor_loss_std': np.std(self.actor_losses),
+                    'critic_loss_std': np.std(self.critic_losses),
+                    'policy_loss_std': np.std(self.policy_losses),
+                    'reward_std': np.std([log['rewards']['mean'] for log in self.logs]),
+                    'entropy_std': np.std(self.entropies)
+                }
+
+            self.logger.info("Metrics calculated successfully")
             return metrics
-            
+                
         except Exception as e:
             self.logger.error(f"Error calculating metrics: {str(e)}")
             raise
@@ -460,10 +511,10 @@ class TrainingMetrics:
         plt.close(fig)
 
     def _plot_cumulative_rewards_per_agent(self, metrics: Dict, env: Any, show_plots: bool) -> None:
-        """Plot cumulative rewards per agent (joint) over episodes."""
-        episodes = np.arange(1, metrics['cumulative_rewards_per_agent'].shape[1] + 1)
+        """Plot cumulative rewards per agent with improved visualization."""
+        episodes = np.arange(1, metrics['rewards']['per_agent_cumulative'].shape[1] + 1)
         num_joints = env.num_joints
-        cumulative_rewards_per_agent = metrics['cumulative_rewards_per_agent']
+        cumulative_rewards = metrics['rewards']['per_agent_cumulative']
         
         fig, axes = plt.subplots(nrows=num_joints, ncols=1, figsize=(30, 6 * num_joints))
         if num_joints == 1:
@@ -471,17 +522,35 @@ class TrainingMetrics:
         
         for joint_idx in range(num_joints):
             ax = axes[joint_idx]
-            ax.plot(episodes, cumulative_rewards_per_agent[joint_idx], 
+            
+            # Plot raw cumulative rewards
+            ax.plot(episodes, cumulative_rewards[joint_idx], 
                     label=f'Joint {joint_idx+1} Cumulative Reward', color='b')
+            
+            # Add moving average trend line
+            window = min(50, len(episodes) // 10) if len(episodes) > 50 else 1
+            if window > 1:
+                rolling_mean = np.convolve(cumulative_rewards[joint_idx], 
+                                        np.ones(window)/window, mode='valid')
+                ax.plot(episodes[window-1:], rolling_mean, 
+                    label=f'Moving Average (window={window})', 
+                    color='r', linestyle='--')
+            
+            # Calculate and display reward rate
+            total_reward = cumulative_rewards[joint_idx][-1]
+            reward_rate = total_reward / len(episodes)
+            ax.text(0.02, 0.98, f'Average Reward Rate: {reward_rate:.2f}/episode\nTotal Reward: {total_reward:.2f}',
+                    transform=ax.transAxes, verticalalignment='top',
+                    bbox=dict(facecolor='white', alpha=0.8))
+            
             ax.set_xlabel('Episodes')
             ax.set_ylabel('Cumulative Reward')
             ax.set_title(f'Joint {joint_idx+1} Cumulative Reward Over Time')
             ax.legend()
-            ax.grid(True)
+            ax.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        self.save_figure(fig, 'cumulative_rewards_per_joint')
-        self.logger.info("Cumulative rewards per joint plot saved successfully.")
+        self.save_figure(fig, 'cumulative_rewards_per_agent')
         if show_plots:
             plt.show()
         plt.close(fig)

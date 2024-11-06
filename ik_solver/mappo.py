@@ -14,7 +14,8 @@ from .models import JointActor, CentralizedCritic
 from .exploration import ExplorationModule
 from .replay_buffer import PrioritizedReplayBuffer
 from .curriculum import CurriculumManager
-
+import os
+import json
 # Initialize device based on CUDA availability
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -150,7 +151,7 @@ class MAPPOAgent:
         handler = logging.FileHandler('training.log')
         handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         self.logger.addHandler(handler)
-
+        
         # Best agent tracking
         self.best_agents_state_dict = [None] * self.num_agents
         self.best_joint_errors = [float('inf')] * self.num_agents
@@ -159,15 +160,9 @@ class MAPPOAgent:
 
 
     def update_policy(self, trajectories):
-        # Unpack and preprocess trajectories
-
         # Ensure trajectories contain the required data for each agent
         assert all(
-            'states' in t
-            and 'actions' in t
-            and 'log_probs' in t
-            and 'rewards' in t
-            and 'dones' in t
+            'states' in t and 'actions' in t and 'log_probs' in t and 'rewards' in t and 'dones' in t
             for t in trajectories
         ), "Each trajectory must contain 'states', 'actions', 'log_probs', 'rewards', and 'dones' keys."
 
@@ -191,25 +186,20 @@ class MAPPOAgent:
         actions_cat = torch.stack(actions, dim=1)
         log_probs_old_cat = torch.stack(log_probs_old, dim=1)
 
-        # Compute values
+        # Compute values with critic
         with torch.no_grad():
             values = self.critic(states_cat).squeeze().view(min_length, self.num_agents)
 
-        # Stack rewards and compute mean rewards
+        # Stack rewards and compute normalized mean rewards
         rewards_tensor = torch.stack(rewards, dim=1)
-        mean_rewards = rewards_tensor.mean(dim=1, keepdim=True).expand(min_length, self.num_agents)
+        mean_rewards = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-8)
+        mean_rewards = mean_rewards.mean(dim=1, keepdim=True).expand(min_length, self.num_agents)
 
-        # Compute advantages and returns
-        advantages, returns = self.compute_individual_gae(
-            mean_rewards[:min_length], dones, values[:min_length]
-        )
-
-        # Transpose advantages and returns for consistent dimensions
-        advantages = advantages.transpose(0, 1)
+        # Compute advantages and returns, apply clipping to reduce outliers
+        advantages, returns = self.compute_individual_gae(mean_rewards[:min_length], dones, values[:min_length])
+        returns = torch.clamp(returns, -10, 10)
+        advantages = torch.clamp(advantages.transpose(0, 1), -10, 10)
         returns = returns.transpose(0, 1)
-
-        # Clip advantages to reduce outliers
-        advantages = torch.clamp(advantages, -10, 10)
 
         # Normalize advantages per agent
         for agent_idx in range(self.num_agents):
@@ -219,26 +209,23 @@ class MAPPOAgent:
             advantages[:, agent_idx] = (agent_advantages - advantages_mean) / advantages_std
 
         # Prepare data for training
-        dataset = torch.utils.data.TensorDataset(
-            states_cat, actions_cat, log_probs_old_cat, advantages, returns
-        )
+        dataset = torch.utils.data.TensorDataset(states_cat, actions_cat, log_probs_old_cat, advantages, returns)
         loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
-        # Initialize a list to store policy losses per agent
+        # Initialize policy loss tracking
         policy_losses_per_agent = [[] for _ in range(self.num_agents)]
-
-        # Calculate current entropy coefficient
         progress = min(self.current_episode / self.num_episodes, 1.0)
         current_entropy_coef = self.initial_entropy_coef * (1 - progress) + self.final_entropy_coef * progress
 
-        # Training loop
+        # Separate critic and actor update phases
         for _ in range(self.ppo_epochs):
             for batch in loader:
                 batch_states, batch_actions, batch_log_probs_old, batch_advantages, batch_returns = batch
 
-                # Critic update
+                # Critic update with value clipping and regularization
                 values_pred = self.critic(batch_states).squeeze().view(batch_returns.shape)
-                critic_loss = nn.MSELoss()(values_pred, batch_returns)
+                values_pred = torch.clamp(values_pred, -10, 10)  # Value clipping
+                critic_loss = nn.MSELoss()(values_pred, batch_returns) + 0.01 * values_pred.norm(2)  # Regularization
                 self.critic_optimizer.zero_grad()
                 critic_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
@@ -258,43 +245,36 @@ class MAPPOAgent:
 
                     # Forward pass through the agent's policy network
                     mean, std = agent(agent_state)
-                    std = torch.clamp(std*self.epsilon, min=1e-4)  # Ensure std is not too small
+                    std = torch.clamp(std * self.epsilon, min=1e-4)
                     dist = Normal(mean, std)
                     agent_log_prob = dist.log_prob(agent_action).sum(dim=-1, keepdim=True)
                     entropy = dist.entropy().sum(dim=-1, keepdim=True)
 
-                    # Calculate the PPO surrogate losses
+                    # PPO surrogate losses
                     ratio = torch.exp(agent_log_prob - agent_log_prob_old.unsqueeze(1))
                     surr1 = ratio * agent_advantages
-                    surr2 = (
-                        torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
-                        * agent_advantages
-                    )
-                    actor_loss = (
-                        -torch.min(surr1, surr2).mean() - current_entropy_coef * entropy.mean()
-                    )
+                    surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * agent_advantages
+                    actor_loss = -torch.min(surr1, surr2).mean() - current_entropy_coef * entropy.mean()
 
                     optimizer.zero_grad()
                     actor_loss.backward()
                     torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)
                     optimizer.step()
 
-                    # Record the policy loss per agent
+                    # Record policy loss per agent
                     policy_loss = -torch.mean(agent_log_prob)
                     policy_losses_per_agent[agent_idx].append(policy_loss.item())
 
-                    # Detailed logging
                     self.logger.info(
                         f"Agent {agent_idx} - Actor Loss: {actor_loss.item():.6f}, Policy Loss: {policy_loss.item():.6f}"
                     )
 
-        # Compute average policy loss per agent over the epochs
+        # Average policy loss per agent over epochs
         avg_policy_loss_per_agent = [np.mean(agent_losses) for agent_losses in policy_losses_per_agent]
-
-        # Return the losses for logging and analysis
         return actor_loss.item(), critic_loss.item(), entropy.mean().item(), avg_policy_loss_per_agent
 
-    # Remove one of the duplicate definitions of compute_individual_gae
+
+
     def compute_individual_gae(self, rewards, dones, values):
         """
         Computes GAE (Generalized Advantage Estimation) individually for each agent.
@@ -450,7 +430,7 @@ class MAPPOAgent:
 
         # Initialize CurriculumManager
         curriculum_manager = CurriculumManager(
-            initial_difficulty=0.50, max_difficulty=5.0, success_threshold=0.8
+            initial_difficulty=0.0, max_difficulty=5.0, success_threshold=0.8
         )
 
         for episode in range(num_episodes):
@@ -466,7 +446,9 @@ class MAPPOAgent:
             # Tracking variables for episode stats
             begin_distance = None
             prev_best = float('inf')
-            cumulative_reward = 0
+            episode_cumulative_reward = 0  # Initialize cumulative reward for each episode
+            discounted_cumulative_reward = 0.0  # If you're using discounted rewards
+
 
             # Log initial joint angles
             initial_joint_angles = [p.getJointState(self.env.robot_id, i)[0] for i in self.env.joint_indices]
@@ -541,18 +523,8 @@ class MAPPOAgent:
                     angular_weights=angular_weights,
                     success_threshold=current_success_threshold
                 )
-                #Calculate reward using the modified compute_reward function
+                overall_reward=np.clip(overall_reward, -1, 100 )
 
-            #     overall_reward, prev_best, success = compute_reward(
-            #     distance=distance,
-            #     begin_distance=begin_distance,
-            #     prev_best=prev_best,
-            #     joint_errors=joint_errors,
-            #     linear_weights=linear_weights,
-            #     angular_weights=angular_weights,
-            #     success_threshold=current_success_threshold
-
-            # )
 
 
                 # Calculate intrinsic reward using exploration module
@@ -561,14 +533,20 @@ class MAPPOAgent:
                     action=actions_tensor,
                     next_state=global_next_state
                 )
+                # Calculate total reward for this step
+                step_reward = overall_reward + intrinsic_reward.item()
 
-                # Add intrinsic reward to the overall reward
-                overall_reward += intrinsic_reward.item()
-                cumulative_reward = 0.95 * cumulative_reward + overall_reward
+                # Update true cumulative reward (simple sum)
+                episode_cumulative_reward += step_reward
+
+                # If you also want to track a discounted cumulative reward:
+                discounted_cumulative_reward = self.gamma * discounted_cumulative_reward + step_reward
+
+                
 
                 # Log rewards and errors for each agent
                 for agent_idx in range(self.num_agents):
-# Safely calculate the joint success rate
+                # Safely calculate the joint success rate
                     if len(total_rewards[agent_idx]) > 0:
                         joint_success_rate = sum([1 for s in total_rewards[agent_idx] if s > self.env.success_threshold]) / len(total_rewards[agent_idx])
                     else:
@@ -721,23 +699,65 @@ class MAPPOAgent:
         """
         return self.env.target_position, self.env.target_orientation
 
-    def test_agent(self, env, num_episodes, max_steps=1000):
+    def test_agent(self, env, num_episodes, max_steps=5000, save_metrics=False, early_stop_criteria=None):
         """
-        Test the trained agent in the environment.
+        Test the trained agent in the environment and log detailed performance metrics.
+    
+        Args:
+            env (object): The environment in which the agent is tested.
+            num_episodes (int): Number of episodes for testing.
+            max_steps (int): Maximum number of steps per episode.
+            save_metrics (bool): Whether to save performance metrics.
+            early_stop_criteria (float): The success threshold for early stopping (optional).
+        
+        Returns:
+            List[Dict]: A list of performance metrics for each episode.
         """
+        episode_metrics = []
+
         for episode in range(num_episodes):
             state = env.reset()
             done = False
             episode_reward = 0
             step_count = 0
+            success = False
+            
             while not done and step_count < max_steps:
                 actions, _ = self.get_actions(state)
-                next_state, rewards, done, _ = env.step(actions)
+                next_state, rewards, done, info = env.step(actions)
                 episode_reward += sum(rewards)  # Sum rewards across agents
                 state = next_state
                 step_count += 1
-            print(f"Test Episode {episode+1}, Total Reward: {episode_reward}")
+                
+                # Check early stopping criteria if provided
+                if early_stop_criteria and info.get('success_rate', 0) >= early_stop_criteria:
+                    success = True
+                    break
+            
+            print(f"Test Episode {episode + 1}, Total Reward: {episode_reward}, Steps Taken: {step_count}")
+            
+            # Collect and store episode metrics
+            metrics = {
+                'episode': episode + 1,
+                'total_reward': episode_reward,
+                'steps_taken': step_count,
+                'success': success
+            }
+            episode_metrics.append(metrics)
+            
+            # Log metrics
+            self.logger.info(f"Test Episode {episode + 1}: Total Reward = {episode_reward}, "
+                            f"Steps Taken = {step_count}, Success = {success}")
+        
+        if save_metrics:
+            metrics_path = os.path.join(self.base_path, 'test_metrics.json')
+            with open(metrics_path, 'w') as f:
+                json.dump(episode_metrics, f, indent=2)
+            print(f"Metrics saved to {metrics_path}")
+
         env.close()
+        return episode_metrics
+
 
 class AdaptiveRewardScaler:
     def __init__(self, window_size=100, initial_scale=1.0, adjustment_rate=0.05):
