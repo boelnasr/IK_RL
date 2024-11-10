@@ -12,7 +12,7 @@ from .reward_function import (
     compute_jacobian_linear,        # To compute the linear Jacobian matrix for the end-effector
     compute_jacobian_angular        # To compute the angular Jacobian matrix for the end-effector
 )
-
+import os
 
 # Set up basic logging configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -23,14 +23,6 @@ class InverseKinematicsEnv(gym.Env):
     Each joint is controlled by an individual agent.
     """
     def __init__(self, robot_name="kuka_iiwa", sim_timestep=1./240., max_episode_steps=1000):
-        """
-        Initializes the environment and PyBullet simulation.
-
-        Args:
-            robot_name (str): The robot's name to load (e.g., "kuka_iiwa").
-            sim_timestep (float): Simulation time step for PyBullet.
-            max_episode_steps (int): Maximum number of steps per episode.
-        """
         super(InverseKinematicsEnv, self).__init__()
         self.episode_number = 0
         self.total_episodes = config.get('num_episodes', 1000)
@@ -51,22 +43,40 @@ class InverseKinematicsEnv(gym.Env):
 
         # Load the selected robot
         if robot_name == "kuka_iiwa":
-            self.robot_id = p.loadURDF("kuka_iiwa/model.urdf", useFixedBase=True)  # Assign robot_id here
+            self.robot_id = p.loadURDF("kuka_iiwa/model.urdf", useFixedBase=True)
+        elif robot_name == "ur5":
+            # Provide the path to the UR5 URDF file
+            ur5_urdf_path = os.path.join("ur5/ur5.urdf")
+            ur5_urdf_directory = os.path.dirname(ur5_urdf_path)
+            p.setAdditionalSearchPath(ur5_urdf_directory)  # Add UR5 model path
+            self.robot_id = p.loadURDF(ur5_urdf_path, useFixedBase=True)
         else:
             raise ValueError(f"Robot {robot_name} is not available in PyBullet data.")
 
         # Initialize joint information
-        self.num_joints = p.getNumJoints(self.robot_id)  # Ensure robot_id is assigned before this line
-        self.joint_indices = list(range(self.num_joints))
-        print(f"Number of joints in the robot: {self.num_joints}")
-
-        # Retrieve joint limits for all joints
+        self.joint_indices = []
         self.joint_limits = []
-        for i in self.joint_indices:
+
+        # Filter out fixed joints and include only revolute joints
+        for i in range(p.getNumJoints(self.robot_id)):
             joint_info = p.getJointInfo(self.robot_id, i)
-            lower_limit = joint_info[8]
-            upper_limit = joint_info[9]
-            self.joint_limits.append((lower_limit, upper_limit))
+            joint_name = joint_info[1].decode('utf-8')
+            joint_type = joint_info[2]
+            if joint_type == p.JOINT_REVOLUTE:
+                self.joint_indices.append(i)
+                lower_limit = joint_info[8]
+                upper_limit = joint_info[9]
+                if lower_limit > upper_limit:
+                    # Handle continuous joints
+                    lower_limit = -np.pi
+                    upper_limit = np.pi
+                self.joint_limits.append((lower_limit, upper_limit))
+                print(f"Active Joint {i}: {joint_name}, Type: {joint_type}, Limits: {lower_limit}, {upper_limit}")
+            else:
+                print(f"Skipped Joint {i}: {joint_name}, Type: {joint_type}")
+
+        self.num_joints = len(self.joint_indices)
+        print(f"Number of active joints in the robot: {self.num_joints}")
 
         # Track previous joint angles
         self.previous_joint_angles = None  # Will be initialized in reset
@@ -74,7 +84,8 @@ class InverseKinematicsEnv(gym.Env):
         # Define action and observation spaces per agent
         self.action_spaces = []
         self.observation_spaces = []
-        for i in range(self.num_joints):
+        for idx in self.joint_indices:
+            i = self.joint_indices.index(idx)
             # Action space for each joint (scalar)
             action_low = np.array([self.joint_limits[i][0]], dtype=np.float32)
             action_high = np.array([self.joint_limits[i][1]], dtype=np.float32)
@@ -100,9 +111,8 @@ class InverseKinematicsEnv(gym.Env):
         self.position_threshold = 0.1  # Define appropriate value
         self.orientation_threshold = 0.1  # Define appropriate value in radians
 
-        # Set the success threshold for the distance
-        #self.success_threshold = 0.05  # Adjust this value as needed
         print(f"Number of joints in the robot: {self.num_joints}")
+
 
     def compute_forward_kinematics(self, joint_angles):
         """
@@ -178,14 +188,14 @@ class InverseKinematicsEnv(gym.Env):
         self.episode_number += 1
 
         # Visualize target (optional)
-        if hasattr(self, 'target_marker'):
-            p.removeBody(self.target_marker)
-        self.target_marker = p.loadURDF(
-            "sphere_small.urdf",
-            self.target_position,
-            globalScaling=0.05,
-            useFixedBase=True
-        )
+        # if hasattr(self, 'target_marker'):
+        #     p.removeBody(self.target_marker)
+        # self.target_marker = p.loadURDF(
+        #     "sphere_small.urdf",
+        #     self.target_position,
+        #     globalScaling=0.05,
+        #     useFixedBase=True
+        # )
 
         # Calculate initial errors
         self.position_error = self.current_position - self.target_position
