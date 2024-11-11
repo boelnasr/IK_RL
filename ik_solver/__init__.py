@@ -11,10 +11,10 @@ from .reward_function import (
     compute_overall_distance,       # To compute the combined distance metric
     compute_reward,                 # To compute the overall reward based on the distance metrics
     compute_jacobian_linear,        # To compute the linear Jacobian matrix for the end-effector
-    compute_jacobian_angular,       # To compute the angular Jacobian matrix for the end-effector
-    assign_joint_weights,           # To assign weights for joint contributions
-    compute_weighted_joint_rewards  # To compute rewards weighted by joint errors
+    compute_jacobian_angular        # To compute the angular Jacobian matrix for the end-effector
 )
+
+
 
 # Import training metrics class
 from .training_metrics import TrainingMetrics  # Ensure the path is correct
@@ -34,15 +34,10 @@ from .utils import (
 __all__ = [
     "InverseKinematicsEnv", 
     "MAPPOAgent", 
-    "compute_position_error",
-    "compute_quaternion_distance",
-    "compute_overall_distance",
-    "compute_reward",
-    "compute_jacobian_linear",
-    "compute_jacobian_angular",
-    "assign_joint_weights",
-    "compute_weighted_joint_rewards",
-    "TrainingMetrics", 
+    "compute_position_reward", 
+    "compute_orientation_reward",
+    "compute_joint_change_penalty",  # Ensure this is included
+    "TrainingMetrics",  # Add this to make training metrics publicly available
     "rotation_matrix_to_euler_angles", 
     "euler_angles_to_rotation_matrix",
     "skew_symmetric",
