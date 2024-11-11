@@ -141,22 +141,13 @@ class JointActor(nn.Module):
         return action_mean, action_std
 
 
-# Centralized Critic Class
 class CentralizedCritic(nn.Module):
-    def __init__(
-        self,
-        state_dim,
-        hidden_dim,
-        num_agents,
-        use_attention=False,
-        num_heads=4,
-        dropout=0.1,
-    ):
+    def __init__(self, state_dim, hidden_dim, num_agents, use_attention=False, num_heads=4, dropout=0.1):
         super(CentralizedCritic, self).__init__()
 
         self.use_attention = use_attention
         self.hidden_dim = hidden_dim
-        self.num_agents = num_agents  # Number of agents
+        self.num_agents = num_agents
 
         # Feature extraction with layer normalization
         self.feature_extractor = nn.Sequential(
@@ -167,31 +158,15 @@ class CentralizedCritic(nn.Module):
 
         # Optional multi-head attention layer
         if use_attention:
-            self.attention = MultiHeadAttention(
-                embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout
-            )
+            self.attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout)
             self.attention_norm = nn.LayerNorm(hidden_dim)
 
         # Core critic network with residual connections and dropout
-        self.critic_layers = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(dropout),
-                ),
-                nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(dropout),
-                ),
-                nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(dropout),
-                ),
-            ]
-        )
+        self.critic_layers = nn.ModuleList([
+            nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout)),
+            nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout)),
+            nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout)),
+        ])
 
         # Final output layer to estimate state value for each agent
         self.output_layer = nn.Linear(hidden_dim, num_agents)
@@ -206,16 +181,24 @@ class CentralizedCritic(nn.Module):
 
     def forward(self, states):
         # Feature extraction and normalization
-        x = self.feature_extractor(states)
+        x = self.feature_extractor(states)  # [batch_size, hidden_dim]
 
         # Apply attention with residual connection if enabled
         if self.use_attention:
-            attn_out = self.attention(x, x, x)
-            x = x + self.attention_norm(attn_out)
+            # nn.MultiheadAttention expects [seq_len, batch_size, embed_dim]
+            x = x.unsqueeze(0)  # [1, batch_size, hidden_dim]
+            attn_out, _ = self.attention(x, x, x)  # [1, batch_size, hidden_dim]
+            attn_out = attn_out.squeeze(0)  # [batch_size, hidden_dim]
+            x = x.squeeze(0) + self.attention_norm(attn_out)  # [batch_size, hidden_dim]
 
         # Pass through critic layers with residual connections
         for layer in self.critic_layers:
-            x = x + layer(x)
+            x = x + layer(x)  # [batch_size, hidden_dim]
 
-        # Final output layer for state value estimation per agent
-        return self.output_layer(x)  # Shape: (batch_size, num_agents)
+        # Output layer for value estimation
+        x = self.output_layer(x)  # [batch_size, num_agents]
+
+        # Debugging output shape
+        #print(f"Output shape from CentralizedCritic before returning: {x.shape}")
+
+        return x  # [batch_size, num_agents]

@@ -14,8 +14,8 @@ from .models import JointActor, CentralizedCritic
 from .exploration import ExplorationModule
 from .replay_buffer import PrioritizedReplayBuffer
 from .curriculum import CurriculumManager
-import os
-import json
+from .PD_controller import PDController
+
 # Initialize device based on CUDA availability
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -90,7 +90,7 @@ class MAPPOAgent:
         self.agents = []
         self.optimizers = []
         for agent_idx, obs_dim in enumerate(self.obs_dims):
-            actor = JointActor(obs_dim, self.hidden_dim, action_dim=1).to(self.device)
+            actor = JointActor(obs_dim, self.hidden_dim,use_attention=True, action_dim=1).to(self.device)
             optimizer = optim.Adam(actor.parameters(), lr=self.agent_lrs[agent_idx], weight_decay=1e-5)
             self.agents.append(actor)
             self.optimizers.append(optimizer)
@@ -100,6 +100,7 @@ class MAPPOAgent:
             state_dim=sum(self.obs_dims),
             hidden_dim=self.hidden_dim,
             num_agents=self.num_agents,
+            use_attention=True,
         ).to(self.device)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.global_lr, weight_decay=1e-5)
 
@@ -116,7 +117,17 @@ class MAPPOAgent:
         processed_state_list = self._process_state(sample_state)
         global_state = torch.cat(processed_state_list).unsqueeze(0).to(self.device)
         state_dim = global_state.shape[1]
-
+        # Add PD controller initialization
+        self.pd_controllers = []
+        self.pd_weight = config.get('pd_weight', 0.3)
+    
+        # Initialize PD controllers for each joint
+        for _ in range(self.num_agents):
+            self.pd_controllers.append(PDController(
+                kp=config.get('pd_kp', 1.0),
+                kd=config.get('pd_kd', 0.1),
+                dt=config.get('pd_dt', 0.01)
+            ))
         # Determine action_dim
         action_dim = self.num_agents  # Assuming one action per agent
 
@@ -151,7 +162,7 @@ class MAPPOAgent:
         handler = logging.FileHandler('training.log')
         handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         self.logger.addHandler(handler)
-        
+
         # Best agent tracking
         self.best_agents_state_dict = [None] * self.num_agents
         self.best_joint_errors = [float('inf')] * self.num_agents
@@ -159,22 +170,23 @@ class MAPPOAgent:
         logging.info("MAPPOAgent initialization complete.")
 
 
+
     def update_policy(self, trajectories):
-        # Ensure trajectories contain the required data for each agent
+        # Ensure each trajectory contains required keys for all agents
         assert all(
             'states' in t and 'actions' in t and 'log_probs' in t and 'rewards' in t and 'dones' in t
             for t in trajectories
         ), "Each trajectory must contain 'states', 'actions', 'log_probs', 'rewards', and 'dones' keys."
 
-        # Unpack and process trajectories
+        # Extract and truncate trajectories to minimum length across all agents
         states = [torch.stack(t['states']) for t in trajectories]
         actions = [torch.stack(t['actions']) for t in trajectories]
         log_probs_old = [torch.stack(t['log_probs']) for t in trajectories]
         rewards = [torch.stack(t['rewards']) for t in trajectories]
         dones = torch.tensor(trajectories[0]['dones'], dtype=torch.float32).to(self.device)
-
-        # Ensure all tensors are the same length
         min_length = min(s.size(0) for s in states)
+
+        # Truncate to the minimum length
         states = [s[:min_length] for s in states]
         actions = [a[:min_length] for a in actions]
         log_probs_old = [lp[:min_length] for lp in log_probs_old]
@@ -182,50 +194,54 @@ class MAPPOAgent:
         dones = dones[:min_length]
 
         # Concatenate states for critic input
-        states_cat = torch.cat(states, dim=1)
-        actions_cat = torch.stack(actions, dim=1)
-        log_probs_old_cat = torch.stack(log_probs_old, dim=1)
+        states_cat = torch.cat(states, dim=1)  # Shape: (min_length, state_dim)
+        actions_cat = torch.stack(actions, dim=1)  # Shape: (min_length, num_agents)
+        log_probs_old_cat = torch.stack(log_probs_old, dim=1)  # Shape: (min_length, num_agents)
 
-        # Compute values with critic
+        # Compute values using the critic without reshaping
         with torch.no_grad():
-            values = self.critic(states_cat).squeeze().view(min_length, self.num_agents)
+            values = self.critic(states_cat)
+            #print(f"Shape of states_cat: {states_cat.shape}")
+            #print(f"Shape of values from critic: {values.shape}")
 
-        # Stack rewards and compute normalized mean rewards
-        rewards_tensor = torch.stack(rewards, dim=1)
-        mean_rewards = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-8)
-        mean_rewards = mean_rewards.mean(dim=1, keepdim=True).expand(min_length, self.num_agents)
+            # Validate values shape
+            expected_shape = (min_length, self.num_agents)
+            if values.shape != expected_shape:
+                raise RuntimeError(f"Unexpected values shape {values.shape}, expected {expected_shape}")
 
-        # Compute advantages and returns, apply clipping to reduce outliers
-        advantages, returns = self.compute_individual_gae(mean_rewards[:min_length], dones, values[:min_length])
-        returns = torch.clamp(returns, -10, 10)
-        advantages = torch.clamp(advantages.transpose(0, 1), -10, 10)
-        returns = returns.transpose(0, 1)
+        # Compute mean rewards
+        rewards_tensor = torch.stack(rewards, dim=1)  # Shape: (min_length, num_agents)
+        mean_rewards = rewards_tensor.mean(dim=1, keepdim=True).expand(min_length, self.num_agents)
 
-        # Normalize advantages per agent
+        # Compute advantages and returns
+        advantages, returns = self.compute_individual_gae(mean_rewards, dones, values)
+        advantages, returns = advantages.transpose(0, 1), returns.transpose(0, 1)  # Shape: (min_length, num_agents)
+
+        # Clip advantages and normalize per agent
+        advantages = torch.clamp(advantages, -10, 10)
         for agent_idx in range(self.num_agents):
             agent_advantages = advantages[:, agent_idx]
-            advantages_mean = agent_advantages.mean()
-            advantages_std = agent_advantages.std() + 1e-8
-            advantages[:, agent_idx] = (agent_advantages - advantages_mean) / advantages_std
+            advantages[:, agent_idx] = (agent_advantages - agent_advantages.mean()) / (agent_advantages.std() + 1e-8)
 
         # Prepare data for training
         dataset = torch.utils.data.TensorDataset(states_cat, actions_cat, log_probs_old_cat, advantages, returns)
         loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
-        # Initialize policy loss tracking
+        # Initialize policy losses per agent
         policy_losses_per_agent = [[] for _ in range(self.num_agents)]
+
+        # Adjust entropy coefficient
         progress = min(self.current_episode / self.num_episodes, 1.0)
         current_entropy_coef = self.initial_entropy_coef * (1 - progress) + self.final_entropy_coef * progress
 
-        # Separate critic and actor update phases
+        # Training loop for PPO
         for _ in range(self.ppo_epochs):
             for batch in loader:
                 batch_states, batch_actions, batch_log_probs_old, batch_advantages, batch_returns = batch
 
-                # Critic update with value clipping and regularization
-                values_pred = self.critic(batch_states).squeeze().view(batch_returns.shape)
-                values_pred = torch.clamp(values_pred, -10, 10)  # Value clipping
-                critic_loss = nn.MSELoss()(values_pred, batch_returns) + 0.01 * values_pred.norm(2)  # Regularization
+                # Critic update
+                values_pred = self.critic(batch_states)
+                critic_loss = nn.MSELoss()(values_pred, batch_returns)
                 self.critic_optimizer.zero_grad()
                 critic_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
@@ -234,18 +250,15 @@ class MAPPOAgent:
                 # Actor update
                 for agent_idx, agent in enumerate(self.agents):
                     optimizer = self.optimizers[agent_idx]
-                    start_idx = sum(self.obs_dims[:agent_idx])
-                    end_idx = sum(self.obs_dims[:agent_idx + 1])
+                    start_idx, end_idx = sum(self.obs_dims[:agent_idx]), sum(self.obs_dims[:agent_idx + 1])
                     agent_state = batch_states[:, start_idx:end_idx]
                     agent_action = batch_actions[:, agent_idx].unsqueeze(1)
                     agent_log_prob_old = batch_log_probs_old[:, agent_idx]
-
-                    # Reshape batch_advantages to match dimensions
                     agent_advantages = batch_advantages[:, agent_idx].unsqueeze(1)
 
                     # Forward pass through the agent's policy network
                     mean, std = agent(agent_state)
-                    std = torch.clamp(std * self.epsilon, min=1e-4)
+                    std = torch.clamp(std * self.epsilon, min=1e-4)  # Ensure std is not too small
                     dist = Normal(mean, std)
                     agent_log_prob = dist.log_prob(agent_action).sum(dim=-1, keepdim=True)
                     entropy = dist.entropy().sum(dim=-1, keepdim=True)
@@ -256,24 +269,26 @@ class MAPPOAgent:
                     surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * agent_advantages
                     actor_loss = -torch.min(surr1, surr2).mean() - current_entropy_coef * entropy.mean()
 
+                    # Optimization step
                     optimizer.zero_grad()
                     actor_loss.backward()
                     torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)
                     optimizer.step()
 
-                    # Record policy loss per agent
+                    # Record policy loss
                     policy_loss = -torch.mean(agent_log_prob)
                     policy_losses_per_agent[agent_idx].append(policy_loss.item())
 
+                    # Log detailed information
                     self.logger.info(
                         f"Agent {agent_idx} - Actor Loss: {actor_loss.item():.6f}, Policy Loss: {policy_loss.item():.6f}"
                     )
 
         # Average policy loss per agent over epochs
         avg_policy_loss_per_agent = [np.mean(agent_losses) for agent_losses in policy_losses_per_agent]
+
+        # Return for logging and analysis
         return actor_loss.item(), critic_loss.item(), entropy.mean().item(), avg_policy_loss_per_agent
-
-
 
     def compute_individual_gae(self, rewards, dones, values):
         """
@@ -371,19 +386,82 @@ class MAPPOAgent:
         processed_states = self._process_state(state)
         actions = []
         log_probs = []
+        
         for agent_idx, agent in enumerate(self.agents):
             state_tensor = processed_states[agent_idx].unsqueeze(0)
+            
+            # Get RL policy action
             with torch.no_grad():
                 mean, std = agent(state_tensor)
-            std = torch.clamp(std * self.epsilon, min=1e-4)  # Scale exploration noise by epsilon
+            std = torch.clamp(std * self.epsilon, min=1e-4)
             dist = Normal(mean, std)
-            action = dist.sample()
-            action = action.clamp(-1, 1)  # Ensure action bounds
-            log_prob = dist.log_prob(action).sum(dim=-1)
-            actions.append(action.squeeze().cpu().numpy().item())
+            rl_action = dist.sample()
+            rl_action = rl_action.clamp(-1, 1)
+            log_prob = dist.log_prob(rl_action).sum(dim=-1)
+            
+            # Calculate PD correction
+            current_angle = state[agent_idx]['joint_angle'].flatten()[0]
+            target_angle = self.env.target_joint_angles[agent_idx] if hasattr(self.env, 'target_joint_angles') else 0.0
+            error = target_angle - current_angle
+            
+            pd_correction = self.pd_controllers[agent_idx].compute(error)
+            pd_correction = np.clip(pd_correction, -1, 1)
+            
+            # Combine RL and PD actions
+            combined_action = (1 - self.pd_weight) * rl_action.squeeze().cpu().numpy() + \
+                            self.pd_weight * pd_correction
+            
+            combined_action = np.clip(combined_action, -1, 1)
+            
+            actions.append(float(combined_action))
             log_probs.append(log_prob.item())
+        
         return actions, log_probs
+    def track_pd_metrics(self, pd_corrections, joint_errors):
+        """Track PD controller performance metrics."""
+        pd_metrics = {
+            'mean_correction': np.mean(np.abs(pd_corrections)),
+            'max_correction': np.max(np.abs(pd_corrections)),
+            'correction_std': np.std(pd_corrections),
+            'error_correlation': np.corrcoef(pd_corrections, joint_errors)[0, 1]
+        }
+        return pd_metrics
+        # 4. Add method to update PD parameters dynamically
+    def update_pd_parameters(self, agent_idx=None, kp=None, kd=None, weight=None):
+        """Update PD controller parameters during training."""
+        if agent_idx is not None:
+            if kp is not None:
+                self.pd_controllers[agent_idx].kp = kp
+            if kd is not None:
+                self.pd_controllers[agent_idx].kd = kd
+        else:
+            # Update all controllers
+            for controller in self.pd_controllers:
+                if kp is not None:
+                    controller.kp = kp
+                if kd is not None:
+                    controller.kd = kd
+        
+        if weight is not None:
+            self.pd_weight = weight
 
+    # 5. Add method to compute stability metrics
+    def compute_stability_metrics(self, joint_errors, pd_corrections):
+        """Compute stability metrics for the combined controller."""
+        stability_metrics = {
+            'error_smoothness': np.mean(np.abs(np.diff(joint_errors))),
+            'control_smoothness': np.mean(np.abs(np.diff(pd_corrections))),
+            'overall_stability': np.exp(-np.mean(np.abs(joint_errors)))
+        }
+        return stability_metrics
+
+    # 6. Add adaptive PD weight adjustment
+    def adapt_pd_weight(self, performance_metrics):
+        """Adjust PD contribution weight based on performance."""
+        if performance_metrics['error_smoothness'] > self.stability_threshold:
+            self.pd_weight = min(self.pd_weight * 1.1, 0.8)  # Increase PD influence
+        else:
+            self.pd_weight = max(self.pd_weight * 0.9, 0.1)  # Decrease
     def compute_gae(self, rewards, dones, values):
         advantages = []
         returns = []
@@ -420,6 +498,7 @@ class MAPPOAgent:
         return advantages.detach(), returns.detach()
 
 
+
     def train(self, num_episodes, max_steps_per_episode=1000):
         logging.info(f"Starting training for {num_episodes} episodes")
         self.training_metrics = TrainingMetrics(num_joints=self.num_joints)
@@ -430,7 +509,7 @@ class MAPPOAgent:
 
         # Initialize CurriculumManager
         curriculum_manager = CurriculumManager(
-            initial_difficulty=0.0, max_difficulty=5.0, success_threshold=0.8
+            initial_difficulty=0.50, max_difficulty=5.0, success_threshold=0.8
         )
 
         for episode in range(num_episodes):
@@ -446,9 +525,7 @@ class MAPPOAgent:
             # Tracking variables for episode stats
             begin_distance = None
             prev_best = float('inf')
-            episode_cumulative_reward = 0  # Initialize cumulative reward for each episode
-            discounted_cumulative_reward = 0.0  # If you're using discounted rewards
-
+            cumulative_reward = 0
 
             # Log initial joint angles
             initial_joint_angles = [p.getJointState(self.env.robot_id, i)[0] for i in self.env.joint_indices]
@@ -523,8 +600,18 @@ class MAPPOAgent:
                     angular_weights=angular_weights,
                     success_threshold=current_success_threshold
                 )
-                overall_reward=np.clip(overall_reward, -1, 100 )
+                #Calculate reward using the modified compute_reward function
 
+            #     overall_reward, prev_best, success = compute_reward(
+            #     distance=distance,
+            #     begin_distance=begin_distance,
+            #     prev_best=prev_best,
+            #     joint_errors=joint_errors,
+            #     linear_weights=linear_weights,
+            #     angular_weights=angular_weights,
+            #     success_threshold=current_success_threshold
+
+            # )
 
 
                 # Calculate intrinsic reward using exploration module
@@ -533,20 +620,14 @@ class MAPPOAgent:
                     action=actions_tensor,
                     next_state=global_next_state
                 )
-                # Calculate total reward for this step
-                step_reward = overall_reward + intrinsic_reward.item()
 
-                # Update true cumulative reward (simple sum)
-                episode_cumulative_reward += step_reward
-
-                # If you also want to track a discounted cumulative reward:
-                discounted_cumulative_reward = self.gamma * discounted_cumulative_reward + step_reward
-
-                
+                # Add intrinsic reward to the overall reward
+                overall_reward += intrinsic_reward.item()
+                cumulative_reward = 0.95 * cumulative_reward + overall_reward
 
                 # Log rewards and errors for each agent
                 for agent_idx in range(self.num_agents):
-                # Safely calculate the joint success rate
+# Safely calculate the joint success rate
                     if len(total_rewards[agent_idx]) > 0:
                         joint_success_rate = sum([1 for s in total_rewards[agent_idx] if s > self.env.success_threshold]) / len(total_rewards[agent_idx])
                     else:
@@ -627,6 +708,7 @@ class MAPPOAgent:
         return metrics
 
 
+
     def _process_state(self, state):
         processed_states = []
         for joint_state in state:
@@ -699,65 +781,23 @@ class MAPPOAgent:
         """
         return self.env.target_position, self.env.target_orientation
 
-    def test_agent(self, env, num_episodes, max_steps=5000, save_metrics=False, early_stop_criteria=None):
+    def test_agent(self, env, num_episodes, max_steps=1000):
         """
-        Test the trained agent in the environment and log detailed performance metrics.
-    
-        Args:
-            env (object): The environment in which the agent is tested.
-            num_episodes (int): Number of episodes for testing.
-            max_steps (int): Maximum number of steps per episode.
-            save_metrics (bool): Whether to save performance metrics.
-            early_stop_criteria (float): The success threshold for early stopping (optional).
-        
-        Returns:
-            List[Dict]: A list of performance metrics for each episode.
+        Test the trained agent in the environment.
         """
-        episode_metrics = []
-
         for episode in range(num_episodes):
             state = env.reset()
             done = False
             episode_reward = 0
             step_count = 0
-            success = False
-            
             while not done and step_count < max_steps:
                 actions, _ = self.get_actions(state)
-                next_state, rewards, done, info = env.step(actions)
+                next_state, rewards, done, _ = env.step(actions)
                 episode_reward += sum(rewards)  # Sum rewards across agents
                 state = next_state
                 step_count += 1
-                
-                # Check early stopping criteria if provided
-                if early_stop_criteria and info.get('success_rate', 0) >= early_stop_criteria:
-                    success = True
-                    break
-            
-            print(f"Test Episode {episode + 1}, Total Reward: {episode_reward}, Steps Taken: {step_count}")
-            
-            # Collect and store episode metrics
-            metrics = {
-                'episode': episode + 1,
-                'total_reward': episode_reward,
-                'steps_taken': step_count,
-                'success': success
-            }
-            episode_metrics.append(metrics)
-            
-            # Log metrics
-            self.logger.info(f"Test Episode {episode + 1}: Total Reward = {episode_reward}, "
-                            f"Steps Taken = {step_count}, Success = {success}")
-        
-        if save_metrics:
-            metrics_path = os.path.join(self.base_path, 'test_metrics.json')
-            with open(metrics_path, 'w') as f:
-                json.dump(episode_metrics, f, indent=2)
-            print(f"Metrics saved to {metrics_path}")
-
+            print(f"Test Episode {episode+1}, Total Reward: {episode_reward}")
         env.close()
-        return episode_metrics
-
 
 class AdaptiveRewardScaler:
     def __init__(self, window_size=100, initial_scale=1.0, adjustment_rate=0.05):
@@ -779,4 +819,3 @@ class AdaptiveRewardScaler:
                 self.scale *= (1 + self.adjustment_rate)
             self.scale = np.clip(self.scale, self.min_scale, self.max_scale)
         return self.scale
-
