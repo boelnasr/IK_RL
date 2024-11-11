@@ -260,7 +260,7 @@ class TrainingMetrics:
             }
 
             # Calculate moving averages if enough episodes
-            window = min(100, num_episodes // 10)
+            window = min(10, num_episodes // 10)
             if window > 0:
                 metrics['moving_averages'] = {
                     'reward': self._compute_moving_average(metrics['rewards']['average_per_episode'], window),
@@ -335,7 +335,7 @@ class TrainingMetrics:
         fig.savefig(path, dpi=300, bbox_inches='tight')
         plt.close(fig)
 
-    def plot_metrics(self, metrics: Dict, env: Any, show_plots: bool = False) -> None:
+    def plot_metrics(self, metrics: Dict, env: Any, show_plots: bool = True) -> None:
         """Create and save all plots."""
         try:
             self._plot_joint_metrics(metrics, env, show_plots)
@@ -348,6 +348,8 @@ class TrainingMetrics:
             self._plot_combined_metrics(metrics, show_plots)
             self._plot_policy_loss(metrics, show_plots)
             self._plot_policy_loss_per_agent(metrics, show_plots)
+            self._plot_minimum_joint_errors(metrics, show_plots)  # Add this line
+
 
             self.logger.info("All plots generated and saved successfully")
             
@@ -410,19 +412,27 @@ class TrainingMetrics:
             plt.show()
         plt.close(fig)
 
+
     def _plot_training_metrics(self, metrics: Dict, show_plots: bool) -> None:
-        """Plot training-specific metrics including policy loss."""
+        """Plot training-specific metrics, separating entropy and losses."""
         episodes = np.arange(1, len(metrics['training']['entropy']) + 1)
-        window = min(100, len(episodes) // 10)
+        window = min(10, len(episodes) // 10)
         
         # 1. Plot entropy
         fig_entropy, ax_entropy = plt.subplots(figsize=(12, 6))
-        ax_entropy.plot(episodes, metrics['training']['entropy'], label='Entropy', color='cyan')
-        # Add moving average
+        ax_entropy.plot(episodes, metrics['training']['entropy'], 
+                    label='Entropy', 
+                    color='cyan', 
+                    alpha=0.7)
+        
+        # Add moving average for entropy
         if window > 1:
             entropy_ma = self._compute_moving_average(metrics['training']['entropy'], window)
             ma_episodes = episodes[window-1:]
-            ax_entropy.plot(ma_episodes, entropy_ma, label='Moving Average', color='red', linewidth=2)
+            ax_entropy.plot(ma_episodes, entropy_ma, 
+                        label=f'Moving Average (window={window})', 
+                        color='red', 
+                        linewidth=2)
         
         ax_entropy.set_title('Policy Entropy Over Time')
         ax_entropy.set_xlabel('Episodes')
@@ -433,33 +443,74 @@ class TrainingMetrics:
         self.save_figure(fig_entropy, 'entropy_plot')
         plt.close(fig_entropy)
 
-        # 2. Plot actor, critic, and policy losses
+        # 2. Plot only actor and critic losses
         fig_losses, ax_losses = plt.subplots(figsize=(12, 6))
-        # Actor loss
-        ax_losses.plot(episodes, metrics['training']['actor_loss'], label='Actor Loss', color='blue', alpha=0.7)
-        # Critic loss
-        ax_losses.plot(episodes, metrics['training']['critic_loss'], label='Critic Loss', color='red', alpha=0.7)
-        # Policy loss
-        ax_losses.plot(episodes, metrics['training']['policy_loss'], label='Policy Loss', color='green', alpha=0.7)
+        
+        # Plot raw data with low alpha
+        ax_losses.plot(episodes, metrics['training']['actor_loss'], 
+                    label='Actor Loss', 
+                    color='blue', 
+                    alpha=0.4)
+        ax_losses.plot(episodes, metrics['training']['critic_loss'], 
+                    label='Critic Loss', 
+                    color='red', 
+                    alpha=0.4)
         
         # Add moving averages
         if window > 1:
             actor_ma = self._compute_moving_average(metrics['training']['actor_loss'], window)
             critic_ma = self._compute_moving_average(metrics['training']['critic_loss'], window)
-            policy_ma = self._compute_moving_average(metrics['training']['policy_loss'], window)
             ma_episodes = episodes[window-1:]
-            ax_losses.plot(ma_episodes, actor_ma, label='Actor MA', color='blue', linestyle='--', linewidth=2)
-            ax_losses.plot(ma_episodes, critic_ma, label='Critic MA', color='red', linestyle='--', linewidth=2)
-            ax_losses.plot(ma_episodes, policy_ma, label='Policy MA', color='green', linestyle='--', linewidth=2)
+            
+            ax_losses.plot(ma_episodes, actor_ma, 
+                        label='Actor MA', 
+                        color='blue', 
+                        linestyle='--', 
+                        linewidth=2)
+            ax_losses.plot(ma_episodes, critic_ma, 
+                        label='Critic MA', 
+                        color='red', 
+                        linestyle='--', 
+                        linewidth=2)
         
-        ax_losses.set_title('Actor, Critic, and Policy Losses Over Time')
+        # Add trend lines
+        for data, color, name in zip(
+            [metrics['training']['actor_loss'], metrics['training']['critic_loss']],
+            ['blue', 'red'],
+            ['Actor', 'Critic']
+        ):
+            z = np.polyfit(episodes, data, 1)
+            p = np.poly1d(z)
+            ax_losses.plot(episodes, p(episodes), 
+                        color=color, 
+                        linestyle=':', 
+                        alpha=0.8,
+                        label=f'{name} Trend')
+        
+        # Calculate and display statistics
+        stats_text = (
+            f'Actor Loss:\n'
+            f'  Mean: {np.mean(metrics["training"]["actor_loss"]):.4f}\n'
+            f'  Std: {np.std(metrics["training"]["actor_loss"]):.4f}\n'
+            f'Critic Loss:\n'
+            f'  Mean: {np.mean(metrics["training"]["critic_loss"]):.4f}\n'
+            f'  Std: {np.std(metrics["training"]["critic_loss"]):.4f}'
+        )
+        ax_losses.text(0.02, 0.98, stats_text,
+                    transform=ax_losses.transAxes,
+                    verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        ax_losses.set_title('Actor and Critic Losses Over Time')
         ax_losses.set_xlabel('Episodes')
         ax_losses.set_ylabel('Loss')
         ax_losses.grid(True, alpha=0.3)
-        ax_losses.legend()
+        ax_losses.legend(loc='upper right')
         plt.tight_layout()
-        self.save_figure(fig_losses, 'losses_plot')
+        
+        self.save_figure(fig_losses, 'actor_critic_losses')
         plt.close(fig_losses)
+
 
     def _plot_success_metrics(self, metrics: Dict, env: Any, show_plots: bool) -> None:
         """Plot success-related metrics."""
@@ -468,7 +519,7 @@ class TrainingMetrics:
         fig, ax = plt.subplots(figsize=(12, 6))
         ax.plot(episodes, metrics['success_rate']['cumulative'], label='Success Rate', color='green')
         
-        window = min(100, len(episodes) // 10)
+        window = min(10, len(episodes) // 10)
         if window > 1 and 'moving_averages' in metrics:
             ma_episodes = episodes[window-1:]
             ax.plot(ma_episodes, metrics['moving_averages']['success_rate'], 
@@ -528,7 +579,7 @@ class TrainingMetrics:
                     label=f'Joint {joint_idx+1} Cumulative Reward', color='b')
             
             # Add moving average trend line
-            window = min(50, len(episodes) // 10) if len(episodes) > 50 else 1
+            window = min(10, len(episodes) // 10) if len(episodes) > 50 else 1
             if window > 1:
                 rolling_mean = np.convolve(cumulative_rewards[joint_idx], 
                                         np.ones(window)/window, mode='valid')
@@ -556,59 +607,268 @@ class TrainingMetrics:
         plt.close(fig)
 
     def _plot_mean_episode_rewards_per_agent(self, metrics: Dict, env: Any, show_plots: bool) -> None:
-        """Plot mean episode rewards per agent (joint) over episodes."""
-        episodes = np.arange(1, metrics['mean_episode_rewards_per_agent'].shape[1] + 1)
-        num_joints = env.num_joints
-        mean_episode_rewards_per_agent = metrics['mean_episode_rewards_per_agent']
+        """
+        Plot mean episode rewards per agent (joint) over episodes with moving average and trend line.
+
+        Args:
+            metrics (Dict): Dictionary containing calculated training metrics.
+            env (Any): Environment instance containing relevant attributes like `num_joints`.
+            show_plots (bool): Flag to display plots interactively.
+        """
+        try:
+            # Extract necessary data
+            episodes = np.arange(1, metrics['mean_episode_rewards_per_agent'].shape[1] + 1)
+            num_joints = env.num_joints if env else self.num_joints
+            mean_episode_rewards_per_agent = metrics['mean_episode_rewards_per_agent']
+            
+            # Create subplots for each joint
+            fig, axes = plt.subplots(nrows=num_joints, ncols=1, figsize=(30, 6 * num_joints))
+            if num_joints == 1:
+                axes = [axes]
+            
+            # Define moving average window size
+            window = min(10, len(episodes) // 10)  # Adjust window based on the number of episodes
+            window = max(window, 1)  # Ensure window is at least 1
+            
+            for joint_idx in range(num_joints):
+                ax = axes[joint_idx]
+                joint_rewards = mean_episode_rewards_per_agent[joint_idx]
+                
+                # Plot raw mean episode rewards
+                ax.plot(
+                    episodes, 
+                    joint_rewards, 
+                    label=f'Joint {joint_idx + 1} Mean Reward', 
+                    color='green', 
+                    linewidth=2
+                )
+                
+                # Compute and plot moving average if window > 1
+                if window > 1 and len(joint_rewards) >= window:
+                    moving_avg = self._compute_moving_average(joint_rewards, window)
+                    ma_episodes = episodes[window - 1:]
+                    ax.plot(
+                        ma_episodes, 
+                        moving_avg, 
+                        label=f'Moving Average (window={window})', 
+                        color='red', 
+                        linewidth=2, 
+                        linestyle='--'
+                    )
+                
+                # Compute and plot trend line using linear regression
+                if len(joint_rewards) >= 2:
+                    z = np.polyfit(episodes, joint_rewards, 1)  # Linear fit
+                    p = np.poly1d(z)
+                    ax.plot(
+                        episodes, 
+                        p(episodes), 
+                        label='Trend', 
+                        color='blue', 
+                        linewidth=2, 
+                        linestyle=':'
+                    )
+                
+                # Customize plot
+                ax.set_xlabel('Episodes', fontsize=12)
+                ax.set_ylabel('Mean Episode Reward', fontsize=12)
+                ax.set_title(f'Joint {joint_idx + 1} Mean Episode Reward Over Time', fontsize=14)
+                ax.legend(fontsize=12)
+                ax.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            self.save_figure(fig, 'mean_episode_rewards_per_joint')
+            self.logger.info("Mean episode rewards per joint plot saved successfully.")
+            if show_plots:
+                plt.show()
+            plt.close(fig)
         
-        fig, axes = plt.subplots(nrows=num_joints, ncols=1, figsize=(30, 6 * num_joints))
-        if num_joints == 1:
-            axes = [axes]
+        except Exception as e:
+            self.logger.error(f"Error plotting mean episode rewards per agent: {str(e)}")
+            raise
+
+
+    def _plot_minimum_joint_errors(self, metrics: Dict, show_plots: bool) -> None:
+        """
+        Plot minimum joint errors per episode for each joint in subplots.
         
-        for joint_idx in range(num_joints):
-            ax = axes[joint_idx]
-            ax.plot(episodes, mean_episode_rewards_per_agent[joint_idx], 
-                    label=f'Joint {joint_idx+1} Mean Reward', color='g')
+        Args:
+            metrics: Dictionary containing training metrics
+            show_plots: Boolean to control whether to display plots
+        """
+        try:
+            # Extract joint errors from metrics
+            joint_errors = np.array(metrics['joint_errors']['min'])  # Shape: (num_episodes, num_joints)
+            num_episodes, num_joints = joint_errors.shape
+            episodes = np.arange(1, num_episodes + 1)
+
+            # Create figure with subplots
+            fig, axes = plt.subplots(num_joints, 1, figsize=(15, 4 * num_joints))
+            if num_joints == 1:
+                axes = [axes]
+
+            # Color scheme for better visualization
+            colors = plt.cm.viridis(np.linspace(0, 1, 3))  # 3 colors for different lines
+
+            # Plot for each joint
+            for joint_idx in range(num_joints):
+                ax = axes[joint_idx]
+                errors = joint_errors[:, joint_idx]
+                
+                # Calculate rolling minimum
+                window = min(10, len(episodes) // 10) if len(episodes) > 50 else 1
+                min_errors = np.array([np.min(errors[max(0, i-window):i+1]) 
+                                    for i in range(len(errors))])
+                
+                # Plot raw minimum errors
+                ax.plot(episodes, min_errors, 
+                    label='Minimum Error', 
+                    color=colors[0], 
+                    alpha=0.5)
+                
+                # Add moving average of minimum errors
+                if window > 1:
+                    moving_avg = np.convolve(min_errors, 
+                                        np.ones(window)/window, 
+                                        mode='valid')
+                    ax.plot(episodes[window-1:], 
+                        moving_avg,
+                        label=f'Moving Average (window={window})',
+                        color=colors[1],
+                        linewidth=2)
+
+                # Add trend line
+                z = np.polyfit(episodes, min_errors, 1)
+                p = np.poly1d(z)
+                ax.plot(episodes, p(episodes), 
+                    linestyle='--', 
+                    color=colors[2],
+                    label='Trend',
+                    alpha=0.8)
+
+                # Calculate and display statistics
+                stats = {
+                    'Min': np.min(min_errors),
+                    'Mean': np.mean(min_errors),
+                    'Std': np.std(min_errors),
+                    'Final': min_errors[-1],
+                    'Improvement': ((min_errors[0] - min_errors[-1]) / min_errors[0] * 100 
+                                if min_errors[0] != 0 else 0)
+                }
+                
+                stats_text = (f"Minimum Error: {stats['Min']:.6f}\n"
+                            f"Mean Error: {stats['Mean']:.6f}\n"
+                            f"Std Dev: {stats['Std']:.6f}\n"
+                            f"Final Error: {stats['Final']:.6f}\n"
+                            f"Improvement: {stats['Improvement']:.1f}%")
+                
+                ax.text(0.02, 0.98, stats_text,
+                    transform=ax.transAxes,
+                    verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+                # Highlight key points
+                lowest_error = np.min(min_errors)
+                lowest_error_idx = np.argmin(min_errors)
+                ax.scatter(episodes[lowest_error_idx], lowest_error, 
+                        color='red', s=100, zorder=5,
+                        label='Best Performance')
+
+                # Customize subplot
+                ax.set_xlabel('Episodes')
+                ax.set_ylabel('Joint Error (radians)')
+                ax.set_title(f'Joint {joint_idx + 1}  Error Over Time')
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+                
+                # Set y-axis to log scale if range is large
+                if np.max(min_errors) / (np.min(min_errors) + 1e-10) > 100:
+                    ax.set_yscale('log')
+
+            plt.tight_layout()
+            self.save_figure(fig, 'minimum_joint_errors')
+            if show_plots:
+                plt.show()
+            plt.close(fig)
+
+            # Create summary comparison plot
+            fig, ax = plt.subplots(figsize=(15, 8))
+            
+            # Plot smoothed minimum errors for all joints
+            for joint_idx in range(num_joints):
+                errors = joint_errors[:, joint_idx]
+                window = min(10, len(episodes) // 10) if len(episodes) > 50 else 1
+                
+                # Calculate smoothed minimum errors
+                min_errors = np.array([np.min(errors[max(0, i-window):i+1]) 
+                                    for i in range(len(errors))])
+                moving_avg = np.convolve(min_errors, 
+                                    np.ones(window)/window, 
+                                    mode='valid')
+                
+                ax.plot(episodes[window-1:], 
+                    moving_avg,
+                    label=f'Joint {joint_idx + 1}',
+                    linewidth=2)
+
+            # Add overall error trend
+            mean_errors = np.mean(joint_errors, axis=1)
+            z = np.polyfit(episodes, mean_errors, 1)
+            p = np.poly1d(z)
+            ax.plot(episodes, p(episodes), 
+                linestyle='--', 
+                color='black',
+                label='Overall Trend',
+                alpha=0.5)
+
             ax.set_xlabel('Episodes')
-            ax.set_ylabel('Mean Episode Reward')
-            ax.set_title(f'Joint {joint_idx+1} Mean Episode Reward Over Time')
+            ax.set_ylabel('Minimum Joint Error (radians)')
+            ax.set_title('Comparison of Minimum Joint Errors Across All Joints')
+            ax.grid(True, alpha=0.3)
             ax.legend()
-            ax.grid(True)
-        
-        plt.tight_layout()
-        self.save_figure(fig, 'mean_episode_rewards_per_joint')
-        self.logger.info("Mean episode rewards per joint plot saved successfully.")
-        if show_plots:
-            plt.show()
-        plt.close(fig)
 
-    def _plot_combined_metrics(self, metrics: Dict, show_plots: bool) -> None:
-        """Plot combined performance metrics."""
-        episodes = np.arange(1, len(metrics['rewards']['total']) + 1)
-        
-        # Normalize metrics
-        norm_reward = (np.array([np.sum(r) for r in metrics['rewards']['total']]) - np.min(metrics['rewards']['cumulative'])) / \
-                      (np.max(metrics['rewards']['cumulative']) - np.min(metrics['rewards']['cumulative']) + 1e-8)
-        norm_success = metrics['success_rate']['cumulative']
-        norm_error = 1.0 - (np.mean(metrics['joint_errors']['mean'], axis=1) - 
-                            np.min(np.mean(metrics['joint_errors']['mean'], axis=1))) / \
-                        (np.max(np.mean(metrics['joint_errors']['mean'], axis=1)) - 
-                            np.min(np.mean(metrics['joint_errors']['mean'], axis=1)) + 1e-8)
+            # Set y-axis to log scale if range is large
+            if np.max(joint_errors) / (np.min(joint_errors) + 1e-10) > 100:
+                ax.set_yscale('log')
 
-        fig, ax = plt.subplots(figsize=(12, 6))
-        ax.plot(episodes, norm_reward, label='Normalized Reward', color='blue')
-        ax.plot(episodes, norm_success, label='Success Rate', color='green')
-        ax.plot(episodes, norm_error, label='Normalized Accuracy', color='red')
-        ax.set_xlabel('Episodes')
-        ax.set_ylabel('Normalized Value')
-        ax.set_title('Combined Performance Metrics')
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-        
-        plt.tight_layout()
-        self.save_figure(fig, 'combined_metrics')
-        plt.close(fig)
+            plt.tight_layout()
+            self.save_figure(fig, 'minimum_joint_errors_comparison')
+            if show_plots:
+                plt.show()
+            plt.close(fig)
 
+            # Additional convergence analysis plot
+            fig, ax = plt.subplots(figsize=(15, 6))
+            
+            # Calculate convergence metrics for each joint
+            for joint_idx in range(num_joints):
+                errors = joint_errors[:, joint_idx]
+                window = min(10, len(episodes) // 5)
+                convergence = np.array([np.std(errors[max(0, i-window):i+1]) 
+                                    for i in range(len(errors))])
+                
+                ax.plot(episodes, convergence, 
+                    label=f'Joint {joint_idx + 1}',
+                    alpha=0.7)
+
+            ax.set_xlabel('Episodes')
+            ax.set_ylabel('Error Stability (Std Dev)')
+            ax.set_title('Joint Error Convergence Analysis')
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+
+            plt.tight_layout()
+            self.save_figure(fig, 'joint_errors_convergence')
+            if show_plots:
+                plt.show()
+            plt.close(fig)
+
+        except Exception as e:
+            self.logger.error(f"Error plotting minimum joint errors: {str(e)}")
+            raise
+    
+    
+    
     def save_final_report(self, metrics: Dict) -> None:
         """
         Generate and save a comprehensive training report.
@@ -655,49 +915,331 @@ class TrainingMetrics:
 
         self.logger.info(f"Training report saved to: {report_path}")
 
-
     def _plot_policy_loss(self, metrics: Dict, show_plots: bool) -> None:
-        """Plot Policy Loss over episodes."""
+        """Plot Policy Loss over episodes with smoothing."""
         episodes = np.arange(1, len(metrics['training']['policy_loss']) + 1)
+        raw_policy_loss = np.array(metrics['training']['policy_loss'])
         
-        plt.figure(figsize=(10, 6))
-        plt.plot(episodes, metrics['training']['policy_loss'], label='Policy Loss', color='orange')
-        plt.xlabel('Episodes')
-        plt.ylabel('Policy Loss')
-        plt.title('Policy Loss Over Time')
-        plt.grid(True)
-        plt.legend()
-        plt.tight_layout()
+        fig, ax = plt.subplots(figsize=(12, 6))
         
-        self.save_figure(plt.gcf(), 'policy_loss')
-        self.logger.info("Policy loss plot saved successfully.")
-        if show_plots:
-            plt.show()
-        plt.close()
-    
-    def _plot_policy_loss_per_agent(self, metrics: Dict, show_plots: bool) -> None:
-        """Plot policy loss per agent over episodes."""
-        num_agents = metrics['policy_loss_per_agent'].shape[0]
-        num_episodes = metrics['policy_loss_per_agent'].shape[1]
-        episodes = np.arange(1, num_episodes + 1)
-        policy_loss_per_agent = metrics['policy_loss_per_agent']  # Shape: (num_agents, num_episodes)
-        plt.figure(figsize=(10, 6))
-        fig, axes = plt.subplots(nrows=num_agents, ncols=1, figsize=(30, 6 * num_agents))
-        if num_agents == 1:
-            axes = [axes]
-
-        for agent_idx in range(num_agents):
-            ax = axes[agent_idx]
-            ax.plot(episodes, policy_loss_per_agent[agent_idx], label=f'Agent {agent_idx+1} Policy Loss', color='orange')
-            ax.set_xlabel('Episodes')
-            ax.set_ylabel('Policy Loss')
-            ax.set_title(f'Agent {agent_idx+1} Policy Loss Over Time')
-            ax.legend()
-            ax.grid(True)
-
+        # Plot raw data with low alpha
+        ax.plot(episodes, raw_policy_loss, 
+                label='Raw Policy Loss', 
+                color='orange', 
+                alpha=0.3, 
+                linewidth=1)
+        
+        # Add different smoothing levels
+        windows = [5, 20, 50]  # Different window sizes for smoothing
+        colors = ['red', 'blue', 'green']  # Different colors for each smoothing level
+        
+        for window, color in zip(windows, colors):
+            if len(episodes) > window:
+                # Compute exponential moving average
+                alpha = 2 / (window + 1)
+                smoothed = np.zeros_like(raw_policy_loss)
+                smoothed[0] = raw_policy_loss[0]
+                for i in range(1, len(raw_policy_loss)):
+                    smoothed[i] = alpha * raw_policy_loss[i] + (1 - alpha) * smoothed[i-1]
+                
+                ax.plot(episodes, smoothed, 
+                    label=f'EMA (window={window})', 
+                    color=color, 
+                    linewidth=2)
+        
+        # Add trend line
+        z = np.polyfit(episodes, raw_policy_loss, 1)
+        p = np.poly1d(z)
+        ax.plot(episodes, p(episodes), 
+                '--', 
+                color='purple', 
+                label='Trend', 
+                linewidth=2)
+        
+        # Calculate and display statistics
+        stats_text = (
+            f'Mean: {np.mean(raw_policy_loss):.4f}\n'
+            f'Std: {np.std(raw_policy_loss):.4f}\n'
+            f'Min: {np.min(raw_policy_loss):.4f}\n'
+            f'Max: {np.max(raw_policy_loss):.4f}'
+        )
+        ax.text(0.02, 0.98, stats_text,
+                transform=ax.transAxes,
+                verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        ax.set_xlabel('Episodes')
+        ax.set_ylabel('Policy Loss')
+        ax.set_title('Policy Loss Over Time (with Smoothing)')
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right')
+        
         plt.tight_layout()
-        self.save_figure(fig, 'policy_loss_per_agent')
-        self.logger.info("Policy loss per agent plot saved successfully.")
+        self.save_figure(fig, 'policy_loss_smoothed')
+        self.logger.info("Smoothed policy loss plot saved successfully.")
         if show_plots:
             plt.show()
         plt.close(fig)
+
+    def _plot_policy_loss_per_agent(self, metrics: Dict, show_plots: bool) -> None:
+            """Plot policy loss per agent over episodes with smoothing."""
+            try:
+                num_agents = metrics['policy_loss_per_agent'].shape[0]
+                num_episodes = metrics['policy_loss_per_agent'].shape[1]
+                episodes = np.arange(1, num_episodes + 1)
+                policy_loss_per_agent = metrics['policy_loss_per_agent']
+                
+                fig, axes = plt.subplots(nrows=num_agents, ncols=1, figsize=(30, 6 * num_agents))
+                if num_agents == 1:
+                    axes = [axes]
+
+                windows = [5, 20, 50]  # Different window sizes for smoothing
+                colors = ['red', 'blue', 'green']  # Different colors for each smoothing level
+                
+                for agent_idx in range(num_agents):
+                    ax = axes[agent_idx]
+                    raw_data = policy_loss_per_agent[agent_idx]
+                    
+                    # Plot raw data with low alpha
+                    ax.plot(episodes, raw_data, 
+                            label='Raw Data', 
+                            color='orange', 
+                            alpha=0.7, 
+                            linewidth=1)
+                    
+                    # Add different smoothing levels
+                    for window, color in zip(windows, colors):
+                        if len(episodes) > window:
+                            # Compute exponential moving average
+                            alpha_val = 2 / (window + 1)
+                            smoothed = np.zeros_like(raw_data)
+                            smoothed[0] = raw_data[0]
+                            for i in range(1, len(raw_data)):
+                                smoothed[i] = alpha_val * raw_data[i] + (1 - alpha_val) * smoothed[i-1]
+                            
+                            ax.plot(episodes, smoothed, 
+                                label=f'EMA (window={window})', 
+                                color=color, 
+                                linewidth=2)
+                    
+                    # Add trend line
+                    z = np.polyfit(episodes, raw_data, 1)
+                    p = np.poly1d(z)
+                    ax.plot(episodes, p(episodes), 
+                            '--', 
+                            color='purple', 
+                            label='Trend', 
+                            linewidth=2)
+                    
+                    # Calculate and display statistics
+                    stats_text = (
+                        f'Mean: {np.mean(raw_data):.4f}\n'
+                        f'Std: {np.std(raw_data):.4f}\n'
+                        f'Min: {np.min(raw_data):.4f}\n'
+                        f'Max: {np.max(raw_data):.4f}'
+                    )
+                    ax.text(0.02, 0.98, stats_text,
+                            transform=ax.transAxes,
+                            verticalalignment='top',
+                            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                    
+                    ax.set_xlabel('Episodes')
+                    ax.set_ylabel('Policy Loss')
+                    ax.set_title(f'Agent {agent_idx+1} Policy Loss Over Time')
+                    ax.grid(True, alpha=0.3)
+                    ax.legend(loc='upper right')
+                
+                plt.tight_layout()
+                self.save_figure(fig, 'policy_loss_per_agent_smoothed')
+                self.logger.info("Smoothed policy loss per agent plot saved successfully.")
+                if show_plots:
+                    plt.show()
+                plt.close(fig)
+            
+            except Exception as e:
+                self.logger.error(f"Error plotting policy loss per agent: {str(e)}")
+                raise
+
+    def plot_distance_metrics(self):
+        """
+        Create comprehensive visualizations for distance metrics.
+        """
+        try:
+            # Create directory for plots if it doesn't exist
+            plot_dir = "distance_metrics_plots"
+            os.makedirs(plot_dir, exist_ok=True)
+
+            # Setup subplots
+            fig = plt.figure(figsize=(20, 12))
+            gs = plt.GridSpec(3, 2, figure=fig)
+
+            # 1. Position Distance Over Time
+            ax1 = fig.add_subplot(gs[0, 0])
+            self._plot_position_distance(ax1)
+
+            # 2. Orientation Distance Over Time
+            ax2 = fig.add_subplot(gs[0, 1])
+            self._plot_orientation_distance(ax2)
+
+            # 3. Component-wise Position Distances
+            ax3 = fig.add_subplot(gs[1, 0])
+            self._plot_component_distances(ax3)
+
+            # 4. Euler Angle Distances
+            ax4 = fig.add_subplot(gs[1, 1])
+            self._plot_euler_distances(ax4)
+
+            # 5. Task Completion Progress
+            ax5 = fig.add_subplot(gs[2, 0])
+            self._plot_completion_progress(ax5)
+
+            # 6. Combined Metrics
+            ax6 = fig.add_subplot(gs[2, 1])
+            self._plot_combined_metrics(ax6)
+
+            plt.tight_layout()
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            plt.savefig(os.path.join(plot_dir, f'distance_metrics_{timestamp}.png'), dpi=300, bbox_inches='tight')
+            plt.close()
+
+        except Exception as e:
+            logging.error(f"Error in plot_distance_metrics: {e}")
+
+    def _plot_position_distance(self, ax):
+        """Plot position distance metrics."""
+        steps = range(len(self.distance_history['position']['euclidean']))
+        
+        # Plot raw distance
+        ax.plot(steps, self.distance_history['position']['euclidean'], 
+                label='Euclidean Distance', color='blue', alpha=0.6)
+        
+        # Add moving average
+        window = min(20, len(steps))
+        if window > 1:
+            moving_avg = np.convolve(self.distance_history['position']['euclidean'], 
+                                np.ones(window)/window, mode='valid')
+            ax.plot(steps[window-1:], moving_avg, 
+                    label=f'Moving Average (n={window})', 
+                    color='red', linewidth=2)
+        
+        ax.set_title('Position Distance Over Time')
+        ax.set_xlabel('Steps')
+        ax.set_ylabel('Distance (m)')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    def _plot_orientation_distance(self, ax):
+        """Plot orientation distance metrics."""
+        steps = range(len(self.distance_history['orientation']['quaternion']))
+        
+        # Plot quaternion distance
+        ax.plot(steps, self.distance_history['orientation']['quaternion'], 
+                label='Quaternion Distance', color='green', alpha=0.6)
+        
+        # Add moving average
+        window = min(20, len(steps))
+        if window > 1:
+            moving_avg = np.convolve(self.distance_history['orientation']['quaternion'], 
+                                np.ones(window)/window, mode='valid')
+            ax.plot(steps[window-1:], moving_avg, 
+                    label=f'Moving Average (n={window})', 
+                    color='red', linewidth=2)
+        
+        ax.set_title('Orientation Distance Over Time')
+        ax.set_xlabel('Steps')
+        ax.set_ylabel('Distance (rad)')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    def _plot_component_distances(self, ax):
+        """Plot component-wise position distances."""
+        steps = range(len(self.distance_history['position']['components']['x']))
+        
+        # Plot each component
+        components = ['x', 'y', 'z']
+        colors = ['red', 'green', 'blue']
+        
+        for component, color in zip(components, colors):
+            ax.plot(steps, self.distance_history['position']['components'][component], 
+                    label=f'{component.upper()} Distance', 
+                    color=color, alpha=0.7)
+        
+        ax.set_title('Component-wise Position Distances')
+        ax.set_xlabel('Steps')
+        ax.set_ylabel('Distance (m)')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    def _plot_euler_distances(self, ax):
+        """Plot Euler angle distances."""
+        steps = range(len(self.distance_history['orientation']['euler']['roll']))
+        
+        # Plot each Euler angle
+        angles = ['roll', 'pitch', 'yaw']
+        colors = ['red', 'green', 'blue']
+        
+        for angle, color in zip(angles, colors):
+            ax.plot(steps, self.distance_history['orientation']['euler'][angle], 
+                    label=f'{angle.capitalize()}', 
+                    color=color, alpha=0.7)
+        
+        ax.set_title('Euler Angle Distances')
+        ax.set_xlabel('Steps')
+        ax.set_ylabel('Distance (rad)')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    def _plot_completion_progress(self, ax):
+        """Plot task completion progress."""
+        steps = range(len(self.completion_history['overall']))
+        
+        metrics = ['overall', 'position', 'orientation']
+        colors = ['purple', 'blue', 'green']
+        
+        for metric, color in zip(metrics, colors):
+            ax.plot(steps, self.completion_history[metric], 
+                    label=f'{metric.capitalize()} Completion', 
+                    color=color, alpha=0.7)
+        
+        ax.set_title('Task Completion Progress')
+        ax.set_xlabel('Steps')
+        ax.set_ylabel('Completion (%)')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        ax.set_ylim([0, 100])
+
+    def _plot_combined_metrics(self, metrics: Dict, show_plots: bool) -> None:
+        """Plot combined performance metrics."""
+        try:
+            episodes = np.arange(1, len(metrics['rewards']['average_per_episode']) + 1)
+            # Normalize the metrics
+            # Example normalization: scale each metric between 0 and 1
+            rewards = metrics['rewards']['average_per_episode']
+            success_rate = metrics['success_rate']['per_episode']
+            joint_error_mean = np.mean(metrics['joint_errors']['mean'], axis=1)
+            
+            # Normalize rewards
+            norm_rewards = (rewards - np.min(rewards)) / (np.max(rewards) - np.min(rewards) + 1e-8)
+            # Normalize success rate (already between 0 and 1)
+            norm_success_rate = success_rate
+            # Normalize joint error mean
+            norm_joint_error = 1.0 - (joint_error_mean - np.min(joint_error_mean)) / (np.max(joint_error_mean) - np.min(joint_error_mean) + 1e-8)
+
+            fig, ax = plt.subplots(figsize=(12, 6))
+            ax.plot(episodes, norm_rewards, label='Normalized Reward', color='blue')
+            ax.plot(episodes, norm_success_rate, label='Success Rate', color='green')
+            ax.plot(episodes, norm_joint_error, label='Normalized Accuracy', color='red')
+            ax.set_xlabel('Episodes')
+            ax.set_ylabel('Normalized Value')
+            ax.set_title('Combined Performance Metrics')
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+
+            self.save_figure(fig, 'combined_metrics')
+            if show_plots:
+                plt.show()
+            plt.close(fig)
+        
+        except Exception as e:
+            self.logger.error(f"Error plotting combined metrics: {str(e)}")
+            raise
