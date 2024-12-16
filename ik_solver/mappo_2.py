@@ -2,18 +2,22 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F  # Import functional module for ELU and other activations
-from torch.distributions import Normal
 import numpy as np
 import logging
 from config import config
 from collections import deque
-import pybullet as p
+from .reward_function import (compute_jacobian_angular, compute_jacobian_linear, compute_position_error, compute_quaternion_distance, compute_reward, compute_overall_distance,assign_joint_weights,compute_weighted_joint_rewards)
 from torch.distributions import Normal
-from .reward_function import (compute_jacobian_angular,compute_overall_distance,
-                            compute_quaternion_distance,compute_reward,
-                            compute_position_error, assign_joint_weights,
-                            compute_weighted_joint_rewards,compute_jacobian_linear)
-
+import pybullet as p
+import os
+import traceback
+from .models import JointActor, CentralizedCritic
+from .exploration import ExplorationModule
+from .replay_buffer import PrioritizedReplayBuffer
+from .curriculum import CurriculumManager
+from .PD_controller import PDController
+from .lr_scheduler import LRSchedulerManager
+from .HindsightReplayBuffer import HindsightReplayBuffer, ValidationManager
 # Initialize device based on CUDA availability
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -25,186 +29,11 @@ else:
 # Assuming compute_combined_reward and TrainingMetrics are defined elsewhere
 from .training_metrics import TrainingMetrics
 
-# Multi-Head Attention Class
-class MultiHeadAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout=0.1):
-        super(MultiHeadAttention, self).__init__()
-        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
-
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-
-        # Layers for query, key, and value projections
-        self.query_layer = nn.Linear(embed_dim, embed_dim)
-        self.key_layer = nn.Linear(embed_dim, embed_dim)
-        self.value_layer = nn.Linear(embed_dim, embed_dim)
-        
-        # Output projection layer
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
-
-        # Additional layers for stability and flexibility
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(embed_dim)
-
-        # Scaling factor for dot-product attention
-        self.scale = self.head_dim ** 0.5
-
-    def forward(self, query, key, value, mask=None, causal_mask=False):
-        batch_size = query.size(0)
-
-        # Project inputs to queries, keys, and values
-        Q = self.query_layer(query).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)  # [B, num_heads, seq_len, head_dim]
-        K = self.key_layer(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        V = self.value_layer(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # Calculate attention scores
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # [B, num_heads, seq_len, seq_len]
-        
-        # Apply masks if provided
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
-        
-        # Causal mask to prevent attending to future positions
-        if causal_mask:
-            seq_len = scores.size(-1)
-            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=scores.device)).unsqueeze(0).unsqueeze(0)
-            scores = scores.masked_fill(causal_mask == 0, float('-inf'))
-        
-        # Softmax to get attention probabilities, then apply dropout
-        attn_weights = self.dropout(F.softmax(scores, dim=-1))
-
-        # Calculate attention output
-        attn_output = torch.matmul(attn_weights, V)  # [B, num_heads, seq_len, head_dim]
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, -1, self.embed_dim)  # [B, seq_len, embed_dim]
-        
-        # Project output and apply residual connection and layer norm
-        attn_output = self.out_proj(attn_output)
-        attn_output = self.layer_norm(query + attn_output)  # Residual connection
-
-        return attn_output
-
-# Joint Actor with optional Attention
-class JointActor(nn.Module):
-    def __init__(self, input_dim, hidden_dim, action_dim, use_attention=False, num_heads=4):
-        super(JointActor, self).__init__()
-        self.use_attention = use_attention
-        self.hidden_dim = hidden_dim
-        
-        # Optional feature extractor layer before attention
-        self.feature_extractor = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.LayerNorm(hidden_dim)
-        )
-        
-        # Multi-head attention layer if enabled
-        if use_attention:
-            self.attention = MultiHeadAttention(embed_dim=hidden_dim, num_heads=num_heads)
-
-        # Actor network for action generation
-        self.actor = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim),
-            nn.Tanh()  # Tanh bounds actions between -1 and 1
-        )
-        
-        # Log standard deviation for action exploration
-        self.log_std = nn.Parameter(torch.zeros(action_dim))  # Adjusted to be a vector per action dimension
-
-        # Weight initialization
-        self.apply(self.init_weights)
-
-    def init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight)
-            nn.init.zeros_(m.bias)
-
-    def forward(self, state):
-        # Apply feature extraction
-        x = self.feature_extractor(state)
-        
-        # Apply attention if enabled
-        if self.use_attention:
-            x = self.attention(x, x, x) + x  # Residual connection with attention
-
-        # Pass through the actor network
-        action_mean = self.actor(x)
-        
-        # Ensure std is not too small for numerical stability
-        action_std = torch.clamp(self.log_std.exp().expand_as(action_mean), min=1e-3)
-        
-        return action_mean, action_std
-
-
-# Centralized Critic Class
-class CentralizedCritic(nn.Module):
-    def __init__(self, state_dim, hidden_dim, num_agents, use_attention=False, num_heads=4, dropout=0.1):
-        super(CentralizedCritic, self).__init__()
-        
-        self.use_attention = use_attention
-        self.hidden_dim = hidden_dim
-        self.num_agents = num_agents  # Number of agents
-
-        # Feature extraction with layer normalization
-        self.feature_extractor = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.LayerNorm(hidden_dim)
-        )
-        
-        # Optional multi-head attention layer
-        if use_attention:
-            self.attention = MultiHeadAttention(embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout)
-            self.attention_norm = nn.LayerNorm(hidden_dim)
-
-        # Core critic network with residual connections and dropout
-        self.critic_layers = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout)
-            ),
-            nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout)
-            )
-        ])
-        
-        # Final output layer to estimate state value for each agent
-        self.output_layer = nn.Linear(hidden_dim, num_agents)
-
-        # Weight initialization
-        self.apply(self.init_weights)
-
-    def init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight)
-            nn.init.zeros_(m.bias)
-
-    def forward(self, states):
-        # Feature extraction and normalization
-        x = self.feature_extractor(states)
-        
-        # Apply attention with residual connection if enabled
-        if self.use_attention:
-            attn_out = self.attention(x, x, x)
-            x = x + self.attention_norm(attn_out)
-        
-        # Pass through critic layers with residual connections
-        for layer in self.critic_layers:
-            x = x + layer(x)
-        
-        # Final output layer for state value estimation per agent
-        return self.output_layer(x)  # Shape: (batch_size, num_agents)
 
 
 class MAPPOAgent:
-    def __init__(self, env, config):
+
+    def __init__(self, env, config, training=True):
         logging.info("Starting MAPPOAgent initialization")
 
         # Environment and device setup
@@ -212,95 +41,195 @@ class MAPPOAgent:
         self.num_joints = env.num_joints
         self.num_agents = env.num_joints
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+
         # Hyperparameters and exploration strategy
-        self.hidden_dim = config.get('hidden_dim', 128)
-        self.epsilon = config.get('initial_epsilon', 1.0)
+        self.hidden_dim = config.get('hidden_dim', 256)  # Set default hidden dimension
+        self.epsilon = config.get('initial_epsilon', 0.20)
         self.epsilon_decay = config.get('epsilon_decay', 0.995)
         self.min_epsilon = config.get('min_epsilon', 0.01)
 
         # Learning rate and clip parameters for agents
-        self.global_lr = config.get('lr', 1e-4)
-        self.global_clip_param = config.get('clip_param', 0.1)
-        self.agent_lrs = [config.get(f'lr_joint_{i}', self.global_lr) for i in range(self.num_joints)]
-        self.agent_clip_params = [config.get(f'clip_joint_{i}', self.global_clip_param) for i in range(self.num_joints)]
+        self.global_lr = config.get('lr', 1e-4)  # Set default learning rate
+        self.global_clip_param = config.get('clip_param', 0.1)  # Clip parameter for PPO
+        self.agent_lrs = [
+            config.get(f'lr_joint_{i}', self.global_lr) for i in range(self.num_joints)
+        ]
+        self.agent_clip_params = [
+            config.get(f'clip_joint_{i}', self.global_clip_param) for i in range(self.num_joints)
+        ]
 
         # Learning parameters
         self.gamma = config.get('gamma', 0.99)
         self.tau = config.get('tau', 0.95)
-        self.clip_param = config.get('clip_param', 0.1)
-        
-        # Adaptive learning rate scheduling setup
+        self.clip_param = config.get('clip_param', 0.2)
+
+        # Adaptive learning rate scheduler setup
         self.scheduler_enabled = config.get('use_scheduler', True)
         self.scheduler_patience = config.get('scheduler_patience', 10)
         self.scheduler_decay_factor = config.get('scheduler_decay_factor', 0.5)
-        
-        # Initialize agents (actors) and optimizers
+
+        # Training parameters
+        self.num_episodes = config.get('num_episodes', 1000)
+        self.max_steps_per_episode = config.get('max_steps_per_episode', 5000)
+        self.current_episode = 0
+        self.ppo_epochs = config.get('ppo_epochs', 15)
+        self.batch_size = config.get('batch_size', 64)
+
+        # Entropy coefficient for exploration
+        self.initial_entropy_coef = config.get('initial_entropy_coef', 0.01)
+        self.final_entropy_coef = config.get('final_entropy_coef', 0.001)
+        self.std_min = 1e-4
+        self.std_max = 1.0
+        self.entropy_min = -200.0
+        self.entropy_max = 200.0
+        #self.initial_entropy_coef = 0.1
+        #self.final_entropy_coef = 0.05
+        # Observation space dimensions
+        try:
+            self.obs_dims = [
+                sum(np.prod(space.shape) for space in obs_space.spaces.values())
+                for obs_space in env.observation_space
+            ]
+        except AttributeError as e:
+            logging.error("Error accessing env.observation_space: Check structure and ensure compatibility.")
+            raise e
+
+        # Initialize agents and optimizers
         self.agents = []
         self.optimizers = []
-        self.obs_dims = [sum(np.prod(space.shape) for space in obs_space.spaces.values()) for obs_space in env.observation_space]
-        
         for agent_idx, obs_dim in enumerate(self.obs_dims):
-            actor = JointActor(obs_dim, self.hidden_dim, action_dim=1).to(self.device)
-            optimizer = optim.Adam(actor.parameters(), lr=self.agent_lrs[agent_idx])
+            actor = JointActor(obs_dim, self.hidden_dim,use_attention=True, action_dim=1).to(self.device)
+            optimizer = optim.Adam(actor.parameters(), lr=self.agent_lrs[agent_idx], weight_decay=1e-5)
             self.agents.append(actor)
             self.optimizers.append(optimizer)
 
-        # Centralized critic setup with learning rate scheduler
+        # Centralized critic setup
         self.critic = CentralizedCritic(
             state_dim=sum(self.obs_dims),
             hidden_dim=self.hidden_dim,
-            num_agents=self.num_agents  # Add this argument
+            num_agents=self.num_agents,
+            use_attention=True,
         ).to(self.device)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.global_lr)
-        
-        if self.scheduler_enabled:
-            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                self.critic_optimizer, mode='min', factor=self.scheduler_decay_factor, patience=self.scheduler_patience
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.global_lr, weight_decay=1e-5)
+
+        # Initialize learning rate scheduler manager
+        all_optimizers = self.optimizers + [self.critic_optimizer]  # Combine actor and critic optimizers
+        self.lr_manager = LRSchedulerManager(
+            optimizers=all_optimizers,
+            initial_lr=self.global_lr,
+            warmup_steps=10,  # Set warmup steps as needed
+            min_lr=1e-5
+        )
+        # Initialize early stopping
+        self.init_early_stopping(
+            patience=config.get("early_stop_patience", 50),
+            min_delta=config.get("early_stop_min_delta", 1e-4),
+            min_episodes=config.get("early_stop_min_episodes", 100),
+        )
+
+
+        # Process a sample state to determine state_dim
+        sample_state = self.env.reset()
+        processed_state_list = self._process_state(sample_state)
+        global_state = torch.cat(processed_state_list).unsqueeze(0).to(self.device)
+        state_dim = global_state.shape[1]
+        # Add PD controller initialization
+        self.pd_controllers = []
+        self.pd_weight = config.get('pd_weight', 0.3)
+    
+        # Initialize PD controllers for each joint
+        for _ in range(self.num_agents):
+            self.pd_controllers.append(PDController(
+                kp=config.get('pd_kp', 1.0),
+                kd=config.get('pd_kd', 0.2),
+                dt=config.get('pd_dt', 0.01)
+            ))
+        # Determine action_dim
+        action_dim = self.num_agents  # Assuming one action per agent
+
+        # Initialize exploration module for intrinsic rewards
+        self.exploration_module = ExplorationModule(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            device=self.device
+        )
+
+        # Optional prioritized experience replay
+        self.use_prioritized_replay = config.get('use_prioritized_replay', True)
+        if self.use_prioritized_replay:
+            self.replay_buffer = PrioritizedReplayBuffer(
+                capacity=10000,
+                alpha=0.6,
+                beta_start=0.4,
+                beta_frames=100000
             )
+                # Add these new parameters
+        self.value_loss_scale = config.get('value_loss_scale', 0.5)  # Critic loss scaling
+        self.entropy_scale = config.get('entropy_scale', 0.01)    # Entropy scaling
+        self.max_grad_norm = config.get('max_grad_norm', 0.5)    # Gradient clipping norm
+        self.ratio_clip = config.get('ratio_clip', 10.0)         # Policy ratio clipping
+        self.advantage_clip = config.get('advantage_clip', 4.0)   # Advantage clipping
+                
+        # Initialize the AdaptiveRewardScaler
+        self.reward_scaler = AdaptiveRewardScaler(window_size=100, initial_scale=1.0)
 
-        # Training parameters
-        self.ppo_epochs = config.get('ppo_epochs', 15)
-        self.batch_size = config.get('batch_size', 64)
-        self.training_metrics = TrainingMetrics()
-
-        # Convergence tracking with sliding window
+        # Initialize training metrics
+        self.training_metrics = TrainingMetrics(num_joints=self.num_joints)
+        self.base_path=self.training_metrics.base_path
+        # Sliding window for tracking convergence
         self.convergence_window_size = config.get('convergence_window_size', 100)
         self.rewards_window = deque(maxlen=self.convergence_window_size)
         self.success_window = deque(maxlen=self.convergence_window_size)
         self.error_window = deque(maxlen=self.convergence_window_size)
 
-        # Optional prioritized experience replay
-        self.use_prioritized_replay = config.get('use_prioritized_replay', False)
-        if self.use_prioritized_replay:
-            self.replay_buffer = PrioritizedReplayBuffer(capacity=config.get('replay_buffer_size', 10000))
-
         # Logging setup
         self.logger = logging.getLogger(__name__)
-        self.logger.setLevel(logging.INFO)
-        handler = logging.FileHandler('training.log')
-        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        self.logger.addHandler(handler)
+        if training:
+            self.logger.setLevel(logging.INFO)
+            handler = logging.FileHandler('training.log')
+            handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            self.logger.addHandler(handler)
+        else:
+            self.logger.setLevel(logging.WARNING)
 
         # Best agent tracking
         self.best_agents_state_dict = [None] * self.num_agents
         self.best_joint_errors = [float('inf')] * self.num_agents
+        # Initialize HER buffer with hindsight replay
+        #Initialize the HindsightReplayBuffer with capacity, alpha, beta, and k_future
+        self.her_buffer = HindsightReplayBuffer(
+            capacity=config.get('buffer_size', 100000),
+            alpha=config.get('alpha', 0.6),
+            beta_start=config.get('beta_start', 0.4),
+            k_future=config.get('k_future', 4)
+        )
+        self.reward_stabilizer = RewardStabilizer(
+            window_size=100,
+            scale_min=0.1,
+            scale_max=2.0,
+            ewma_alpha=0.95,
+            clip_range=(-10.0, 10.0),
+            adaptive_clip_percentile=95
+        )
+
+        # Initialize the ValidationManager
+        self.validation_manager = ValidationManager(
+            validation_frequency=config.get('validation_frequency', 10),
+            validation_episodes=config.get('validation_episodes', 10)
+        )
+        logging.info("MAPPOAgent initialization complete.")
 
     def update_policy(self, trajectories):
-        # Unpack and preprocess trajectories (existing code remains the same)
+        """Policy update with balanced losses, HER integration, and entropy control."""
 
-# Ensure trajectories contain the required data for each agent
-        assert all('states' in t and 'actions' in t and 'log_probs' in t and 'rewards' in t and 'dones' in t for t in trajectories), \
-            "Each trajectory must contain 'states', 'actions', 'log_probs', 'rewards', and 'dones' keys."
+        # Extract trajectory components
+        states = [torch.stack(t['states']).to(torch.float32) for t in trajectories]
+        actions = [torch.stack(t['actions']).to(torch.float32) for t in trajectories]
+        log_probs_old = [torch.stack(t['log_probs']).to(torch.float32) for t in trajectories]
+        rewards = [torch.stack(t['rewards']).to(torch.float32) for t in trajectories]
+        dones = torch.tensor(trajectories[0]['dones'], dtype=torch.float32, device=self.device)
 
-        # Unpack and process trajectories
-        states = [torch.stack(t['states']) for t in trajectories]
-        actions = [torch.stack(t['actions']) for t in trajectories]
-        log_probs_old = [torch.stack(t['log_probs']) for t in trajectories]
-        rewards = [torch.stack(t['rewards']) for t in trajectories]
-        dones = torch.tensor(trajectories[0]['dones'], dtype=torch.float32).to(self.device)
-
-        # Ensure all tensors are the same length
+        # Truncate to minimum trajectory length
         min_length = min(s.size(0) for s in states)
         states = [s[:min_length] for s in states]
         actions = [a[:min_length] for a in actions]
@@ -308,92 +237,172 @@ class MAPPOAgent:
         rewards = [r[:min_length] for r in rewards]
         dones = dones[:min_length]
 
-        # Concatenate states for critic input
+        # Concatenate states and stack tensors
         states_cat = torch.cat(states, dim=1)
         actions_cat = torch.stack(actions, dim=1)
         log_probs_old_cat = torch.stack(log_probs_old, dim=1)
 
-        # Compute values
+        # Compute value estimates from critic
         with torch.no_grad():
-            values = self.critic(states_cat).squeeze().view(min_length, self.num_agents)
+            values = self.critic(states_cat).to(torch.float32)
 
-        # Stack rewards and compute mean rewards
-        rewards_tensor = torch.stack(rewards, dim=1)
-        mean_rewards = rewards_tensor.mean(dim=1, keepdim=True).expand(min_length, self.num_agents)
+        # Stabilize rewards before normalization
+        stabilized_rewards = []
+        for agent_idx in range(self.num_agents):
+            raw_rewards = rewards[agent_idx].tolist()  # Convert tensor to list for stabilization
+            stabilized_agent_rewards = [
+                self.reward_stabilizer.stabilize_reward(r, self.current_episode / self.num_episodes) for r in raw_rewards
+            ]
+            stabilized_rewards.append(torch.tensor(stabilized_agent_rewards, dtype=torch.float32).to(self.device))
 
-        # Compute advantages and returns
-        advantages, returns = self.compute_individual_gae(mean_rewards[:min_length], dones, values[:min_length])
+        
+    
+        # Normalize rewards
+        rewards_tensor = torch.stack(rewards, dim=1).to(torch.float32)
+        # Clamp rewards before normalization
+        rewards_clamped = torch.clamp(rewards_tensor, min=-10.0, max=10.0)
 
-        # Transpose advantages and returns for consistent dimensions
-        advantages = advantages.transpose(0, 1)
-        returns = returns.transpose(0, 1)
+        # Check for very small standard deviation to avoid division by zero
+        if rewards_clamped.std() < 1e-6:
+            rewards_normalized = rewards_clamped - rewards_clamped.mean()
+        else:
+            rewards_normalized = (rewards_clamped - rewards_clamped.mean()) / (rewards_clamped.std() + 1e-8)
 
-        # The remaining code stays the same
+        mean_rewards = rewards_normalized.mean(dim=1, keepdim=True).expand(min_length, self.num_agents)
 
-        # **Print Shapes for Debugging**
-        # print(f"States_cat shape: {states_cat.shape}")
-        # print(f"Actions_cat shape: {actions_cat.shape}")
-        # print(f"Log_probs_old_cat shape: {log_probs_old_cat.shape}")
-        # print(f"Advantages shape: {advantages.shape}")
-        # print(f"Returns shape: {returns.shape}")
+        # Compute GAE and returns
+        advantages, returns = self.compute_individual_gae(mean_rewards, dones, values)
+        advantages = advantages.transpose(0, 1).to(torch.float32)
+        returns = returns.transpose(0, 1).to(torch.float32)
 
-        # Prepare data for training
+        # Apply importance sampling weights if available
+        if 'weights' in trajectories[0]:
+            weights = trajectories[0]['weights'].unsqueeze(1).to(self.device, dtype=torch.float32)
+            advantages *= weights
+
+        # Normalize advantages per agent
+        advantages = torch.clamp(advantages, -self.advantage_clip, self.advantage_clip)
+        for agent_idx in range(self.num_agents):
+            agent_advantages = advantages[:, agent_idx]
+            mean = agent_advantages.mean()
+            std = agent_advantages.std(unbiased=False)
+            std = std if std > 1e-6 else 1e-6  # Prevent division by zero
+            advantages[:, agent_idx] = (agent_advantages - mean) / std
+
+        # Create dataset and loader
         dataset = torch.utils.data.TensorDataset(states_cat, actions_cat, log_probs_old_cat, advantages, returns)
         loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
-        # Continue with the training loop...
+        # Initialize tracking variables
+        total_critic_loss, total_actor_loss, total_entropy = 0, 0, 0
+        policy_losses_per_agent = [[] for _ in range(self.num_agents)]
 
-
-        cumulative_policy_loss = 0.0
+        # Calculate adaptive entropy coefficient
+        progress = min(self.current_episode / self.num_episodes, 1.0)
+        current_entropy_coef = self.initial_entropy_coef * (1 - progress) + self.final_entropy_coef * progress
 
         # Training loop
-        for _ in range(self.ppo_epochs):
-            for batch in loader:
+        for epoch in range(self.ppo_epochs):
+            for batch_idx, batch in enumerate(loader):
                 batch_states, batch_actions, batch_log_probs_old, batch_advantages, batch_returns = batch
 
-                # Critic update
-                values = self.critic(batch_states).squeeze().view(batch_returns.shape)
-                critic_loss = nn.MSELoss()(values, batch_returns)
+                # Update critic
+                values_pred = self.critic(batch_states).to(torch.float32)
+                values_normalized = (values_pred - values_pred.mean()) / (values_pred.std() + 1e-8)
+                returns_normalized = (batch_returns - batch_returns.mean()) / (batch_returns.std() + 1e-8)
+                critic_loss = self.value_loss_scale * F.mse_loss(values_normalized, returns_normalized)
+            
+                # Add L2 regularization for critic
+                critic_l2_loss = sum(0.001 * torch.norm(param) for param in self.critic.parameters())
+                critic_loss += critic_l2_loss
+
                 self.critic_optimizer.zero_grad()
                 critic_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=0.5)
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 self.critic_optimizer.step()
+                total_critic_loss += critic_loss.item()
 
-                # Actor update
+                # Update actors
+                epoch_actor_loss, epoch_entropy = 0, 0
                 for agent_idx, agent in enumerate(self.agents):
                     optimizer = self.optimizers[agent_idx]
                     start_idx = sum(self.obs_dims[:agent_idx])
                     end_idx = sum(self.obs_dims[:agent_idx + 1])
+
                     agent_state = batch_states[:, start_idx:end_idx]
                     agent_action = batch_actions[:, agent_idx].unsqueeze(1)
                     agent_log_prob_old = batch_log_probs_old[:, agent_idx]
-
-                    # Reshape batch_advantages to match dimensions of ratio
                     agent_advantages = batch_advantages[:, agent_idx].unsqueeze(1)
 
+                    # Actor forward pass
                     mean, std = agent(agent_state)
-                    dist = Normal(mean, std)
-                    agent_log_prob = dist.log_prob(agent_action).sum(dim=-1, keepdim=True)  # Shape: [batch_size, 1]
-                    entropy = dist.entropy().sum(dim=-1, keepdim=True)
 
-                    # Calculate the PPO surrogate losses
-                    ratio = (agent_log_prob - agent_log_prob_old.unsqueeze(1)).exp()  # Shape: [batch_size, 1]
-                    surr1 = ratio * agent_advantages  # Matched dimensions
+                    # Scale `mean` to fit Beta's (0, 1) range
+                    mean = torch.sigmoid(mean)
+
+                    # Ensure `std` is strictly positive
+                    std = torch.clamp(std * self.epsilon, min=1e-6, max=1.0)
+
+                    # Clamp actions to Beta's valid range [0, 1]
+                    agent_action = torch.sigmoid(agent_action)  # Apply sigmoid to ensure range
+                    std= abs(std)
+                    mean= abs(mean)
+                    try:
+                        dist = Normal(mean, std)
+                        agent_log_prob = dist.log_prob(agent_action).sum(dim=-1, keepdim=True)
+                        entropy =- dist.entropy().sum(dim=-1, keepdim=True)
+                    except ValueError as e:
+                        print(f"Invalid action values: {agent_action}")
+                        raise
+
+
+
+                    # Compute surrogate losses
+                    ratio = torch.exp(agent_log_prob - agent_log_prob_old.unsqueeze(1))
+                    ratio = torch.clamp(ratio, 1.0 / self.ratio_clip, self.ratio_clip)
+                    surr1 = ratio * agent_advantages
                     surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * agent_advantages
-                    actor_loss = -torch.min(surr1, surr2).mean() - 0.01 * entropy.mean()
 
+                    # Compute actor loss
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    entropy_loss = -current_entropy_coef * entropy.mean()
+                    actor_l2_loss = sum(0.001 * torch.norm(param) for param in agent.parameters())
+                    actor_loss = policy_loss + entropy_loss + actor_l2_loss
+
+                    # Update actor
                     optimizer.zero_grad()
                     actor_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=0.5)
+                    torch.nn.utils.clip_grad_norm_(agent.parameters(), self.max_grad_norm)
                     optimizer.step()
 
-                    policy_loss = -torch.mean(agent_log_prob)
-                    cumulative_policy_loss += policy_loss.item()
+                    # Track losses
+                    policy_losses_per_agent[agent_idx].append(policy_loss.item())
+                    epoch_actor_loss += actor_loss.item()
+                    epoch_entropy += entropy.mean().item()
 
-        avg_policy_loss = cumulative_policy_loss / (self.ppo_epochs * len(loader))
+                total_actor_loss += epoch_actor_loss / self.num_agents
+                total_entropy += epoch_entropy / self.num_agents
 
-        return actor_loss.item(), critic_loss.item(), entropy.mean().item(), avg_policy_loss
+        # Compute averages
+        avg_critic_loss = total_critic_loss / (self.ppo_epochs * len(loader))
+        avg_actor_loss = total_actor_loss / (self.ppo_epochs * len(loader))
+        avg_entropy = total_entropy / (self.ppo_epochs * len(loader))
+        avg_policy_loss_per_agent = [np.mean(losses) for losses in policy_losses_per_agent]
 
+        # Log metrics
+        self.logger.info(f"Actor/Critic Loss Ratio: {avg_actor_loss / (avg_critic_loss + 1e-8):.4f}")
+        self.logger.info(f"Current Entropy Coefficient: {current_entropy_coef:.6f}")
+        self.logger.info(f"Average Entropy: {avg_entropy:.6f}")
+
+        return (
+            float(avg_actor_loss),
+            float(avg_critic_loss),
+            float(avg_entropy),
+            [float(loss) for loss in avg_policy_loss_per_agent],
+            values_pred,
+            returns,
+            advantages
+        )
 
 
     def compute_individual_gae(self, rewards, dones, values):
@@ -406,28 +415,40 @@ class MAPPOAgent:
             values (tensor): [batch_size, num_agents] value predictions from critic.
         """
         advantages, returns = [], []
+        rewards = (rewards - rewards.mean(dim=0, keepdim=True)) / (rewards.std(dim=0, keepdim=True) + 1e-8)  # Normalize rewards
+        
         for agent_idx in range(self.num_agents):
-            agent_rewards = rewards[:, agent_idx]  # Select rewards per agent
-            agent_values = values[:, agent_idx]  # Select values per agent
-
+            agent_rewards = rewards[:, agent_idx]
+            agent_values = values[:, agent_idx]
+            agent_values = torch.tensor(
+                np.convolve(agent_values.cpu().numpy(), np.ones(3)/3, mode='same'), device=self.device
+            )  # Smooth critic values
+            
             gae = 0
             agent_advantages, agent_returns = [], []
             next_value = 0
 
-            # Compute GAE per agent
             for step in reversed(range(len(agent_rewards))):
                 mask = 1 - dones[step].item()
-                delta = agent_rewards[step] + self.gamma * next_value * mask - agent_values[step]
+                delta = (
+                    agent_rewards[step]
+                    + self.gamma * next_value * mask
+                    - agent_values[step]
+                )
                 gae = delta + self.gamma * self.tau * mask * gae
                 agent_advantages.insert(0, gae)
                 agent_returns.insert(0, gae + agent_values[step])
-
                 next_value = agent_values[step]
 
-            advantages.append(torch.tensor(agent_advantages, device=self.device))
+            agent_advantages = torch.tensor(agent_advantages, device=self.device)
+            advantages.append(agent_advantages)
             returns.append(torch.tensor(agent_returns, device=self.device))
 
-        return torch.stack(advantages), torch.stack(returns)
+        # Stack advantages and normalize
+        advantages = torch.stack(advantages)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # Normalize advantages
+
+        return advantages, torch.stack(returns)
 
 
     def _compute_gae_for_agent(self, rewards, dones, values):
@@ -467,250 +488,469 @@ class MAPPOAgent:
         agent_returns = torch.stack(agent_returns)
         
         return agent_advantages, agent_returns
-    def save_best_model(self, agent_idx, actor, episode, avg_error):
+    
+    def save_best_model(self, agent_idx, actor, episode, avg_error, criterion='mean_error'):
         """
-        Save the best model for the specified agent based on the average joint error.
-
+        Save the best model for the specified agent based on the average joint error or other criteria.
+        
         Args:
             agent_idx (int): The index of the agent (joint).
             actor (nn.Module): The actor network for the agent.
             episode (int): The episode number during which the best model was found.
             avg_error (float): The average joint error for the agent.
+            criterion (str): The criterion for saving ('mean_error' or 'reward').
         """
-        model_path = f"best_agent_joint_{agent_idx}_episode_{episode}.pth"
+        model_path =os.path.join(self.base_path,f"best_agent_joint_{agent_idx}")
         torch.save(actor.state_dict(), model_path)
-        logging.info(f"Saved new best model for agent {agent_idx} at episode {episode} with Avg Error: {avg_error:.6f}")
+        logging.info(f"Saved new best model for agent {agent_idx} at episode {episode} with Avg {criterion}: {avg_error:.6f}")
 
-    def _process_state(self, state):
-        processed_states = []
-        for joint_state in state:  # Assuming state is a list of joint states
-            obs = np.concatenate([
-                joint_state['joint_angle'].flatten(),
-                joint_state['position_error'].flatten(),
-                joint_state['orientation_error'].flatten()
-            ])
-            # Normalize observations
-            obs = (obs - np.mean(obs)) / (np.std(obs) + 1e-8)
-            processed_states.append(torch.tensor(obs, dtype=torch.float32).to(self.device))
-        return processed_states
 
-    def get_actions(self, state):
+    def get_actions(self, state, eval_mode=False):
         processed_states = self._process_state(state)
         actions = []
         log_probs = []
+        
         for agent_idx, agent in enumerate(self.agents):
             state_tensor = processed_states[agent_idx].unsqueeze(0)
+            
+            # Get RL policy action
             with torch.no_grad():
                 mean, std = agent(state_tensor)
-            std = std * self.epsilon  # Scale exploration noise by epsilon
+            std = torch.clamp(std * self.epsilon, min=1e-4)
             dist = Normal(mean, std)
-            action = dist.sample()
-            action = action.clamp(-1, 1)  # Ensure action bounds
-            log_prob = dist.log_prob(action).sum(dim=-1)
-            actions.append(action.squeeze().cpu().numpy().item())
+            rl_action = dist.sample()
+            rl_action = rl_action.clamp(-1, 1)
+            log_prob = dist.log_prob(rl_action).sum(dim=-1)
+            
+            # Extract scalar action value
+            rl_action_value = float(rl_action.squeeze().cpu().item())
+            
+            if eval_mode:
+                # Calculate PD correction
+                current_angle = state[agent_idx]['joint_angle'].flatten()[0]
+                target_angle = self.env.target_joint_angles[agent_idx] if hasattr(self.env, 'target_joint_angles') else 0.0
+                error = target_angle - current_angle
+                
+                pd_correction = self.pd_controllers[agent_idx].compute(error)
+                pd_correction = np.clip(pd_correction, -1, 1)
+                
+                # Ensure PD correction is in the same range as RL action
+                pd_correction = np.clip(pd_correction, -1, 1)
+
+                # Combine RL and PD actions
+                combined_action = (1 - self.pd_weight) * rl_action_value + self.pd_weight * pd_correction
+                combined_action = np.clip(combined_action, -1, 1)
+                actions.append(combined_action)
+
+            else:
+                # During training, use RL action directly
+                action = rl_action_value
+                actions.append(action)
+            
+            # Ensure log_prob is a single scalar
             log_probs.append(log_prob.item())
+
         return actions, log_probs
 
 
-    def compute_gae(self, rewards, dones, values):
-        advantages = []
-        returns = []
-        gae = 0
-        next_value = 0  # Initialize next_value to 0
 
-        # Convert inputs to tensors if they're not already
-        rewards = torch.as_tensor(rewards, dtype=torch.float32, device=self.device).requires_grad_(True)
-        dones = torch.as_tensor(dones, dtype=torch.float32, device=self.device).requires_grad_(True)
-        values = torch.as_tensor(values, dtype=torch.float32, device=self.device).requires_grad_(True)
-
-        # Check if values is a scalar tensor or a single value and convert accordingly
-        if isinstance(values, (int, float)) or (isinstance(values, torch.Tensor) and values.dim() == 0):
-            # Use the scalar value to create a tensor with the same shape as `rewards`
-            values = torch.full((len(rewards),), values.item() if isinstance(values, torch.Tensor) else values, dtype=torch.float32, device=self.device).requires_grad_(True)
+    def track_pd_metrics(self, pd_corrections, joint_errors):
+        """Track PD controller performance metrics."""
+        pd_metrics = {
+            'mean_correction': np.nanmean(np.abs(pd_corrections)),
+            'max_correction': np.max(np.abs(pd_corrections)),
+            'correction_std': np.std(pd_corrections),
+            'error_correlation': np.corrcoef(pd_corrections, joint_errors)[0, 1]
+        }
+        return pd_metrics
+        # 4. Add method to update PD parameters dynamically
+    def update_pd_parameters(self, agent_idx=None, kp=None, kd=None, weight=None):
+        """Update PD controller parameters during training."""
+        if agent_idx is not None:
+            if kp is not None:
+                self.pd_controllers[agent_idx].kp = kp
+            if kd is not None:
+                self.pd_controllers[agent_idx].kd = kd
         else:
-            values = torch.as_tensor(values, dtype=torch.float32, device=self.device).requires_grad_(True)
-
-        for step in reversed(range(len(rewards))):
-            current_value = values[step].item()
-            
-            mask = 1.0 - dones[step].item()
-            delta = rewards[step].item() + self.gamma * next_value * mask - current_value
-            gae = delta + self.gamma * self.tau * mask * gae
-            advantages.insert(0, gae)
-            returns.insert(0, gae + current_value)
-            
-            # Update next_value for the next iteration
-            next_value = current_value
-
-        advantages = torch.tensor(advantages, dtype=torch.float32).to(self.device)
-        returns = torch.tensor(returns, dtype=torch.float32).to(self.device)
+            # Update all controllers
+            for controller in self.pd_controllers:
+                if kp is not None:
+                    controller.kp = kp
+                if kd is not None:
+                    controller.kd = kd
         
-        return advantages.detach(), returns.detach()
+        if weight is not None:
+            self.pd_weight = weight
 
-    def train(self, num_episodes, max_steps_per_episode=100):
-        logging.info(f"Starting training for {num_episodes} episodes")
+    # 5. Add method to compute stability metrics
+    def compute_stability_metrics(self, joint_errors, pd_corrections):
+        """Compute stability metrics for the combined controller."""
+        stability_metrics = {
+            'error_smoothness': np.nanmean(np.abs(np.diff(joint_errors))),
+            'control_smoothness': np.nanmean(np.abs(np.diff(pd_corrections))),
+            'overall_stability': np.exp(-np.nanmean(np.abs(joint_errors)))
+        }
+        return stability_metrics
 
-        # Define a target position and orientation at the start of training
-        target_position = np.random.uniform([0.1, -0.5, 0.1], [0.5, 0.5, 0.5])
-        target_orientation = p.getQuaternionFromEuler(np.random.uniform(-np.pi, np.pi, 3))
-        target_id = p.loadURDF("sphere_small.urdf", target_position, globalScaling=0.05, useFixedBase=True)
+    # 6. Add adaptive PD weight adjustment
+    def adapt_pd_weight(self, performance_metrics):
+        """Adjust PD contribution weight based on performance."""
+        if performance_metrics['error_smoothness'] > self.stability_threshold:
+            self.pd_weight = min(self.pd_weight * 1.1, 0.8)  # Increase PD influence
+        else:
+            self.pd_weight = max(self.pd_weight * 0.9, 0.1)  # Decrease
 
-        try:
-            for episode in range(num_episodes):
-                state = self.env.reset()
-                done = False
-                step = 0
+    def train(self):
+        self.training_metrics = TrainingMetrics(num_joints=self.num_joints)
+        torch.autograd.set_detect_anomaly(True)
+        
+        # Initialize curriculum manager
+        curriculum_manager = CurriculumManager(
+            initial_difficulty=0.0, 
+            max_difficulty=3.0, 
+            success_threshold=0.8
+        )
 
-                # Get initial end-effector pose using PyBullet directly
-                link_state = p.getLinkState(self.env.robot_id, self.env.num_joints - 1)
-                if link_state is None:
-                    raise RuntimeError("Failed to get link state")
+        for episode in range(self.num_episodes):
+            self.current_episode = episode
+            difficulty = curriculum_manager.get_current_difficulty()
+            state = self.env.reset(difficulty=difficulty)
+            done = False
+            step = 0
+            
+            # Initialize tracking lists
+            total_rewards = [[] for _ in range(self.num_agents)]
+            total_errors = [[] for _ in range(self.num_agents)]
+            total_joint_errors = []
+            
+            # Update learning rate
+            mean_error = np.mean([np.nanmean(errors) for errors in total_errors if errors])
+            self.lr_manager.step(mean_error)
 
-                initial_position = np.array(link_state[4])  # Position [x, y, z]
-                initial_orientation = np.array(link_state[5])  # Orientation [qx, qy, qz, qw]
+            # Episode variables
+            begin_distance = None
+            prev_best = float('inf')
+            cumulative_reward = 0
 
-                # Compute initial distance
-                initial_distance = compute_overall_distance(
-                    initial_position, target_position,
-                    initial_orientation, target_orientation
-                )
-                prev_best_distance = initial_distance
+            # Log initial state
+            initial_joint_angles = [p.getJointState(self.env.robot_id, i)[0] 
+                                    for i in self.env.joint_indices]
+            logging.info(f"Episode {episode} - Initial joint angles: {initial_joint_angles}")
 
-                # Initialize episode tracking
-                total_rewards = [[] for _ in range(self.num_agents)]
-                total_errors = [[] for _ in range(self.num_agents)]
-                total_joint_errors = []
-                trajectories = [{'states': [], 'actions': [], 'log_probs': [], 'rewards': [], 'dones': []} 
-                            for _ in range(self.num_agents)]
+            # Initialize trajectories
+            trajectories = [{
+                'states': [], 
+                'actions': [], 
+                'log_probs': [], 
+                'rewards': [], 
+                'dones': []
+            } for _ in range(self.num_agents)]
 
-                logging.info(f"Episode {episode} - Initializing episode variables")
+            while not done and step < self.max_steps_per_episode:
+                if step % 10 == 0:
+                    logging.debug(f"Step {step}: Executing action")
 
-                while not done and step < max_steps_per_episode:
-                    actions, log_probs = self.get_actions(state)
-                    next_state, rewards, done, info = self.env.step(actions)
+                # Get pre-action state
+                pre_action_angles = [p.getJointState(self.env.robot_id, i)[0] 
+                                for i in self.env.joint_indices]
+                processed_state_list = self._process_state(state)
+                global_state = torch.cat(processed_state_list).unsqueeze(0).to(self.device)
 
-                    # Get current end-effector pose
-                    link_state = p.getLinkState(self.env.robot_id, self.env.num_joints - 1)
-                    current_position = np.array(link_state[4])
-                    current_orientation = np.array(link_state[5])
+                # Get actions and execute
+                actions, log_probs = self.get_actions(state, eval_mode=False)
+                next_state, rewards, done, info = self.env.step(actions)
 
-                    # Calculate errors and distances
-                    position_error = compute_position_error(current_position, target_position)
-                    orientation_error = compute_quaternion_distance(current_orientation, target_orientation)
-                    overall_distance = compute_overall_distance(
-                        current_position, target_position,
-                        current_orientation, target_orientation
-                    )
+                # Directly scale rewards (remove stabilization)
+                scaled_rewards = [self.reward_scaler.update_scale(r) * r for r in rewards]
 
-                    # Compute reward
-                    reward, prev_best_distance, success = compute_reward(
-                        distance=overall_distance,
-                        begin_distance=initial_distance,
-                        prev_best=prev_best_distance
-                    )
-
-                    # Get joint states directly from PyBullet
-                    joint_states = [p.getJointState(self.env.robot_id, i) for i in range(self.env.num_joints)]
-                    joint_angles = np.array([state[0] for state in joint_states])
-                    previous_angles = self.env.previous_joint_angles
-                    joint_errors = np.abs(joint_angles - previous_angles)
-                    total_joint_errors.append(joint_errors)
-
-                    # Calculate Jacobians using custom functions from reward_function script
-                    jacobian_linear = compute_jacobian_linear(self.env.robot_id, joint_angles, current_position)
-                    jacobian_angular = compute_jacobian_angular(self.env.robot_id, joint_angles, current_orientation)
-
-                    # Compute weights and rewards
-                    linear_weights, angular_weights = assign_joint_weights(jacobian_linear, jacobian_angular)
-                    joint_rewards = compute_weighted_joint_rewards(
-                        joint_errors, linear_weights, angular_weights, reward
-                    )
-
-                    # Store experience for each agent
-                    for agent_idx in range(self.num_agents):
-                        total_rewards[agent_idx].append(joint_rewards[agent_idx])
-                        total_errors[agent_idx].append(joint_errors[agent_idx])
-
-                        agent_state = self._process_state(state)[agent_idx]
-                        trajectories[agent_idx]['states'].append(agent_state)
-                        trajectories[agent_idx]['actions'].append(
-                            torch.tensor(actions[agent_idx], dtype=torch.float32).to(self.device))
-                        trajectories[agent_idx]['log_probs'].append(
-                            torch.tensor(log_probs[agent_idx], dtype=torch.float32).to(self.device))
-                        trajectories[agent_idx]['rewards'].append(
-                            torch.tensor(joint_rewards[agent_idx], dtype=torch.float32).to(self.device))
-                        trajectories[agent_idx]['dones'].append(done)
-
-                    state = next_state
-                    step += 1
-
-                # Update policy and log metrics
-                actor_loss, critic_loss, entropy, policy_loss = self.update_policy(trajectories)
-
-                # Log and save the best-performing agents
-                for agent_idx in range(self.num_agents):
-                    mean_joint_error = np.mean(total_errors[agent_idx])
-                    logging.info(f"Episode {episode}, Joint {agent_idx} - Mean Joint Error: {mean_joint_error:.6f}")
-
-                    # Update best agent's model if current mean_joint_error is better
-                    if mean_joint_error < self.best_joint_errors[agent_idx]:
-                        self.best_joint_errors[agent_idx] = mean_joint_error
-                        self.best_agents_state_dict[agent_idx] = self.agents[agent_idx].state_dict()
-                        torch.save(self.best_agents_state_dict[agent_idx], f"best_agent_joint_{agent_idx}.pth")
-                        logging.info(f"New best agent for joint {agent_idx} saved with Mean Joint Error: {mean_joint_error:.6f}")
-
-                # Log training metrics for this episode
-                self.training_metrics.log_episode(
-                    joint_errors=total_joint_errors,
-                    rewards=[sum(reward_list) for reward_list in total_rewards],
-                    success=[success] * self.num_agents,
-                    entropy=entropy,
-                    actor_loss=actor_loss,
-                    critic_loss=critic_loss,
-                    policy_loss=policy_loss,
-                    env=self.env
+                # Store experience in HER buffer
+                self.her_buffer.add_experience_with_info(
+                    state=state,
+                    action=actions,
+                    reward=scaled_rewards,  # Use scaled rewards
+                    next_state=next_state,
+                    done=done,
+                    info=info
                 )
 
-                # Log aggregated metrics per joint
+                # Process next state
+                processed_next_state_list = self._process_state(next_state)
+                global_next_state = torch.cat(processed_next_state_list).unsqueeze(0).to(self.device)
+                actions_tensor = torch.tensor(actions, dtype=torch.float32).unsqueeze(0).to(self.device)
+
+                # Get post-action state
+                post_action_angles = [p.getJointState(self.env.robot_id, i)[0] 
+                                    for i in self.env.joint_indices]
+
+                # Calculate distances and errors
+                current_position, current_orientation = self.get_end_effector_pose()
+                target_position, target_orientation = self.get_target_pose()
+                distance = compute_overall_distance(
+                    current_position, target_position,
+                    current_orientation, target_orientation
+                )
+                
+                if begin_distance is None:
+                    begin_distance = distance
+
+                # Compute Jacobians and weights
+                jacobian_linear = compute_jacobian_linear(
+                    self.env.robot_id, self.env.joint_indices, post_action_angles)
+                jacobian_angular = compute_jacobian_angular(
+                    self.env.robot_id, self.env.joint_indices, post_action_angles)
+                linear_weights, angular_weights = assign_joint_weights(
+                    jacobian_linear, jacobian_angular)
+
+                # Calculate joint errors
+                joint_errors = []
+                for i in range(self.num_agents):
+                    target_joint_angle = initial_joint_angles[i]
+                    error = abs(post_action_angles[i] - target_joint_angle)
+                    joint_errors.append(max(error, 1e-6))
+                total_joint_errors.append(joint_errors)
+
+                # Calculate rewards
+                overall_reward, individual_rewards, prev_best, success = compute_reward(
+                    distance=distance,
+                    begin_distance=begin_distance,
+                    prev_best=prev_best,
+                    current_orientation=current_orientation,
+                    target_orientation=target_orientation,
+                    joint_errors=joint_errors,
+                    linear_weights=linear_weights,
+                    angular_weights=angular_weights,
+                    success_threshold=self.env.success_threshold,
+                    episode_number=episode,
+                    total_episodes=self.num_episodes
+                )
+
+                # Calculate intrinsic reward
+                intrinsic_reward = self.exploration_module.get_combined_intrinsic_reward(
+                    state=global_state,
+                    action=actions_tensor,
+                    next_state=global_next_state
+                )
+                
+                # Normalize and add intrinsic reward
+                max_intrinsic_reward = 1.0
+                intrinsic_reward_normalized = intrinsic_reward.item() / max_intrinsic_reward
+                intrinsic_reward_weight = 0.05
+                overall_reward += intrinsic_reward_weight * intrinsic_reward_normalized
+
+                # Apply time penalty
+                time_penalty = -0.01 * step
+                overall_reward += time_penalty
+
+                # Smooth reward
+                reward_smoothing_factor = 0.9
+                smoothed_reward = (reward_smoothing_factor * cumulative_reward +
+                                (1 - reward_smoothing_factor) * overall_reward)
+                cumulative_reward = np.clip(smoothed_reward, -10.0, 10.0)
+
+                # Update trajectories and logs for each agent
+                # Update trajectories and logs for each agent
                 for agent_idx in range(self.num_agents):
-                    avg_error = np.mean(total_errors[agent_idx])
-                    avg_reward = np.mean(total_rewards[agent_idx])
-                    logging.info(f"Episode {episode}, Joint {agent_idx} - Avg Error: {avg_error:.6f}, Avg Reward: {avg_reward:.6f}")
+                    # Calculate success rate
+                    joint_success_rate = (
+                        sum(1 for s in total_rewards[agent_idx] if s > self.env.success_threshold) / 
+                        len(total_rewards[agent_idx])
+                    ) if total_rewards[agent_idx] else 0
 
-                # Log overall episode metrics
-                avg_episode_reward = sum([sum(agent_rewards) for agent_rewards in total_rewards]) / self.num_agents
-                overall_success = all([success] * self.num_agents)
-                logging.info(f"Episode {episode} - Avg Episode Reward: {avg_episode_reward:.6f}, Overall Success: {overall_success}")
+                    # Compute combined reward
+                    combined_reward = self.compute_combined_reward(
+                        scaled_rewards[agent_idx],
+                        intrinsic_reward,
+                        individual_rewards[agent_idx]
+                    )
+                    
+                    # Stabilize reward
+                    episode_progress = self.current_episode / self.num_episodes
+                    stabilized_reward = self.stabilize_rewards([combined_reward], episode_progress)[0]
+                    
+                    # Update total rewards and errors
+                    total_rewards[agent_idx].append(stabilized_reward)
+                    total_errors[agent_idx].append(joint_errors[agent_idx])
 
-                # Remove the target object at the end of the episode
-                p.removeBody(target_id)
+                    # Update trajectories
+                    agent_state = processed_state_list[agent_idx]
+                    trajectories[agent_idx]['states'].append(agent_state)
+                    trajectories[agent_idx]['actions'].append(
+                        torch.tensor(actions[agent_idx], dtype=torch.float32).to(self.device))
+                    trajectories[agent_idx]['log_probs'].append(
+                        torch.tensor(log_probs[agent_idx], dtype=torch.float32).to(self.device))
+                    trajectories[agent_idx]['rewards'].append(
+                        torch.tensor(stabilized_reward, dtype=torch.float32).to(self.device))
+                    trajectories[agent_idx]['dones'].append(done)
+                    # Calculate success rate
+                    joint_success_rate = (
+                        sum(1 for s in total_rewards[agent_idx] if s > self.env.success_threshold) / 
+                        len(total_rewards[agent_idx])
+                    ) if total_rewards[agent_idx] else 0
 
-        except Exception as e:
-            logging.error(f"Error during training: {e}")
+                    # Clip rewards
+                    joint_reward = np.clip(individual_rewards[agent_idx], -10, 50)
 
-        # After training, save logs and plot metrics
-        self.training_metrics.save_logs("training_logs.json")
+                    # Update total rewards and errors
+                    total_rewards[agent_idx].append(scaled_rewards[agent_idx] + 
+                                                intrinsic_reward.item()+np.abs(joint_reward))
+                    total_errors[agent_idx].append(joint_errors[agent_idx])
+
+                    # Update trajectories
+                    agent_state = processed_state_list[agent_idx]
+                    trajectories[agent_idx]['states'].append(agent_state)
+                    trajectories[agent_idx]['actions'].append(
+                        torch.tensor(actions[agent_idx], dtype=torch.float32).to(self.device))
+                    trajectories[agent_idx]['log_probs'].append(
+                        torch.tensor(log_probs[agent_idx], dtype=torch.float32).to(self.device))
+                    trajectories[agent_idx]['rewards'].append(
+                        torch.tensor(scaled_rewards[agent_idx] + intrinsic_reward.item(),
+                                dtype=torch.float32).to(self.device))
+                    trajectories[agent_idx]['dones'].append(done)
+
+                state = next_state
+                step += 1
+
+            # Update policy and logging remains the same
+
+
+            # Update policy from experience replay
+            if len(self.her_buffer.buffer) > self.batch_size:
+                experiences, weights, indices = self.her_buffer.sample(
+                    self.batch_size, beta=self.her_buffer.beta_start)
+                self.update_policy_with_experiences(experiences, weights, indices)
+
+            # Validate if needed
+            if self.validation_manager.should_validate(episode):
+                is_best, metrics = self.validation_manager.validate(self, self.env)
+
+            # Update policy and log results
+            actor_loss, critic_loss, entropy, policy_loss_per_agent, values, returns, advantages = \
+                self.update_policy(trajectories)
+
+            # Log episode statistics for each agent
+            for agent_idx in range(self.num_agents):
+                mean_joint_error = np.nanmean(total_errors[agent_idx]) if total_errors[agent_idx] else 0
+                max_joint_error = np.max(total_errors[agent_idx])
+                min_joint_error = np.min(total_errors[agent_idx])
+                mean_reward = np.nanmean(total_rewards[agent_idx])
+                
+                self.check_early_stopping(agent_idx, mean_error, episode)
+
+                logging.info(
+                    f"Episode {episode}, Joint {agent_idx} - "
+                    f"Mean Error: {mean_joint_error:.6f}, "
+                    f"Max Error: {max_joint_error:.6f}, "
+                    f"Min Error: {min_joint_error:.6f}, "
+                    f"Mean Reward: {mean_reward:.6f}"
+                )
+
+                # Save best model if improved
+                if mean_joint_error < self.best_joint_errors[agent_idx]:
+                    self.best_joint_errors[agent_idx] = mean_joint_error
+                    self.best_agents_state_dict[agent_idx] = self.agents[agent_idx].state_dict()
+                    self.save_best_model(agent_idx, self.agents[agent_idx], episode, mean_joint_error)
+
+            # Update curriculum
+            curriculum_manager.log_success(success)
+            curriculum_manager.update_difficulty()
+
+            # Log episode metrics
+            success_status = info.get('success_per_agent', [False] * self.num_agents)
+            episode_rewards = [np.sum(agent_rewards) for agent_rewards in total_rewards]
+            
+            self.training_metrics.log_episode(
+                joint_errors=total_joint_errors,
+                rewards=episode_rewards,
+                success=success_status,
+                entropy=(entropy),
+                actor_loss=actor_loss,
+                critic_loss=critic_loss,
+                policy_loss=policy_loss_per_agent,
+                advantages=advantages.cpu().numpy(),
+                env=self.env,
+                success_threshold=self.env.success_threshold
+            )
+
+        # Save final results
+        self.training_metrics.save_logs()
         metrics = self.training_metrics.calculate_metrics(env=self.env)
-        self.training_metrics.plot_metrics(metrics, self.env, show_plots=True)
+        self.training_metrics.plot_metrics(metrics, self.env, show_plots=False)
+        self.training_metrics.save_final_report(metrics)
 
-    
-    def _ensure_pybullet_connection(self):
-        """Ensure PyBullet is properly connected"""
-        try:
-            if not p.isConnected():
-                self.physics_client = p.connect(p.DIRECT)
-            return True
-        except Exception as e:
-            logging.error(f"PyBullet connection error: {e}")
-            return False
+        return metrics
 
-    def _cleanup_pybullet(self):
-        """Cleanup PyBullet connection"""
-        try:
-            if p.isConnected():
-                p.disconnect()
-        except:
-            pass
+    def _process_state(self, state):
+        processed_states = []
+        for joint_state in state:
+            joint_angle = joint_state['joint_angle'].flatten()
+            position_error = joint_state['position_error'].flatten()
+            orientation_error = joint_state['orientation_error'].flatten()
+
+            # Normalize features as needed
+            joint_angle_normalized = joint_angle / np.pi
+            position_error_normalized = position_error / 1.0
+            orientation_error_normalized = orientation_error / np.pi
+
+            obs = np.concatenate(
+                [
+                    joint_angle_normalized,
+                    position_error_normalized,
+                    orientation_error_normalized,
+                ]
+            )
+
+            processed_states.append(torch.tensor(obs, dtype=torch.float32).to(self.device))
+        return processed_states  # Returns a list of tensors, one per agent
+
+    def _process_global_state(self, state):
+        """
+        Processes the entire state into a single tensor for the exploration module.
+        """
+        processed_states = []
+        for joint_state in state:
+            joint_angle = joint_state['joint_angle'].flatten()
+            position_error = joint_state['position_error'].flatten()
+            orientation_error = joint_state['orientation_error'].flatten()
+
+            # Normalize joint angles to [-1, 1]
+            joint_angle_normalized = joint_angle / np.pi
+
+            # Normalize position errors
+            position_error_normalized = position_error / 1.0  # Adjust max value as needed
+
+            # Normalize orientation errors to [-1, 1]
+            orientation_error_normalized = orientation_error / np.pi
+
+            obs = np.concatenate(
+                [
+                    joint_angle_normalized,
+                    position_error_normalized,
+                    orientation_error_normalized,
+                ]
+            )
+
+            processed_states.append(obs)
+        # Concatenate all agents' observations into a single tensor
+        global_state = np.concatenate(processed_states)
+        return torch.tensor(global_state, dtype=torch.float32).to(self.device)
+
+
+    # Helper functions to retrieve the end-effector and target pose
+    def get_end_effector_pose(self):
+        """
+        Retrieve the current position and orientation of the end-effector.
+        """
+        end_effector_state = p.getLinkState(self.env.robot_id, self.env.joint_indices[-1])
+        current_position = np.array(end_effector_state[4])
+        current_orientation = np.array(end_effector_state[5])
+        return current_position, current_orientation
+
+    def get_target_pose(self):
+        """
+        Retrieve the target position and orientation (assumes target is stored as attributes).
+        """
+        return self.env.target_position, self.env.target_orientation
+
     def test_agent(self, env, num_episodes, max_steps=1000):
         """
         Test the trained agent in the environment.
@@ -728,79 +968,383 @@ class MAPPOAgent:
                 step_count += 1
             print(f"Test Episode {episode+1}, Total Reward: {episode_reward}")
         env.close()
-class PrioritizedReplayBuffer:
-    def __init__(self, capacity, alpha=0.6):
+
+
+    # Add these methods to your existing MAPPOAgent class
+    def init_early_stopping(self, patience=50, min_delta=1e-4, min_episodes=100):
+        self.early_stop_patience = patience
+        self.early_stop_min_delta = min_delta
+        self.early_stop_min_episodes = min_episodes
+
+        # Per-agent tracking
+        self.agent_early_stop_info = [{
+            'best_mean_error': float('inf'),
+            'best_epoch': 0,
+            'no_improvement_count': 0,
+            'stopped': False,
+            'best_model': None,
+            'error_history': deque(maxlen=100)
+        } for _ in range(self.num_agents)]
+
+        # Track how many agents have stopped
+        self.num_agents_stopped = 0
+
+    def check_early_stopping(self, agent_idx, mean_error, episode):
+        agent_info = self.agent_early_stop_info[agent_idx]
+        
+        if episode < self.early_stop_min_episodes:
+            return False
+        
+        # Update error history
+        agent_info['error_history'].append(mean_error)
+        
+        # Check for improvement
+        if mean_error < agent_info['best_mean_error'] - self.early_stop_min_delta:
+            agent_info['best_mean_error'] = mean_error
+            agent_info['best_epoch'] = episode
+            agent_info['no_improvement_count'] = 0
+            
+            # Save the best model for this agent
+            agent_info['best_model'] = self.agents[agent_idx].state_dict()
+            self.save_best_model(agent_idx, self.agents[agent_idx], episode, mean_error)
+            self.logger.info(f"New best model saved for agent {agent_idx} at episode {episode} with mean error: {mean_error:.6f}")
+            return False
+        
+        # Increment no improvement count
+        agent_info['no_improvement_count'] += 1
+        
+        # Log warning if nearing early stopping
+        if agent_info['no_improvement_count'] > self.early_stop_patience * 0.7 and not agent_info['stopped']:
+            self.logger.warning(
+                f"Agent {agent_idx}: No improvement for {agent_info['no_improvement_count']} episodes. "
+                f"Will stop after {self.early_stop_patience - agent_info['no_improvement_count']} more episodes "
+                f"without improvement."
+            )
+        
+        # Check if early stopping should be triggered for this agent
+        if agent_info['no_improvement_count'] >= self.early_stop_patience and not agent_info['stopped']:
+            agent_info['stopped'] = True
+            self.num_agents_stopped += 1
+            self.logger.info(
+                f"Early stopping triggered for agent {agent_idx} at episode {episode}. "
+                f"Best performance was at episode {agent_info['best_epoch']} "
+                f"with mean error: {agent_info['best_mean_error']:.6f}"
+            )
+            return True
+        
+        return False
+
+
+    def safe_mean(arr):
+        if len(arr) == 0:
+            return np.nan  # or return 0 if preferred
+        return np.mean(arr)
+
+    def restore_best_models(self):
+        """Restore the best performing models"""
+        for agent_idx, agent_info in enumerate(self.agent_early_stop_info):
+            if agent_info['best_model'] is not None:
+                self.agents[agent_idx].load_state_dict(agent_info['best_model'])
+                self.logger.info(f"Restored best model for agent {agent_idx} from episode {agent_info['best_epoch']}")
+
+
+    def update_policy_with_experiences(self, experiences, weights, indices):
         """
-        Initializes the Prioritized Experience Replay Buffer.
+        Update policy using sampled experiences with proper loss handling.
+        
+        Args:
+            experiences: List of experience tuples
+            weights: Importance sampling weights
+            indices: Indices of sampled experiences
+        """
+        try:
+            # Convert experiences to trajectories format
+            trajectories = [{'states': [], 'actions': [], 'log_probs': [], 
+                            'rewards': [], 'dones': []} 
+                        for _ in range(self.num_agents)]
+            
+            # Process each experience
+            for exp_idx, experience in enumerate(experiences):
+                # Convert experience components to tensors and move to device
+                state = self._process_state(experience.state)
+                next_state = self._process_state(experience.next_state)
+                
+                # Ensure actions and rewards are properly formatted
+                actions = self._format_experience_data(experience.action, self.num_agents)
+                rewards = self._format_experience_data(experience.reward, self.num_agents)
+                
+                # Get log probs for the actions
+                with torch.no_grad():
+                    log_probs = []
+                    for agent_idx, agent in enumerate(self.agents):
+                        agent_state = state[agent_idx].unsqueeze(0)
+                        agent_action = torch.tensor(actions[agent_idx], dtype=torch.float32).to(self.device)
+                        
+                        mean, std = agent(agent_state)
+                        std = torch.clamp(std * self.epsilon, min=1e-4, max=1.0)
+                        dist = Normal(mean, std)
+                        log_prob = dist.log_prob(agent_action).sum()
+                        log_probs.append(log_prob.item())
+                
+                # Update trajectories for each agent
+                for agent_idx in range(self.num_agents):
+                    trajectories[agent_idx]['states'].append(state[agent_idx])
+                    trajectories[agent_idx]['actions'].append(
+                        torch.tensor(actions[agent_idx], dtype=torch.float32).to(self.device)
+                    )
+                    trajectories[agent_idx]['rewards'].append(
+                        torch.tensor(rewards[agent_idx], dtype=torch.float32).to(self.device)
+                    )
+                    trajectories[agent_idx]['log_probs'].append(
+                        torch.tensor(log_probs[agent_idx], dtype=torch.float32).to(self.device)
+                    )
+                    trajectories[agent_idx]['dones'].append(experience.done)
+            
+            # Apply importance sampling weights
+            weights_tensor = torch.tensor(weights, dtype=torch.float32).to(self.device)
+            for agent_idx in range(self.num_agents):
+                trajectories[agent_idx]['weights'] = weights_tensor
+            
+            # Update policy using trajectories
+            actor_loss, critic_loss, entropy, policy_losses, values, returns, _ = self.update_policy(trajectories)
+            
+            # Compute per-experience TD-errors
+            td_errors = self.compute_td_errors(trajectories)
+            
+            # Convert TD-errors to numpy array
+            new_priorities = np.abs(td_errors.detach().cpu().numpy()) + 1e-6
+            
+            # Update priorities in the replay buffer
+            self.her_buffer.update_priorities(indices, new_priorities)
+            
+            # Log the values for debugging
+            self.logger.debug(f"Critic Loss: {critic_loss}, New Priorities: {new_priorities}")
+            
+            return new_priorities
+            
+        except Exception as e:
+            self.logger.error(f"Error in update_policy_with_experiences: {str(e)}")
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
+
+    def compute_td_errors(self, trajectories):
+        """
+        Compute TD-errors per experience using per-agent rewards and dones.
 
         Args:
-            capacity (int): Maximum number of experiences to store.
-            alpha (float): Controls the level of prioritization. alpha=0 gives uniform sampling.
-        """
-        self.capacity = capacity
-        self.alpha = alpha
-        self.buffer = []
-        self.priorities = np.zeros((capacity,), dtype=np.float32)
-        self.pos = 0
-
-    def add(self, experience, priority=1.0):
-        """
-        Adds a new experience to the buffer with a given priority.
-
-        Args:
-            experience: The experience to store (tuple).
-            priority (float): Priority for sampling this experience.
-        """
-        max_priority = self.priorities.max() if self.buffer else priority
-
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(experience)
-        else:
-            self.buffer[self.pos] = experience
-
-        self.priorities[self.pos] = max_priority
-        self.pos = (self.pos + 1) % self.capacity
-
-    def sample(self, batch_size, beta=0.4):
-        """
-        Samples a batch of experiences based on priority.
-
-        Args:
-            batch_size (int): Number of experiences to sample.
-            beta (float): Bias correction factor for sampling probability.
+            trajectories: A list of dictionaries containing trajectories for each agent.
 
         Returns:
-            batch (list): Sampled experiences.
-            weights (list): Importance-sampling weights for each experience.
-            indices (list): Indices of sampled experiences in the buffer.
+            td_errors: Tensor of TD-errors per experience.
         """
-        if len(self.buffer) == self.capacity:
-            priorities = self.priorities
-        else:
-            priorities = self.priorities[:self.pos]
+        batch_size = len(trajectories[0]['states'])  # Number of time steps
+        num_agents = self.num_agents  # Number of agents
 
-        # Compute the probability of each experience
-        probabilities = priorities ** self.alpha
-        probabilities /= probabilities.sum()
+        # Collect global states, per-agent rewards, and per-agent dones
+        global_states = []
+        rewards = []
+        dones = []
 
-        # Sample experiences according to the computed probabilities
-        indices = np.random.choice(len(self.buffer), batch_size, p=probabilities)
-        batch = [self.buffer[idx] for idx in indices]
+        for t in range(batch_size):
+            # Concatenate states from all agents at time step t
+            state_t = []
+            rewards_t = []
+            dones_t = []
+            for agent_idx in range(num_agents):
+                state_t.append(trajectories[agent_idx]['states'][t])
+                # Get per-agent reward
+                reward = trajectories[agent_idx]['rewards'][t]
+                if isinstance(reward, torch.Tensor):
+                    reward = reward.item()
+                rewards_t.append(reward)
+                # Get per-agent done
+                done = trajectories[agent_idx]['dones'][t]
+                if isinstance(done, torch.Tensor):
+                    done = done.item()
+                dones_t.append(float(done))
+            global_state = torch.cat(state_t, dim=0)  # Shape: [total_state_dim]
+            global_states.append(global_state)
+            rewards.append(rewards_t)  # Shape: [num_agents]
+            dones.append(dones_t)      # Shape: [num_agents]
 
-        # Compute importance-sampling weights
-        total = len(self.buffer)
-        weights = (total * probabilities[indices]) ** (-beta)
-        weights /= weights.max()  # Normalize for stability
+        # Convert lists to tensors
+        global_states = torch.stack(global_states).to(self.device)        # Shape: [batch_size, total_state_dim]
+        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)  # Shape: [batch_size, num_agents]
+        dones = torch.tensor(dones, dtype=torch.float32).to(self.device)      # Shape: [batch_size, num_agents]
 
-        return batch, weights, indices
+        # Get values from critic
+        with torch.no_grad():
+            values = self.critic(global_states)  # Should output shape: [batch_size, num_agents]
+            values = values.view(batch_size, num_agents)  # Ensure correct shape
 
-    def update_priorities(self, indices, priorities):
+        # Compute next values
+        next_values = torch.zeros_like(values)
+        next_values[:-1] = values[1:]
+
+        
+        # Compute TD-targets
+        td_target = rewards + self.gamma * next_values * (1 - dones)
+
+        # Compute TD-errors
+        td_errors = td_target - values
+
+        # Flatten td_errors to shape [batch_size * num_agents] if needed
+        td_errors = td_errors.view(-1)
+
+        return td_errors
+
+
+
+    def _format_experience_data(self, data, num_agents):
+        """Helper method to format experience data"""
+        if isinstance(data, (list, np.ndarray)):
+            if len(data) < num_agents:
+                # Extend data to match number of agents
+                return list(data) + [data[-1]] * (num_agents - len(data))
+            return data
+        # Single value case
+        return [data] * num_agents
+
+    def _validate_experience(self, experience):
+        """Validate experience data"""
+        try:
+            state = self._process_state(experience.state)
+            if len(state) != self.num_agents:
+                self.logger.warning(f"State length mismatch. Expected {self.num_agents}, got {len(state)}")
+                return False
+            return True
+        except Exception as e:
+            self.logger.error(f"Experience validation error: {str(e)}")
+            return False
+
+    def compute_combined_reward(self, scaled_reward, intrinsic_reward, joint_reward):
+        """Compute combined reward with proper scaling"""
+        # Scale components individually
+        scaled_intrinsic = intrinsic_reward.item() * 0.1  # Reduce intrinsic reward influence
+        scaled_joint = joint_reward * 0.3  # Scale joint reward contribution
+        
+        # Combine rewards with exponential smoothing
+        combined = (
+            0.6 * scaled_reward +  # Main reward component
+            0.2 * scaled_intrinsic +  # Exploration component
+            0.2 * scaled_joint  # Joint-specific component
+        )
+        
+        return combined
+
+    def stabilize_rewards(self, rewards, episode_progress):
+        """Apply consistent reward stabilization"""
+        # Initialize moving averages if not exists
+        if not hasattr(self, 'reward_stats'):
+            self.reward_stats = {
+                'mean': deque(maxlen=100),
+                'std': deque(maxlen=100)
+            }
+        
+        # Update statistics
+        self.reward_stats['mean'].append(np.mean(rewards))
+        self.reward_stats['std'].append(np.std(rewards))
+        
+        # Compute running statistics
+        running_mean = np.mean(self.reward_stats['mean'])
+        running_std = np.mean(self.reward_stats['std']) + 1e-8
+        
+        # Normalize rewards
+        normalized_rewards = [(r - running_mean) / running_std for r in rewards]
+        
+        # Apply adaptive clipping
+        clip_range = 2.0 * (1.0 - episode_progress) + 1.0  # Reduces range over time
+        stabilized_rewards = [np.clip(r, -clip_range, clip_range) for r in normalized_rewards]
+        
+        return stabilized_rewards
+
+
+class AdaptiveRewardScaler:
+    def __init__(self, window_size=100, initial_scale=1.0, adjustment_rate=0.02):
+        self.window_size = window_size
+        self.reward_history = deque(maxlen=window_size)
+        self.scale = initial_scale
+        self.min_scale = 0.5
+        self.max_scale = 5.0
+        self.adjustment_rate = adjustment_rate
+
+    def update_scale(self, reward):
+        """Update scaling factor based on reward history."""
+        self.reward_history.append(reward)
+        if len(self.reward_history) >= self.window_size:
+            reward_mean = np.nanmean(self.reward_history)
+            if abs(reward_mean) > 1.0:
+                self.scale *= (1 - self.adjustment_rate)
+            elif abs(reward_mean) < 0.1:
+                self.scale *= (1 + self.adjustment_rate)
+            self.scale = np.clip(self.scale, self.min_scale, self.max_scale)
+        return self.scale
+class RewardStabilizer:
+    def __init__(self, 
+                 window_size=100, 
+                 scale_min=0.1, 
+                 scale_max=2.0,
+                 ewma_alpha=0.95,
+                 clip_range=(-10.0, 300.0),
+                 adaptive_clip_percentile=95):
+        self.window_size = window_size
+        self.reward_history = deque(maxlen=window_size)
+        self.scale_min = scale_min
+        self.scale_max = scale_max
+        self.ewma_alpha = ewma_alpha
+        self.ewma_value = None
+        self.base_clip_range = clip_range
+        self.adaptive_clip_percentile = adaptive_clip_percentile
+        self.current_clip_range = clip_range
+
+    def update_clip_range(self):
+        """Dynamically adjust clip range based on recent reward history"""
+        if len(self.reward_history) >= self.window_size // 2:
+            rewards_array = np.array(self.reward_history)
+            percentile_value = np.percentile(np.abs(rewards_array), self.adaptive_clip_percentile)
+            clip_value = min(max(percentile_value, self.base_clip_range[1] * 0.5), 
+                           self.base_clip_range[1] * 1.5)
+            self.current_clip_range = (-clip_value, clip_value)
+
+    def stabilize_reward(self, reward, progress_ratio=None):
         """
-        Updates the priorities of sampled experiences based on TD error.
-
+        Apply multiple stabilization techniques to the reward.
+        
         Args:
-            indices (list): Indices of experiences to update.
-            priorities (list): New priority values for the experiences.
+            reward (float): The original reward value
+            progress_ratio (float): Training progress (0 to 1) for adaptive scaling
         """
-        for idx, priority in zip(indices, priorities):
-            self.priorities[idx] = priority
+        # 1. Apply EWMA smoothing
+        if self.ewma_value is None:
+            self.ewma_value = reward
+        else:
+            self.ewma_value = self.ewma_alpha * self.ewma_value + (1 - self.ewma_alpha) * reward
+
+        # 2. Adaptive scaling based on training progress
+        if progress_ratio is not None:
+            scale_factor = self.scale_max - (self.scale_max - self.scale_min) * progress_ratio
+        else:
+            scale_factor = self.scale_max
+
+        # 3. Update clip range based on recent history
+        self.reward_history.append(reward)
+        self.update_clip_range()
+
+        # 4. Apply stabilization techniques
+        stabilized_reward = self.ewma_value * scale_factor
+
+        # 5. Apply adaptive clipping
+        stabilized_reward = np.clip(stabilized_reward, 
+                                  self.current_clip_range[0], 
+                                  self.current_clip_range[1])
+
+        return stabilized_reward
+
+    def get_stats(self):
+        """Return current stabilization statistics"""
+        return {
+            'ewma_value': self.ewma_value,
+            'clip_range': self.current_clip_range,
+            'reward_std': np.std(self.reward_history) if len(self.reward_history) > 0 else 0,
+            'reward_mean': np.mean(self.reward_history) if len(self.reward_history) > 0 else 0
+        }

@@ -1,6 +1,7 @@
-import numpy as np
 import pybullet as p
-
+import numpy as np
+from collections import deque
+from typing import List, Tuple, Optional
 def compute_position_error(current_position, target_position):
     """
     Enhanced position error calculation with debugging.
@@ -12,32 +13,26 @@ def compute_position_error(current_position, target_position):
     return max(error, 1e-6)  # Ensure non-zero error
 
 
-def compute_quaternion_distance(current_orientation, target_orientation):
+def compute_quaternion_distance(q1, q2):
     """
-    Compute quaternion distance with improved numerical stability.
-    
+    Compute the distance between two quaternions.
+
     Args:
-        current_orientation (np.array): Current orientation quaternion
-        target_orientation (np.array): Target orientation quaternion
-    
+        q1 (np.array): First quaternion.
+        q2 (np.array): Second quaternion.
+
     Returns:
-        float: Angular distance in radians
+        float: Quaternion distance.
     """
-    # Ensure inputs are numpy arrays
-    current_orientation = np.array(current_orientation)
-    target_orientation = np.array(target_orientation)
-    
-    # Compute dot product with improved numerical stability
-    dot_product = np.clip(
-        np.abs(np.dot(current_orientation, target_orientation)),
-        -1.0 + 1e-7,
-        1.0 - 1e-7
-    )
-    
-    # Convert to angle
-    distance = 2 * np.arccos(dot_product)
-    
-    return max(distance, 1e-7)  # Ensure non-zero distance
+    q1 = np.array(q1)
+    q2 = np.array(q2)
+    dot_product = np.abs(np.dot(q1, q2))
+    dot_product = np.clip(dot_product, -1.0, 1.0)
+    angle = 2 * np.arccos(dot_product)
+    return angle
+
+
+
 
 def compute_overall_distance(current_position, target_position, current_orientation, target_orientation):
     """
@@ -61,7 +56,6 @@ def compute_overall_distance(current_position, target_position, current_orientat
     # Combine the Euclidean and Quaternion distances
     overall_distance = euclidean_distance + quaternion_distance
     return overall_distance
-
 
 # def compute_reward(distance, begin_distance, prev_best, current_orientation, target_orientation, 
 #                    joint_errors, linear_weights, angular_weights,
@@ -127,174 +121,318 @@ def compute_overall_distance(current_position, target_position, current_orientat
 #     reward -= joint_error_penalty
     
 #     # Clip the reward to ensure numerical stability
-#     reward = np.clip(reward, -50, 50)
+#     reward = np.clip(reward, -1, 100)
     
 #     return reward, prev_best, success
 
+# def compute_reward(distance, begin_distance, prev_best, current_orientation, target_orientation, 
+#                    joint_errors, linear_weights, angular_weights,
+#                    success_threshold=0.006, time_penalty=-1):
+#     """
+#     Enhanced reward function that incorporates joint errors and returns individual joint rewards.
+    
+#     Args:
+#         distance (float): Current distance to target.
+#         begin_distance (float): Initial distance to target.
+#         prev_best (float): Best distance achieved so far.
+#         current_orientation (np.array): Current end-effector orientation quaternion.
+#         target_orientation (np.array): Target orientation quaternion.
+#         joint_errors (list): List of errors for each joint.
+#         linear_weights (np.array): Weights for each joint based on linear movement.
+#         angular_weights (np.array): Weights for each joint based on angular movement.
+#         success_threshold (float): Distance threshold for success.
+#         time_penalty (float): Small penalty per timestep to encourage efficiency.
+    
+#     Returns:
+#         tuple: (reward, individual_rewards, prev_best, success)
+#     """
+#     success = False
+    
+#     # Shape the distance metrics
+#     shaped_dist, shaped_begin = compute_shaped_distance(distance, begin_distance)
+    
+#     # Compute progress reward
+#     progress_reward = compute_progress_reward(shaped_dist, shaped_begin)
+    
+#     # Compute orientation reward
+#     quaternion_distance = compute_quaternion_distance(current_orientation, target_orientation)
+#     orientation_reward = compute_orientation_bonus(quaternion_distance)
+    
+#     # Calculate joint rewards using joint errors and weights
+#     joint_rewards = compute_weighted_joint_rewards(
+#         joint_errors, linear_weights, angular_weights, progress_reward
+#     )
+#     joint_reward_contribution = np.sum(joint_rewards)  # Aggregate contribution from joint rewards
+
+#     # Combine rewards with time penalty and joint contributions
+#     reward = (
+#         0.1 * progress_reward +
+#         0.1 * orientation_reward +
+#         0.1 * joint_reward_contribution +
+#         time_penalty
+#     )
+    
+#     # Check for success
+#     if distance <= success_threshold:
+#         # Exponential bonus for precision
+#         precision_bonus = 2000 * np.exp(-distance / (0.1 * success_threshold))
+#         reward += precision_bonus
+#         success = True
+
+#     # Update previous best if we've improved
+#     if distance < prev_best:
+#         prev_best = distance
+#     elif distance > prev_best:
+#         # The agent moved away from the target, apply punishment
+#         reward -= (distance - prev_best) * 10  # Adjust the multiplier as needed
+
+#     # Add smoothing to prevent sharp reward changes
+#     reward = np.clip(reward, -1, 5000)
+    
+#     # Return individual joint rewards along with other values
+#     return reward, joint_rewards, prev_best, success
 
 
-def compute_reward(distance, begin_distance, prev_best, current_orientation, target_orientation, 
-                   joint_errors, linear_weights, angular_weights,
-                   success_threshold=0.006, time_penalty=-0.1):
+def compute_reward(
+    distance: float,
+    begin_distance: float,
+    prev_best: float,
+    current_orientation: np.ndarray,
+    target_orientation: np.ndarray,
+    joint_errors: List[float],
+    linear_weights: List[float],
+    angular_weights: List[float],
+    episode_number: int,
+    total_episodes: int,
+    success_threshold: float = 0.01,
+    time_penalty: float = -0.1,
+    smoothing_window: int = 10,
+    curriculum_factor: float = 0.5,
+    exploration_bonus: float = 0.1
+) -> Tuple[np.ndarray, List[float], float, bool]:
     """
-    Enhanced reward function with logarithmic shaping and improvement tracking.
-    
-    Args:
-        distance (float): Current distance to target.
-        begin_distance (float): Initial distance to target.
-        prev_best (float): Best distance achieved so far.
-        current_orientation (np.array): Current end-effector orientation quaternion.
-        target_orientation (np.array): Target orientation quaternion.
-        joint_errors (list): List of errors for each joint.
-        linear_weights (np.array): Weights for each joint based on linear movement.
-        angular_weights (np.array): Weights for each joint based on angular movement.
-        success_threshold (float): Distance threshold for success.
-        time_penalty (float): Small penalty per timestep to encourage efficiency.
-    
-    Returns:
-        tuple: (reward, prev_best, success)
-    """
-    success = False
-    epsilon = 1e-6
-    
-    # Shape the distance metrics logarithmically
-    shaped_dist, shaped_begin = compute_shaped_distance(distance, begin_distance)
-    
-    # Compute progress reward with logarithmic scaling
-    progress_reward = compute_progress_reward(shaped_dist, shaped_begin)
-    
-    # Compute orientation reward
-    quaternion_distance = compute_quaternion_distance(current_orientation, target_orientation)
-    orientation_reward = compute_orientation_bonus(quaternion_distance)
-    
-    # Calculate improvement with logarithmic scaling
-    if distance < prev_best:
-        # Logarithmic improvement bonus
-        improvement = -np.log(np.maximum(distance / prev_best, epsilon))
-        prev_best = distance
-    else:
-        # Logarithmic penalty for moving away
-        improvement = -np.log1p((distance - prev_best) / begin_distance)
-    
-    # Ensure arrays and normalize weights
-    joint_errors = np.array(joint_errors)
-    linear_weights = np.array(linear_weights)
-    angular_weights = np.array(angular_weights)
-    
-    # Logarithmic error scaling for joints
-    log_joint_errors = -np.log(np.maximum(joint_errors, epsilon))
-    max_log_error = np.max(np.abs(log_joint_errors))
-    normalized_joint_errors = log_joint_errors / (max_log_error + epsilon)
-    
-    # Combine weights
-    combined_weights = np.maximum(linear_weights + angular_weights, epsilon)
-    combined_weights /= (np.sum(combined_weights) + epsilon)
-    
-    # Calculate base reward components
-    progress_contribution = progress_reward * np.mean(combined_weights)
-    orientation_contribution = orientation_reward * np.mean(combined_weights)
-    improvement_contribution = improvement * np.mean(combined_weights)
-    
-    # Joint efficiency (logarithmically scaled)
-    efficiency = np.mean(normalized_joint_errors * np.log1p(1 / (joint_errors + epsilon)))
-    
-    # Combine all components
-    reward = (
-        0.3 * progress_contribution +
-        0.3 * orientation_contribution +
-        0.2 * improvement_contribution +
-        0.2 * efficiency
-    )
-    
-    # Success bonus with logarithmic precision scaling
-    if distance <= success_threshold:
-        precision_ratio = distance / success_threshold
-        precision_bonus = -20.0 * np.log(precision_ratio)
+        Computes the reward for an inverse kinematics (IK) task, taking into account various factors such as distance, orientation, joint errors, and exploration.
         
-        # Additional bonus for efficient joints
-        if np.mean(joint_errors) < np.max(joint_errors):
-            efficiency_bonus = -10.0 * np.log(np.mean(joint_errors) / np.max(joint_errors))
-            precision_bonus += efficiency_bonus
-            
-        reward += precision_bonus
-        success = True
-    
-    # Time penalty with logarithmic decay
-    progress_ratio = distance / begin_distance
-    adaptive_time_penalty = time_penalty * np.log1p(progress_ratio)
-    reward += adaptive_time_penalty
-    
-    # Logarithmic reward scaling
-    if reward > 0:
-        reward = np.log1p(reward)
-    else:
-        reward = -np.log1p(-reward)
-    
-    # Clip rewards with logarithmic bounds
-    if not success:
-        reward = np.clip(reward, -5.0, 5.0)
-    else:
-        reward = np.clip(reward, -5.0, 10.0)
-    
-    # Debug information
-    if np.random.random() < 0.01:  # Print occasionally
-        print("\n=== Reward Computation Debug ===")
-        print(f"Distance: {distance:.6f}, Begin: {begin_distance:.6f}")
-        print(f"Improvement: {improvement:.4f}")
-        print(f"Progress Reward: {progress_reward:.4f}")
-        print(f"Orientation Reward: {orientation_reward:.4f}")
-        print(f"Joint Errors: {joint_errors}")
-        print(f"Combined Reward: {reward:.4f}")
-        print(f"Success Threshold: {success_threshold}")
-        print(f"Success: {success}")
+        Args:
+            distance (float): The current distance between the end-effector and the target position.
+            begin_distance (float): The initial distance between the end-effector and the target position.
+            prev_best (float): The previous best distance achieved.
+            current_orientation (np.ndarray): The current orientation of the end-effector.
+            target_orientation (np.ndarray): The target orientation of the end-effector.
+            joint_errors (List[float]): The errors between the current and target joint angles.
+            linear_weights (List[float]): The weights for the linear joints.
+            angular_weights (List[float]): The weights for the angular joints.
+            episode_number (int): The current episode number.
+            total_episodes (int): The total number of episodes.
+            success_threshold (float, optional): The threshold for considering the task successful. Defaults to 0.006.
+            time_penalty (float, optional): The penalty per timestep to encourage efficiency. Defaults to -0.1.
+            smoothing_window (int, optional): The window size for smoothing the joint error history. Defaults to 10.
+            curriculum_factor (float, optional): The factor for the curriculum learning progress. Defaults to 0.5.
+            exploration_bonus (float, optional): The factor for the exploration bonus. Defaults to 0.1.
+        
+        Returns:
+            Tuple[np.ndarray, List[float], float, bool]: A tuple containing:
+                - final_rewards: A numpy array of shape (num_joints,) containing the individual joint rewards.
+                - joint_specific_rewards: A list of detailed rewards for each joint.
+                - new_best: The updated best performance.
+                - success: A boolean indicating whether the success threshold was reached.
+        """
+    # Constants for reward bounds and scaling factors
+    MAX_REWARD = 15.0
+    MIN_REWARD = -5.0
+    POSITION_SCALE = 0.6
+    ORIENTATION_SCALE = 0.4
+    IMPROVEMENT_SCALE = 0.3
+    ERROR_PENALTY_SCALE = 0.2
+    SUCCESS_BONUS_BASE = 100
+    NOVELTY_BASE = 0.5
 
-    return reward, prev_best, success
+    # Initialize storage
+    if not hasattr(compute_reward, 'distance_history'):
+        compute_reward.distance_history = deque(maxlen=smoothing_window)
+        compute_reward.state_visits = {}
+        compute_reward.min_distance = float('inf')
+        compute_reward.joint_histories = [deque(maxlen=smoothing_window) for _ in range(len(joint_errors))]
+        compute_reward.prev_joint_errors = [float('inf')] * len(joint_errors)
+
+    # Update histories
+    compute_reward.min_distance = min(compute_reward.min_distance, distance)
+    compute_reward.distance_history.append(distance)
+    curriculum_progress = np.clip((episode_number / total_episodes) ** curriculum_factor, 0.0, 1.0)
+    task_difficulty = 0.2 + 0.3 * curriculum_progress
+
+    # Normalize metrics
+    norm_distance = distance / (begin_distance + 1e-8)
+    orientation_diff = compute_quaternion_distance(current_orientation, target_orientation)
+    norm_quaternion_distance = orientation_diff / np.pi
+
+    num_joints = len(joint_errors)
+    joint_specific_rewards = []
+    final_rewards = np.zeros(num_joints)
+    joint_errors = np.array(joint_errors)
+
+    # Calculate rewards for each joint
+    for i in range(num_joints):
+        # Update joint history
+        compute_reward.joint_histories[i].append(joint_errors[i])
+        smoothed_error = max(np.median(list(compute_reward.joint_histories[i])), 1e-6)
+        prev_error = max(compute_reward.prev_joint_errors[i], 1e-6)
+        if not np.isfinite(prev_error) or not np.isfinite(smoothed_error):
+            improvement = 0  # Default value for invalid improvement
+        else:
+            improvement = np.clip((prev_error - smoothed_error) / (prev_error + 1e-8), -1.0, 1.0)
+        compute_reward.prev_joint_errors[i] = smoothed_error
+
+        # Determine if the joint is angular or linear
+        is_angular = i >= len(linear_weights)
+
+        # Calculate position and orientation rewards
+        position_reward = POSITION_SCALE * (1.0 - norm_distance)
+        orientation_reward = ORIENTATION_SCALE * (1.0 - norm_quaternion_distance)
+
+        # Improvement reward
+        progress_reward = IMPROVEMENT_SCALE * np.tanh(improvement)
+
+        # Error penalty
+        normalized_error = np.clip(joint_errors[i] / np.pi, 0.0, 1.0)
+        error_penalty = -normalized_error * task_difficulty * ERROR_PENALTY_SCALE
+
+        # Exploration bonus
+        state_key = tuple(np.round([distance, smoothed_error], 3))
+        visits = compute_reward.state_visits.get(state_key, 0) + 1
+        compute_reward.state_visits[state_key] = visits
+        novelty_bonus = exploration_bonus * (NOVELTY_BASE / np.sqrt(visits)) * (1.0 - curriculum_progress)
+
+        # Success bonus
+        success_bonus = 0
+        if joint_errors[i] <= success_threshold:
+            # print(f"Joint {i} reached success threshold: {joint_errors[i]} <= {success_threshold}")
+            success_bonus = SUCCESS_BONUS_BASE *np.exp(-(1.0 + curriculum_progress)/success_threshold)
+
+        # Combine components
+        joint_reward = (
+            position_reward +
+            orientation_reward +
+            progress_reward +
+            error_penalty +
+            novelty_bonus +
+            success_bonus
+        )
+
+        # Apply time penalty
+        joint_reward += time_penalty * task_difficulty
+
+        # Clip the reward
+        final_rewards[i] = np.clip(joint_reward, MIN_REWARD, MAX_REWARD)
+        joint_specific_rewards.append(joint_reward)
+
+    # Determine success
+    success = np.all(joint_errors <= success_threshold)
+    new_best = min(prev_best, compute_reward.min_distance)
+    final_rewards *=np.log(episode_number+1/total_episodes) 
+    final_rewards = np.clip(final_rewards, MIN_REWARD, MAX_REWARD)
+    return final_rewards, joint_specific_rewards, new_best, success
 
 def compute_jacobian_linear(robot_id, joint_indices, joint_angles):
     """
-    Computes the linear Jacobian for the end-effector.
-
+    Computes the linear Jacobian for the end-effector analytically.
+    
     Args:
         robot_id (int): The ID of the robot in the PyBullet simulation.
         joint_indices (list): The indices of the joints to consider.
         joint_angles (list): The angles of the joints to compute the Jacobian.
-
+    
     Returns:
-        np.array: Linear Jacobian matrix.
+        np.array: Linear Jacobian matrix (3 x n).
     """
-    zero_vec = [0.0] * len(joint_indices)
-    jacobian_linear, _ = p.calculateJacobian(
-        bodyUniqueId=robot_id,
-        linkIndex=joint_indices[-1],
-        localPosition=[0, 0, 0],
-        objPositions=joint_angles,
-        objVelocities=zero_vec,
-        objAccelerations=zero_vec
-    )
-    return np.array(jacobian_linear)
+    num_joints = len(joint_indices)
+    J_linear = np.zeros((3, num_joints))
+    
+    # Get end-effector position and joint poses
+    ee_state = p.getLinkState(robot_id, joint_indices[-1])
+    ee_pos = np.array(ee_state[4])  # Use worldLinkFramePosition
+    
+    # Compute Jacobian column by column
+    for i, joint_idx in enumerate(joint_indices):
+        # Get joint state
+        joint_info = p.getJointInfo(robot_id, joint_idx)
+        joint_state = p.getLinkState(robot_id, joint_idx)
+        
+        # Get joint position and axis in world frame
+        joint_pos = np.array(joint_state[4])  # Use worldLinkFramePosition
+        joint_axis = np.array(joint_info[13])  # Joint axis in world frame
+        
+        # Normalize joint axis
+        joint_axis = joint_axis / (np.linalg.norm(joint_axis) + 1e-8)
+        
+        # For revolute joints: J = z × (p - p_i)
+        # where z is joint axis, p is end-effector position, p_i is joint position
+        r = ee_pos - joint_pos
+        J_linear[:, i] = np.cross(joint_axis, r)
+    
+    return J_linear
 
 def compute_jacobian_angular(robot_id, joint_indices, joint_angles):
     """
-    Computes the angular Jacobian for the end-effector.
-
+    Computes the angular Jacobian for the end-effector analytically.
+    
     Args:
         robot_id (int): The ID of the robot in the PyBullet simulation.
         joint_indices (list): The indices of the joints to consider.
         joint_angles (list): The angles of the joints to compute the Jacobian.
-
+    
     Returns:
-        np.array: Angular Jacobian matrix.
+        np.array: Angular Jacobian matrix (3 x n).
     """
-    zero_vec = [0.0] * len(joint_indices)
-    _, jacobian_angular = p.calculateJacobian(
-        bodyUniqueId=robot_id,
-        linkIndex=joint_indices[-1],
-        localPosition=[0, 0, 0],
-        objPositions=joint_angles,
-        objVelocities=zero_vec,
-        objAccelerations=zero_vec
-    )
-    return np.array(jacobian_angular)
+    num_joints = len(joint_indices)
+    J_angular = np.zeros((3, num_joints))
+    
+    # Get current transforms
+    ee_state = p.getLinkState(robot_id, joint_indices[-1])
+    ee_orientation = np.array(ee_state[5])  # World frame orientation
+    
+    # Compute Jacobian column by column
+    for i, joint_idx in enumerate(joint_indices):
+        # Get joint info
+        joint_info = p.getJointInfo(robot_id, joint_idx)
+        joint_state = p.getLinkState(robot_id, joint_idx)
+        
+        # Get joint axis in world frame
+        joint_axis = np.array(joint_info[13])
+        
+        # Get joint orientation
+        joint_orientation = np.array(joint_state[5])
+        
+        # Normalize joint axis
+        joint_axis = joint_axis / (np.linalg.norm(joint_axis) + 1e-8)
+        
+        # For revolute joints: Angular Jacobian column is the joint rotation axis
+        # transformed to the world frame
+        R = quaternion_to_rotation_matrix(joint_orientation)
+        J_angular[:, i] = R @ joint_axis
+    
+    return J_angular
+
+def quaternion_to_rotation_matrix(q):
+    """
+    Convert quaternion to rotation matrix.
+    
+    Args:
+        q (np.array): Quaternion [x, y, z, w].
+        
+    Returns:
+        np.array: 3x3 rotation matrix.
+    """
+    x, y, z, w = q
+    
+    R = np.array([
+        [1 - 2*y*y - 2*z*z,     2*x*y - 2*w*z,     2*x*z + 2*w*y],
+        [    2*x*y + 2*w*z, 1 - 2*x*x - 2*z*z,     2*y*z - 2*w*x],
+        [    2*x*z - 2*w*y,     2*y*z + 2*w*x, 1 - 2*x*x - 2*y*y]
+    ])
+    
+    return R
+
 
 def assign_joint_weights(jacobian_linear, jacobian_angular):
     """
@@ -317,64 +455,50 @@ def assign_joint_weights(jacobian_linear, jacobian_angular):
 
     return linear_weights, angular_weights
 
-def compute_weighted_joint_rewards(joint_errors, linear_weights, angular_weights, overall_reward):
+def compute_weighted_joint_rewards(joint_errors, linear_weights, angular_weights, progress_reward):
     """
-    Enhanced joint reward calculation with debugging and minimum values.
+    Compute weighted joint rewards based on joint errors and movement weights.
+
+    Args:
+        joint_errors (list): List of errors for each joint.
+        linear_weights (np.array): Linear movement weights for joints.
+        angular_weights (np.array): Angular movement weights for joints.
+        progress_reward (float): Reward based on progress towards the target.
+
+    Returns:
+        np.array: Array of individual joint rewards.
     """
-    epsilon = 1e-6
+    # Combine linear and angular weights
+    combined_weights = linear_weights + angular_weights
+    combined_weights /= np.sum(combined_weights) + 1e-8  # Normalize weights
+
+    # Inverse of joint errors to reward lower errors more
+    inverse_errors = 1.0 / (np.array(joint_errors) + 1e-6)
+    normalized_inverse_errors = inverse_errors / (np.sum(inverse_errors) + 1e-8)
+
     
-    # Print debug information
-    #print("Debug - Joint Errors:", joint_errors)
-    #print("Debug - Overall Reward:", overall_reward)
-    
-    # Ensure joint errors aren't zero
-    joint_errors = np.array(joint_errors)
-    joint_errors = np.maximum(np.abs(joint_errors), epsilon)
-    
-    # Calculate error norm with minimum value
-    joint_error_norms = max(np.linalg.norm(joint_errors), epsilon)
-    normalized_joint_errors = joint_errors / joint_error_norms
-    
-    #print("Debug - Normalized Joint Errors:", normalized_joint_errors)
-    
-    # Combine weights with minimum values
-    combined_weights = np.maximum(linear_weights + angular_weights, epsilon)
-    
-    # Calculate rewards with minimum value
-    joint_rewards = overall_reward * combined_weights * normalized_joint_errors*10
-    
-    # Ensure at least some small reward/penalty
-    joint_rewards = np.where(joint_rewards == 0, 
-                           np.sign(overall_reward) * epsilon,
-                           joint_rewards)
-    
-    #print("Debug - Final Joint Rewards:", joint_rewards)
-    
+    # Calculate joint rewards proportional to progress and weights
+    joint_rewards = progress_reward * combined_weights * normalized_inverse_errors
+
     return joint_rewards
 
-def compute_shaped_distance(distance, begin_distance, max_distance=1.0):
-    """
-    Shapes the distance metric using a smoothed normalization.
-    
-    Args:
-        distance (float): Current distance to target
-        begin_distance (float): Initial distance to target
-        max_distance (float): Maximum expected distance for normalization
-    
-    Returns:
-        float: Shaped distance metric between 0 and 1
-    """
-    # Normalize distances to [0,1] range with smooth clipping
-    norm_dist = np.clip(distance / max_distance, 0, 1)
-    norm_begin = np.clip(begin_distance / max_distance, 0, 1)
-    
-    # Apply smooth shaping function
-    shaped_dist = 1 - np.exp(-2 * norm_dist)
-    shaped_begin = 1 - np.exp(-2 * norm_begin)
-    
-    return shaped_dist, shaped_begin
 
-def compute_progress_reward(shaped_dist, shaped_begin, scale=1000.0):
+def compute_shaped_distance(distance, begin_distance):
+    """
+    Shape the distance metrics to enhance sensitivity near the target.
+
+    Args:
+        distance (float): Current distance to the target.
+        begin_distance (float): Initial distance to the target.
+
+    Returns:
+        tuple: (shaped_distance, shaped_begin_distance)
+    """
+    shaped_distance = np.log(distance + 1e-6)
+    shaped_begin_distance = np.log(begin_distance + 1e-6)
+    return shaped_distance, shaped_begin_distance
+
+def compute_progress_reward(shaped_dist, shaped_begin, scale=1.0):
     """
     Computes reward based on progress toward the goal.
     
@@ -397,19 +521,38 @@ def compute_progress_reward(shaped_dist, shaped_begin, scale=1000.0):
     
     return reward
 
-def compute_orientation_bonus(quaternion_distance, max_angle=np.pi):
+
+def compute_orientation_bonus(quaternion_distance):
     """
-    Computes additional reward for good orientation alignment.
-    
+    Compute the orientation bonus based on quaternion distance.
+
     Args:
-        quaternion_distance (float): Angular distance between current and target orientation
-        max_angle (float): Maximum expected angular distance
-    
+        quaternion_distance (float): Distance between current and target orientations.
+
     Returns:
-        float: Orientation bonus reward
+        float: Orientation bonus.
     """
-    # Normalize and shape the orientation reward
-    norm_angle = np.clip(quaternion_distance / max_angle, 0, 1)
-    orientation_bonus = np.exp(-3 * norm_angle) - 0.05
-    return max(orientation_bonus, 0) 
+    orientation_bonus = np.exp(-quaternion_distance)
+    return orientation_bonus
+
+def inverse_scaled_rewards(scaled_rewards, epsilon=1e-6):
+    """
+    Compute the inverse of scaled rewards, avoiding division by zero.
+
+    Args:
+        scaled_rewards (list): Scaled rewards to invert.
+        epsilon (float): Small value to avoid division by zero.
+
+    Returns:
+        list: Inverse of the scaled rewards.
+    """
+    inverse_rewards = []
+    for reward in scaled_rewards:
+        if reward == 0:
+            inverse_rewards.append(1 / epsilon)  # Avoid division by zero
+        else:
+            inverse_rewards.append(1 / reward)
+    return inverse_rewards
+
+
 

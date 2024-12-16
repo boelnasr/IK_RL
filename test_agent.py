@@ -99,7 +99,7 @@ def test_best_agents(agent, env, num_episodes=10, max_steps=1000):
         success_rate = success_count / (env.num_joints * step)
         results['success_rate'].append(success_rate)
 
-        logging.info(f"Test Episode {episode+1} - Mean Joint Error: {mean_joint_error}, Success Rate: {success_rate:.2f}")
+        print(f"Test Episode {episode+1} - Mean Joint Error: {mean_joint_error}, Success Rate: {success_rate:.2f}")
 
     # Convert results lists to numpy arrays
     for key in results:
@@ -130,18 +130,18 @@ def main():
     load_best_agents(agent, base_path=base_path)
 
     # Test the best agents and collect results
-    test_results = test_best_agents(agent, env, num_episodes=10, max_steps=1000)
+    test_results = test_best_agents(agent, env, num_episodes=100, max_steps=1000)
 
     # Display the results
     for key, values in test_results.items():
-        logging.info(f"{key}: {values}")
+        logging.info(f"{key}: {values}")   
 
     # Calculate average success rate and joint error across all episodes
     avg_success_rate = np.mean(test_results['success_rate'], axis=0)
     avg_joint_error = np.mean(test_results['mean_joint_errors'], axis=0)
 
-    logging.info(f"Average Success Rate per Joint: {avg_success_rate}")
-    logging.info(f"Average Joint Error per Joint: {avg_joint_error}")
+    print(f"Average Success Rate per Joint: {avg_success_rate}")
+    print(f"Average Joint Error per Joint: {avg_joint_error}")
 
 if __name__ == "__main__":
     main()

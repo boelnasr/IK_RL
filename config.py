@@ -7,32 +7,32 @@ logging.basicConfig(filename='training.log', level=logging.INFO,
 
 # Configuration dictionary
 config = {
-    'robot_name': 'ur5',#'kuka_iiwa',             # Robot model to be used
+    'robot_name': 'xarm',             # Robot model to be used
     'hidden_dim': 256,                     # Hidden layer dimension for the actor-critic network
     'lr': 1e-4,                            # Global default learning rate
     'gamma': 0.99,                         # Discount factor for rewards
     'tau': 0.95,                           # GAE parameter for advantage estimation
-    'clip_param': 0.2,                     # Global default PPO clip parameter
-    'ppo_epochs': 15,                      # Number of PPO epochs per update
-    'batch_size': 128,                      # Batch size for training
+    'clip_param': 0.3,                     # Global default PPO clip parameter
+    'ppo_epochs': 20,                      # Number of PPO epochs per update
+    'batch_size': 64,                      # Batch size for training
     'buffer_size': 4096,                   # Size of the replay buffer
-    'initial_epsilon': 1.0,
+    'initial_epsilon': 0.20,
     'epsilon_decay': 0.999,
     'min_epsilon':0.01,
-    'num_episodes': 1000,                  # Number of episodes to train
-    'max_steps_per_episode':5000,          # Maximum number of steps per episode
+    'num_episodes': 200,                  # Number of episodes to train
+    'max_steps_per_episode':1000,       # Maximum number of steps per episode
 
     'test_agent_after_training': True,     #  Whether to test the agent after training
-    'num_tests': 15,                        # Number of test episodes to run after training
-
+    'num_tests': 10,                        # Number of test episodes to run after training
+    'use_cross_validation' : True,
     # Per-joint learning rates (optional, fall back to global 'lr' if not provided)
-    'lr_joint_0': 1e-4,                    # Learning rate for joint 0
-    'lr_joint_1': 1e-4,                    # Learning rate for joint 1
-    'lr_joint_2': 1e-4,                    # Learning rate for joint 2
-    'lr_joint_3': 1e-4,                    # Learning rate for joint 3
-    'lr_joint_4': 1e-4,                    # Learning rate for joint 4
-    'lr_joint_5': 1e-4,                    # Learning rate for joint 5
-    'lr_joint_6': 1e-4,                    # Learning rate for joint 6
+    'lr_joint_0': 3e-4,                    # Learning rate for joint 0
+    'lr_joint_1': 3e-4,                    # Learning rate for joint 1
+    'lr_joint_2': 3e-4,                    # Learning rate for joint 2
+    'lr_joint_3': 3e-4,                    # Learning rate for joint 3
+    'lr_joint_4': 3e-4,                    # Learning rate for joint 4
+    'lr_joint_5': 3e-4,                    # Learning rate for joint 5
+    'lr_joint_6': 3e-4,                    # Learning rate for joint 6
 
     # Per-joint PPO clip parameters (optional, fall back to global 'clip_param' if not provided)
     'clip_joint_0': 0.2,                   # PPO clip parameter for joint 0
@@ -41,7 +41,21 @@ config = {
     'clip_joint_3': 0.2,                   # PPO clip parameter for joint 3
     'clip_joint_4': 0.2,                   # PPO clip parameter for joint 4
     'clip_joint_5': 0.2,                   # PPO clip parameter for joint 5
-    'clip_joint_6': 0.2                    # PPO clip parameter for joint 6
+    'clip_joint_6': 0.2,                    # PPO clip parameter for joint 6
+    # Your existing config parameters
+    'value_loss_scale': 0.5,     # Scales critic loss
+    'entropy_scale': 0.01,       # Scales entropy bonus
+    'max_grad_norm': 0.5,        # Maximum gradient norm
+    'ratio_clip': 10.0,          # Maximum policy ratio
+    'advantage_clip': 4.0,       # Maximum advantage value
+    'use_scheduler': True,     # Whether to use a learning rate scheduler
+    #GPU config
+    'num_envs': 4,              # Number of parallel environments
+    'world_size': 1,            # Number of GPUs (1 for single GPU)
+    'rank': 0,                  # GPU rank (0 for single GPU)
+    #Cross validation config
+    'validation_episodes': 10,
+    'k_folds': 3
 }
 attention_config = {
     'num_heads': 4,               # Number of attention heads

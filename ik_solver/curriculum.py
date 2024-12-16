@@ -54,3 +54,7 @@ class CurriculumManager:
             float: The current difficulty level.
         """
         return self.current_difficulty
+
+
+
+
