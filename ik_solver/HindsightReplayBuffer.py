@@ -214,35 +214,57 @@ class HindsightReplayBuffer:
     
 
     def _extract_desired_goal(self, state, info):
-        """Extract desired goal from state/info with detailed fallback."""
-        desired_goal = None
+        """Extract desired goal with multiple fallback options."""
+        try:
+            # Primary method: direct desired_goal from info
+            if info and 'desired_goal' in info:
+                goal = info['desired_goal']
+                if isinstance(goal, dict) and 'position' in goal and 'orientation' in goal:
+                    return np.concatenate([
+                        np.array(goal['position']),
+                        np.array(goal['orientation'])
+                    ])
 
-        # Attempt extraction from known fields in info and state
-        if info and 'desired_goal' in info:
-            desired_goal = info['desired_goal']
-        elif 'target_position' in info:
-            desired_goal = np.concatenate([
-                info['target_position'],
-                info.get('target_orientation', np.zeros(3))
-            ])
-        elif isinstance(state, dict) and 'target_joint_angles' in state:
-            desired_goal = state['target_joint_angles'].flatten()
-        
-        # Fallback using position and orientation errors if specific goal fields are missing
-        if desired_goal is None and 'position_error' in info and 'orientation_error' in info:
-            #print("Fallback activated: Using position and orientation error as desired goal")
-            desired_goal = np.concatenate([
-                np.array(info['position_error']).flatten(),
-                np.array(info['orientation_error']).flatten()
-            ])
-        
-        # Raise an error if extraction fails even with fallback
-        if desired_goal is None:
-            print("State Contents:", state)
-            print("Info Contents:", info)
+            # Secondary method: separate target fields
+            if info and 'target_position' in info and 'target_orientation' in info:
+                return np.concatenate([
+                    np.array(info['target_position']),
+                    np.array(info['target_orientation'])
+                ])
+
+            # Tertiary method: from state dictionary
+            if isinstance(state, dict):
+                if 'target_pose' in state:
+                    target = state['target_pose']
+                    return np.concatenate([
+                        np.array(target['position']),
+                        np.array(target['orientation'])
+                    ])
+                elif 'target_position' in state and 'target_orientation' in state:
+                    return np.concatenate([
+                        np.array(state['target_position']),
+                        np.array(state['target_orientation'])
+                    ])
+
+            # Final fallback: use errors to reconstruct goal
+            if info and 'position_error' in info and 'orientation_error' in info:
+                return np.concatenate([
+                    np.array(info['position_error']),
+                    np.array(info['orientation_error'])
+                ])
+
+            # If we get here, log the contents and raise error
+            print("Failed to extract goal from:")
+            print("State:", state)
+            print("Info:", info)
             raise ValueError("Could not extract desired goal from state/info")
 
-        return desired_goal
+        except Exception as e:
+            print(f"Error in goal extraction: {str(e)}")
+            print("State:", state)
+            print("Info:", info)
+            raise
+
 
     def extract_achieved_goal(self, state, info):
         """Extract achieved goal from state/info"""

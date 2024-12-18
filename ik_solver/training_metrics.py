@@ -35,8 +35,10 @@ class TrainingMetrics:
             'actor_loss': [],
             'critic_loss': [],
             'advantages': [],
-            'policy_loss': []
+            'policy_loss': [],
+            'overall_actor_loss': []
         }
+        
 
         # Additional attributes for tracking
         self.episode_rewards = []
@@ -75,24 +77,34 @@ class TrainingMetrics:
         self.color_palette = plt.cm.get_cmap('tab10')  # For discrete data
         self.sequential_palette = plt.cm.get_cmap('viridis')  # For gradients
 
-    def log_episode(self, joint_errors: List[List[float]], rewards: List[List[float]], success: List[bool],
-                    entropy: float, actor_loss: float, critic_loss: float, policy_loss: List[float],
-                    advantages: List[float],
-                    env: Any, success_threshold: float) -> None:
+
+    def log_episode(self, 
+                    joint_errors: List[List[float]], 
+                    rewards: List[List[float]], 
+                    success: List[bool],
+                    entropy: float, 
+                    actor_loss: float, 
+                    critic_loss: float, 
+                    policy_loss: List[float],
+                    advantages: np.ndarray, 
+                    actor_loss_per_actor: List[float],
+                    env: Any, 
+                    success_threshold: float) -> None:
         """
         Log comprehensive metrics for a single episode.
 
         Args:
-            joint_errors: List of joint errors over time.
-            rewards: List of rewards per time step per agent for the episode.
-            success: Success status per agent.
-            entropy: Policy entropy value.
-            actor_loss: Actor network loss.
-            critic_loss: Critic network loss.
-            policy_loss: List of policy losses per agent.
-            advantages: List of advantages calculated during the episode.
+            joint_errors: List of joint errors over time (time_steps x num_agents).
+            rewards: List of rewards per time step per agent for the episode (time_steps x num_agents).
+            success: Success status per agent (num_agents, boolean values).
+            entropy: Policy entropy value (float).
+            actor_loss: Overall actor network loss (scalar float).
+            critic_loss: Critic network loss (scalar float).
+            policy_loss: List of policy losses per agent (length = num_agents).
+            advantages: Numpy array of advantages calculated during the episode (time_steps,).
+            actor_loss_per_actor: List of actor losses per agent (length = num_agents, each a float).
             env: Environment instance for additional metrics.
-            success_threshold: Threshold for determining success in the episode.
+            success_threshold: Threshold for determining success in the episode (float).
         """
         try:
             # Convert inputs to numpy arrays for consistency
@@ -114,11 +126,9 @@ class TrainingMetrics:
 
             # Calculate per-agent total rewards
             total_rewards_per_agent = np.sum(rewards, axis=0)  # Shape: (num_agents,)
-
-            # Ensure total_rewards_per_agent is 1D
             total_rewards_per_agent = np.atleast_1d(total_rewards_per_agent)
 
-            # Calculate episode statistics
+            # Construct the episode_data dictionary
             episode_data = {
                 'joint_errors': {
                     'mean': np.mean(joint_errors, axis=0).tolist(),
@@ -135,19 +145,22 @@ class TrainingMetrics:
                 'success': success.tolist(),
                 'success_rate': float(np.mean(success)),
                 'entropy': float(entropy),
-                'actor_loss': float(actor_loss),
+                'overall_actor_loss': float(actor_loss),  # Make sure this is present
                 'critic_loss': float(critic_loss),
-                'policy_loss': policy_loss,
+                'policy_loss': policy_loss,               # List of floats, one per agent
                 'advantages': advantages.tolist(),
                 'episode_length': int(joint_errors.shape[0]),
-                'success_threshold': float(success_threshold)
+                'success_threshold': float(success_threshold),
+                'actor_loss_per_actor': actor_loss_per_actor  # List of per-actor losses
             }
 
-            # Add to logs
+            # Add the episode data to logs
             self.logs.append(episode_data)
 
-            # Update metrics and track success per joint
+            # Update the running episode metrics
             self._update_episode_metrics(episode_data)
+
+            # Update other tracked variables
             self.episode_rewards.append(np.sum(total_rewards_per_agent))
             self.successes.append(np.any(success))
             self.policy_losses.append(np.mean(policy_loss))
@@ -158,22 +171,25 @@ class TrainingMetrics:
 
             # Update cumulative rewards
             cumulative_reward = (np.sum(total_rewards_per_agent)
-                                if not self.cumulative_rewards else
-                                self.cumulative_rewards[-1] + np.sum(total_rewards_per_agent))
+                                if not self.cumulative_rewards 
+                                else self.cumulative_rewards[-1] + np.sum(total_rewards_per_agent))
             self.cumulative_rewards.append(cumulative_reward)
             self.training_episodes += 1
 
+            # Track success per joint
             for joint_idx, joint_success in enumerate(success):
                 self.joint_successes[joint_idx].append(joint_success)
 
-            # Check for convergence
+            # Check for convergence if enough episodes have passed
             if not self.converged and len(self.successes) >= 100:
                 recent_success_rate = np.mean(self.successes[-100:])
                 if recent_success_rate >= self.convergence_threshold:
                     self.converged = True
                     self.episodes_to_converge = self.training_episodes
-                    self.logger.info(f"Convergence achieved at episode {self.training_episodes} "
-                                    f"with success rate {recent_success_rate:.4f}")
+                    self.logger.info(
+                        f"Convergence achieved at episode {self.training_episodes} "
+                        f"with success rate {recent_success_rate:.4f}"
+                    )
 
             # Log episode details including the success threshold
             self.logger.info(
@@ -194,10 +210,14 @@ class TrainingMetrics:
         self.episode_metrics['rewards'].append(episode_data['rewards']['total'])
         self.episode_metrics['success_rates'].append(episode_data['success_rate'])
         self.episode_metrics['entropy'].append(episode_data['entropy'])
-        self.episode_metrics['actor_loss'].append(episode_data['actor_loss'])
+        # Append per-actor losses (list of floats, one per agent)
+        self.episode_metrics['actor_loss'].append(episode_data['actor_loss_per_actor'])
+        # Append overall actor loss (single float)
+        self.episode_metrics['overall_actor_loss'].append(episode_data['overall_actor_loss'])
         self.episode_metrics['critic_loss'].append(episode_data['critic_loss'])
         self.episode_metrics['policy_loss'].append(episode_data['policy_loss'])
         self.episode_metrics['advantages'].append(episode_data['advantages'])
+
 
     def calculate_metrics(self, env: Any) -> Dict:
         """
@@ -217,39 +237,29 @@ class TrainingMetrics:
             num_episodes = len(self.logs)
             num_agents = self.num_joints
             
-            # Calculate per-agent rewards properly
+            # Extract total rewards per agent for each episode
             total_rewards_per_agent = np.array([log['rewards']['total'] for log in self.logs])  # Shape: (episodes, num_agents)
-            
-            # Ensure total_rewards_per_agent is 2D
             if total_rewards_per_agent.ndim == 1:
                 total_rewards_per_agent = total_rewards_per_agent.reshape(-1, 1)
-            
-            # Initialize arrays for cumulative rewards
+                
+            # Per-agent cumulative rewards
             cumulative_rewards_per_agent = np.zeros((num_agents, num_episodes))
             mean_episode_rewards_per_agent = total_rewards_per_agent.T  # Shape: (num_agents, episodes)
-            
-            # Calculate cumulative rewards per agent properly
             for agent_idx in range(num_agents):
                 cumulative_rewards_per_agent[agent_idx] = np.cumsum(total_rewards_per_agent[:, agent_idx])
 
-            # Calculate success metrics
+            # Extract success data
             agent_success = np.array([log['success'] for log in self.logs])  # Shape: (episodes, num_agents)
-            
-            # Ensure agent_success is 2D
             if agent_success.ndim == 1:
                 agent_success = agent_success.reshape(-1, 1)
             
             cumulative_success_per_agent = np.zeros((num_agents, num_episodes))
             success_rate_per_agent = np.zeros((num_agents, num_episodes))
-            
-            # Calculate cumulative success and success rate per agent
             for agent_idx in range(num_agents):
                 cumulative_success_per_agent[agent_idx] = np.cumsum(agent_success[:, agent_idx])
                 success_rate_per_agent[agent_idx] = cumulative_success_per_agent[agent_idx] / np.arange(1, num_episodes + 1)
 
-            # Calculate overall metrics
             overall_success_rate = np.mean(self.successes)
-            policy_loss_per_agent = np.array(self.episode_metrics['policy_loss'])
             average_cumulative_reward = np.mean([cum_rew[-1] for cum_rew in cumulative_rewards_per_agent])
             average_policy_loss = np.mean(self.policy_losses)
             average_joint_error = np.mean(self.joint_errors)
@@ -260,13 +270,29 @@ class TrainingMetrics:
                 for joint_idx in range(num_agents)
             }
 
+            # Convert stored metrics into arrays
+            # policy_loss is a list of lists, each inner list corresponds to a single episode
+            policy_loss_per_agent = np.array(self.episode_metrics['policy_loss'])   # Shape: (episodes, num_agents)
+            actor_loss_per_agent = np.array(self.episode_metrics['actor_loss'])     # Shape: (episodes, num_agents)
+            overall_actor_loss_array = np.array(self.episode_metrics['overall_actor_loss'])  # Shape: (episodes,)
+            critic_loss_array = np.array(self.episode_metrics['critic_loss'])       # Shape: (episodes,)
+
+            # Compute mean actor loss per episode (averaged over agents)
+            actor_loss_array = np.array([np.mean(al) for al in actor_loss_per_agent])
+
+            # Extract joint error statistics
+            joint_errors_mean = np.array([log['joint_errors']['mean'] for log in self.logs])
+            joint_errors_max = np.array([log['joint_errors']['max'] for log in self.logs])
+            joint_errors_min = np.array([log['joint_errors']['min'] for log in self.logs])
+            joint_errors_std = np.array([log['joint_errors']['std'] for log in self.logs])
+
             # Compile all metrics into a structured dictionary
             metrics = {
                 'joint_errors': {
-                    'mean': np.array([log['joint_errors']['mean'] for log in self.logs]),
-                    'max': np.array([log['joint_errors']['max'] for log in self.logs]),
-                    'min': np.array([log['joint_errors']['min'] for log in self.logs]),
-                    'std': np.array([log['joint_errors']['std'] for log in self.logs])
+                    'mean': joint_errors_mean,
+                    'max': joint_errors_max,
+                    'min': joint_errors_min,
+                    'std': joint_errors_std
                 },
                 'rewards': {
                     'mean': np.array([log['rewards']['mean'] for log in self.logs]),
@@ -288,15 +314,18 @@ class TrainingMetrics:
                 },
                 'training': {
                     'entropy': np.array(self.episode_metrics['entropy']),
-                    'actor_loss': np.array(self.episode_metrics['actor_loss']),
-                    'critic_loss': np.array(self.episode_metrics['critic_loss']),
-                    'policy_loss': np.mean(policy_loss_per_agent, axis=1)
+                    'actor_loss': actor_loss_array,          # Mean per-actor loss
+                    'overall_actor_loss': overall_actor_loss_array,  # Overall actor loss
+                    'critic_loss': critic_loss_array,
+                    'policy_loss': np.mean(policy_loss_per_agent, axis=1),
+                    # 'advantages': np.array(self.episode_metrics['advantages'])
                 },
                 'agent_success': agent_success,
                 'cumulative_rewards_per_agent': cumulative_rewards_per_agent,
                 'mean_episode_rewards_per_agent': mean_episode_rewards_per_agent,
                 'success_rate_per_agent': success_rate_per_agent,
                 'policy_loss_per_agent': policy_loss_per_agent.T,
+                'actor_loss_per_agent': actor_loss_per_agent.T,
                 'average_cumulative_reward': average_cumulative_reward,
                 'average_policy_loss': average_policy_loss,
                 'average_joint_error': average_joint_error,
@@ -309,19 +338,17 @@ class TrainingMetrics:
                 }
             }
 
-            # Calculate moving averages if enough episodes
+            # Compute moving averages if enough episodes
             window = min(10, num_episodes // 10)
             if window > 0:
                 metrics['moving_averages'] = {
                     'reward': self._compute_moving_average(metrics['rewards']['average_per_episode'], window),
-                    'success_rate': self._compute_moving_average(metrics['success_rate']['per_episode'], window)
+                    'success_rate': self._compute_moving_average(metrics['success_rate']['per_episode'], window),
+                    'per_agent_rewards': np.array([
+                        self._compute_moving_average(mean_episode_rewards_per_agent[i], window)
+                        for i in range(num_agents)
+                    ])
                 }
-
-                # Add per-agent moving averages
-                metrics['moving_averages']['per_agent_rewards'] = np.array([
-                    self._compute_moving_average(mean_episode_rewards_per_agent[i], window)
-                    for i in range(num_agents)
-                ])
 
             # Add training stability metrics
             if len(self.actor_losses) > 1:
@@ -335,11 +362,10 @@ class TrainingMetrics:
 
             self.logger.info("Metrics calculated successfully")
             return metrics
-                
+
         except Exception as e:
             self.logger.error(f"Error calculating metrics: {str(e)}")
             raise
-
 
     def _compute_moving_average(self, data: np.ndarray, window: int) -> np.ndarray:
         """Compute moving average with the specified window size."""
@@ -403,6 +429,9 @@ class TrainingMetrics:
     def plot_metrics(self, metrics: Dict, env: Any, show_plots: bool = True) -> None:
         """Create and save all plots."""
         try:
+            print("Rewards mean:", metrics['rewards']['mean'])
+            print("Per-agent mean rewards:", metrics['rewards']['per_agent_mean'])
+
             self._plot_joint_metrics(metrics, env, show_plots)
             self._plot_per_joint_cumulative_rewards(metrics, env, show_plots)
             self._plot_training_metrics(metrics, show_plots)
@@ -417,13 +446,15 @@ class TrainingMetrics:
             self._plot_normalized_reward(metrics, show_plots)
             self._plot_normalized_reward_per_agent(metrics, show_plots)
             self._plot_normalized_cumulative_reward_per_agent(metrics, show_plots)
-            self._plot_advantages(metrics, show_plots)
+            # self._plot_advantages(metrics, show_plots)
             self._plot_value_loss(metrics, show_plots)
             self._plot_convergence(metrics, show_plots)  # Added convergence plot
             self._plot_reward_std_over_time(metrics, show_plots)
             self._plot_reward_std_per_agent(metrics, show_plots)
             self.plot_joint_error_convergence(metrics, show_plots,num_joints=self.num_joints)
             self._plot_entropy(metrics, show_plots)
+            self._plot_actor_loss_per_actor(metrics, show_plots)
+
 
             self.logger.info("All plots generated and saved successfully")
             
@@ -805,7 +836,7 @@ class TrainingMetrics:
             ax = axes[joint_idx]
             joint_rewards = mean_episode_rewards_per_agent[joint_idx]
             # Clip rewards to a reasonable range
-            joint_rewards = np.clip(joint_rewards, -10, 300)
+            joint_rewards = np.clip(joint_rewards, -10, 1200)
 
             # Plot raw data
             ax.plot(episodes, joint_rewards, label=f'Joint {joint_idx + 1} Mean Reward', 
@@ -1485,13 +1516,14 @@ class TrainingMetrics:
             fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
             ax.plot(episodes, mean_advantages, label='Mean Advantage', color='tab:blue', linewidth=1.5)
             ax.fill_between(
-                episodes,
-                mean_advantages - std_advantages,
-                mean_advantages + std_advantages,
-                alpha=0.3,
-                color='tab:blue',
-                label='Std Deviation'
-            )
+            episodes,
+            mean_advantages - std_advantages,
+            mean_advantages + std_advantages,
+            alpha=0.3,
+            color='tab:blue',
+            label='Std Deviation'
+        )
+
 
             # Apply moving average smoothing
             window = max(1, len(episodes) // 50)
@@ -1674,3 +1706,83 @@ class TrainingMetrics:
         except Exception as e:
             self.logger.warning(f"Error in clip_rewards: {str(e)}. Returning unclipped rewards.")
             return rewards
+        
+    def _plot_actor_loss_per_actor(self, metrics: Dict, show_plots: bool) -> None:
+        """Plot actor loss per agent over episodes with enhanced styling and robust handling."""
+        try:
+            actor_loss_per_agent = metrics.get('actor_loss_per_agent', None)
+            if actor_loss_per_agent is None:
+                self.logger.warning("No actor_loss_per_agent data found in metrics. Skipping plot.")
+                return
+
+            num_agents, num_episodes = actor_loss_per_agent.shape
+            episodes = np.arange(1, num_episodes + 1)
+
+            if num_agents == 0 or num_episodes == 0:
+                self.logger.warning("No actor loss data available for agents.")
+                return
+
+            # Determine subplot grid dimensions
+            ncols = 2 if num_agents > 1 else 1
+            nrows = (num_agents + 1) // 2
+
+            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10 * ncols, 3 * nrows), dpi=300)
+            axes = np.atleast_1d(axes).flatten()
+
+            # Plot for each agent
+            for agent_idx in range(num_agents):
+                ax = axes[agent_idx]
+                raw_data = actor_loss_per_agent[agent_idx]
+                # Clip data to a reasonable range if desired
+                raw_data = np.clip(raw_data, -5, 10)
+                ax.plot(episodes, raw_data, label='Raw Data', color='tab:orange', alpha=0.3, linewidth=1)
+
+                # Add different smoothing levels
+                windows = [5, 20, 50]
+                colors = ['tab:red', 'tab:blue', 'tab:green']
+                for window, color in zip(windows, colors):
+                    if len(episodes) > window:
+                        alpha_val = 2 / (window + 1)
+                        smoothed = np.zeros_like(raw_data)
+                        smoothed[0] = raw_data[0]
+                        for i in range(1, len(raw_data)):
+                            smoothed[i] = alpha_val * raw_data[i] + (1 - alpha_val) * smoothed[i-1]
+
+                        ax.plot(episodes, smoothed, label=f'EMA (window={window})', color=color, linewidth=2)
+
+                # Add trend line
+                if len(raw_data) > 1:
+                    z = np.polyfit(episodes, raw_data, 1)
+                    p = np.poly1d(z)
+                    ax.plot(episodes, p(episodes), '--', color='tab:purple', label='Trend', linewidth=2)
+
+                # Calculate and display statistics
+                stats_text = (
+                    f'Mean: {np.mean(raw_data):.4f}\n'
+                    f'Std: {np.std(raw_data):.4f}\n'
+                    f'Min: {np.min(raw_data):.4f}\n'
+                    f'Max: {np.max(raw_data):.4f}'
+                )
+                ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8), fontsize=10)
+
+                ax.set_xlabel('Episodes', fontsize=12)
+                ax.set_ylabel('Actor Loss', fontsize=12)
+                ax.set_title(f'Agent {agent_idx + 1} Actor Loss Over Time', fontsize=14)
+                ax.grid(True, alpha=0.3)
+                ax.legend(loc='upper right', fontsize=10)
+
+            # Hide unused subplots
+            for ax in axes[num_agents:]:
+                ax.axis('off')
+
+            plt.tight_layout()
+            self.save_figure(fig, 'actor_loss_per_agent_smoothed')
+            self.logger.info("Smoothed actor loss per agent plot saved successfully.")
+            if show_plots:
+                plt.show()
+            plt.close(fig)
+
+        except Exception as e:
+            self.logger.error(f"Error plotting actor loss per agent: {str(e)}")
+            raise

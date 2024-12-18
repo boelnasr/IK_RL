@@ -192,7 +192,6 @@ def compute_overall_distance(current_position, target_position, current_orientat
 #     # Return individual joint rewards along with other values
 #     return reward, joint_rewards, prev_best, success
 
-
 def compute_reward(
     distance: float,
     begin_distance: float,
@@ -202,6 +201,7 @@ def compute_reward(
     joint_errors: List[float],
     linear_weights: List[float],
     angular_weights: List[float],
+    curriculum_manager: object,
     episode_number: int,
     total_episodes: int,
     success_threshold: float = 0.01,
@@ -211,32 +211,11 @@ def compute_reward(
     exploration_bonus: float = 0.1
 ) -> Tuple[np.ndarray, List[float], float, bool]:
     """
-        Computes the reward for an inverse kinematics (IK) task, taking into account various factors such as distance, orientation, joint errors, and exploration.
-        
-        Args:
-            distance (float): The current distance between the end-effector and the target position.
-            begin_distance (float): The initial distance between the end-effector and the target position.
-            prev_best (float): The previous best distance achieved.
-            current_orientation (np.ndarray): The current orientation of the end-effector.
-            target_orientation (np.ndarray): The target orientation of the end-effector.
-            joint_errors (List[float]): The errors between the current and target joint angles.
-            linear_weights (List[float]): The weights for the linear joints.
-            angular_weights (List[float]): The weights for the angular joints.
-            episode_number (int): The current episode number.
-            total_episodes (int): The total number of episodes.
-            success_threshold (float, optional): The threshold for considering the task successful. Defaults to 0.006.
-            time_penalty (float, optional): The penalty per timestep to encourage efficiency. Defaults to -0.1.
-            smoothing_window (int, optional): The window size for smoothing the joint error history. Defaults to 10.
-            curriculum_factor (float, optional): The factor for the curriculum learning progress. Defaults to 0.5.
-            exploration_bonus (float, optional): The factor for the exploration bonus. Defaults to 0.1.
-        
-        Returns:
-            Tuple[np.ndarray, List[float], float, bool]: A tuple containing:
-                - final_rewards: A numpy array of shape (num_joints,) containing the individual joint rewards.
-                - joint_specific_rewards: A list of detailed rewards for each joint.
-                - new_best: The updated best performance.
-                - success: A boolean indicating whether the success threshold was reached.
-        """
+    Computes the reward for an inverse kinematics (IK) task for multiple agents/joints,
+    taking into account various factors such as distance, orientation, joint errors,
+    and exploration. Uses agent-specific difficulties from curriculum_manager.
+    """
+
     # Constants for reward bounds and scaling factors
     MAX_REWARD = 15.0
     MIN_REWARD = -5.0
@@ -244,36 +223,37 @@ def compute_reward(
     ORIENTATION_SCALE = 0.4
     IMPROVEMENT_SCALE = 0.3
     ERROR_PENALTY_SCALE = 0.2
-    SUCCESS_BONUS_BASE = 100
     NOVELTY_BASE = 0.5
 
-    # Initialize storage
+    num_joints = len(joint_errors)
+
+    # Initialize storage if not present
     if not hasattr(compute_reward, 'distance_history'):
         compute_reward.distance_history = deque(maxlen=smoothing_window)
         compute_reward.state_visits = {}
         compute_reward.min_distance = float('inf')
-        compute_reward.joint_histories = [deque(maxlen=smoothing_window) for _ in range(len(joint_errors))]
-        compute_reward.prev_joint_errors = [float('inf')] * len(joint_errors)
+        compute_reward.joint_histories = [deque(maxlen=smoothing_window) for _ in range(num_joints)]
+        compute_reward.prev_joint_errors = [float('inf')] * num_joints
 
-    # Update histories
+    # Update minimum distance and history
     compute_reward.min_distance = min(compute_reward.min_distance, distance)
     compute_reward.distance_history.append(distance)
-    curriculum_progress = np.clip((episode_number / total_episodes) ** curriculum_factor, 0.0, 1.0)
-    task_difficulty = 0.2 + 0.3 * curriculum_progress
 
     # Normalize metrics
     norm_distance = distance / (begin_distance + 1e-8)
     orientation_diff = compute_quaternion_distance(current_orientation, target_orientation)
     norm_quaternion_distance = orientation_diff / np.pi
 
-    num_joints = len(joint_errors)
+    joint_errors = np.array(joint_errors)
     joint_specific_rewards = []
     final_rewards = np.zeros(num_joints)
-    joint_errors = np.array(joint_errors)
 
-    # Calculate rewards for each joint
+    # Calculate per-agent rewards
     for i in range(num_joints):
-        # Update joint history
+        # Retrieve agent-specific difficulty
+        agent_difficulty = curriculum_manager.get_agent_difficulty(i)
+
+        # Update joint error history and improvement calculation
         compute_reward.joint_histories[i].append(joint_errors[i])
         smoothed_error = max(np.median(list(compute_reward.joint_histories[i])), 1e-6)
         prev_error = max(compute_reward.prev_joint_errors[i], 1e-6)
@@ -281,14 +261,16 @@ def compute_reward(
             improvement = 0  # Default value for invalid improvement
         else:
             improvement = np.clip((prev_error - smoothed_error) / (prev_error + 1e-8), -1.0, 1.0)
+        
         compute_reward.prev_joint_errors[i] = smoothed_error
 
-        # Determine if the joint is angular or linear
-        is_angular = i >= len(linear_weights)
+        # Scale factors by agent_difficulty
+        SUCCESS_BONUS_BASE = 100 * agent_difficulty
+        task_difficulty = 0.2 + 0.3 * agent_difficulty
 
-        # Calculate position and orientation rewards
-        position_reward = POSITION_SCALE * (1.0 - norm_distance)
-        orientation_reward = ORIENTATION_SCALE * (1.0 - norm_quaternion_distance)
+        # Position and orientation rewards
+        position_reward = POSITION_SCALE * (1.0 - norm_distance) * agent_difficulty
+        orientation_reward = ORIENTATION_SCALE * (1.0 - norm_quaternion_distance) * agent_difficulty
 
         # Improvement reward
         progress_reward = IMPROVEMENT_SCALE * np.tanh(improvement)
@@ -297,17 +279,16 @@ def compute_reward(
         normalized_error = np.clip(joint_errors[i] / np.pi, 0.0, 1.0)
         error_penalty = -normalized_error * task_difficulty * ERROR_PENALTY_SCALE
 
-        # Exploration bonus
+        # Exploration bonus (state_key is global; same environment)
         state_key = tuple(np.round([distance, smoothed_error], 3))
         visits = compute_reward.state_visits.get(state_key, 0) + 1
         compute_reward.state_visits[state_key] = visits
-        novelty_bonus = exploration_bonus * (NOVELTY_BASE / np.sqrt(visits)) * (1.0 - curriculum_progress)
+        novelty_bonus = exploration_bonus * (NOVELTY_BASE / np.sqrt(visits)) * (1.0 - agent_difficulty)
 
-        # Success bonus
+        # Success bonus per agent
         success_bonus = 0
         if joint_errors[i] <= success_threshold:
-            # print(f"Joint {i} reached success threshold: {joint_errors[i]} <= {success_threshold}")
-            success_bonus = SUCCESS_BONUS_BASE *np.exp(-(1.0 + curriculum_progress)/success_threshold)
+            success_bonus = SUCCESS_BONUS_BASE * (1.0 + agent_difficulty)
 
         # Combine components
         joint_reward = (
@@ -316,22 +297,34 @@ def compute_reward(
             progress_reward +
             error_penalty +
             novelty_bonus +
-            success_bonus
+            success_bonus +
+            time_penalty * task_difficulty
         )
 
-        # Apply time penalty
-        joint_reward += time_penalty * task_difficulty
+        # Initial clipping
+        joint_reward = np.clip(joint_reward, -50.0, 1200.0)
 
-        # Clip the reward
-        final_rewards[i] = np.clip(joint_reward, MIN_REWARD, MAX_REWARD)
         joint_specific_rewards.append(joint_reward)
+        final_rewards[i] = joint_reward
 
-    # Determine success
-    success = np.all(joint_errors <= success_threshold)
+    # Determine success for each agent and log to curriculum_manager
+    successes = joint_errors <= success_threshold
+    for i in range(num_joints):
+        curriculum_manager.log_agent_success(i, bool(successes[i]))
+        curriculum_manager.update_agent_difficulty(i)
+    for i in range(num_joints):
+                final_rewards[i] = np.clip(final_rewards[i], -50.0, 1200.0)
+    # Overall success if all agents succeed
+    success = np.all(successes)
     new_best = min(prev_best, compute_reward.min_distance)
-    final_rewards *=np.log(episode_number+1/total_episodes) 
+
+    # Scale rewards by episode progression
+    scaling_factor = np.log((episode_number + 1) / total_episodes + 1)
+    final_rewards *= scaling_factor
     final_rewards = np.clip(final_rewards, MIN_REWARD, MAX_REWARD)
+
     return final_rewards, joint_specific_rewards, new_best, success
+
 
 def compute_jacobian_linear(robot_id, joint_indices, joint_angles):
     """

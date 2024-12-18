@@ -59,7 +59,11 @@ class MAPPOAgent:
         self.agent_clip_params = [
             config.get(f'clip_joint_{i}', self.global_clip_param) for i in range(self.num_joints)
         ]
-
+        curriculum_manager = CurriculumManager(
+            initial_difficulty=0.0, 
+            max_difficulty=3.0, 
+            success_threshold=0.8
+        )
         # Learning parameters
         self.gamma = config.get('gamma', 0.99)
         self.tau = config.get('tau', 0.95)
@@ -224,128 +228,17 @@ class MAPPOAgent:
 
 
     def update_policy(self, trajectories):
+        """This method, `update_policy`, is responsible for updating the policy of the MAPPO (Multi-Agent Proximal Policy Optimization) agent. It performs the following steps:
+        
+        1. Processes the input trajectories, including normalizing the states, actions, log probabilities, rewards, and done flags.
+        2. Computes the advantages and returns using the `compute_individual_gae` method.
+        3. Normalizes the advantages and creates a PyTorch dataset and data loader for the training batches.
+        4. Iterates over the training epochs and batches, updating the critic and actor networks.
+        5. Calculates the average actor loss, critic loss, entropy, policy losses, and actor losses per agent.
+        6. Returns the calculated metrics and values for further use.
+        """
         try:
-            # Extract and preprocess trajectory components
-            states = [torch.stack(t['states']).to(torch.float32) for t in trajectories]
-            actions = [torch.stack(t['actions']).to(torch.float32) for t in trajectories]
-            log_probs_old = [torch.stack(t['log_probs']).to(torch.float32) for t in trajectories]
-            dones = torch.tensor(trajectories[0]['dones'], dtype=torch.float32, device=self.device)
-
-            # Process rewards with validation and clamping
-            rewards = []
-            for idx, t in enumerate(trajectories):
-                raw_rewards = torch.tensor(t['rewards'], dtype=torch.float32, device=self.device)
-                print(f"Raw rewards for trajectory {idx}:", raw_rewards)
-
-                # Validate rewards
-                assert torch.isfinite(raw_rewards).all(), f"NaN or Inf in rewards for trajectory {idx}"
-
-                # Clamp rewards to avoid extreme values
-                clamped_rewards = torch.clamp(raw_rewards, min=-10.0, max=10.0)
-                rewards.append(clamped_rewards)
-
-            # Stack rewards into a tensor and validate
-            rewards_tensor = torch.stack(rewards, dim=1)
-            print("Rewards tensor before normalization:", rewards_tensor)
-            assert torch.isfinite(rewards_tensor).all(), "NaN or Inf in rewards_tensor before normalization"
-
-            # Normalize rewards
-            rewards_mean = rewards_tensor.mean()
-            rewards_std = rewards_tensor.std() + 1e-8  # Avoid division by zero
-            print(f"Rewards mean: {rewards_mean}, Rewards std: {rewards_std}")
-            rewards_normalized = (rewards_tensor - rewards_mean) / rewards_std
-            assert torch.isfinite(rewards_normalized).all(), "NaN or Inf in rewards_normalized"
-
-            # Truncate to minimum trajectory length
-            min_length = min(s.size(0) for s in states)
-            states = [s[:min_length] for s in states]
-            actions = [a[:min_length] for a in actions]
-            log_probs_old = [lp[:min_length] for lp in log_probs_old]
-            rewards_normalized = rewards_normalized[:min_length]
-            dones = dones[:min_length]
-
-            # Concatenate and stack tensors
-            states_cat = torch.cat(states, dim=1).to(self.device)
-            actions_cat = torch.stack(actions, dim=1).to(self.device)
-            log_probs_old_cat = torch.stack(log_probs_old, dim=1).to(self.device)
-
-            # Get critic values
-            with torch.no_grad():
-                values = self.critic(states_cat).to(torch.float32)
-
-            # Compute GAE and returns
-            advantages, returns = self.compute_individual_gae(rewards_normalized, dones, values)
-            advantages = advantages.transpose(0, 1).to(torch.float32)
-            returns = returns.transpose(0, 1).to(torch.float32)
-
-            # Normalize advantages
-            advantages = torch.clamp(advantages, -self.advantage_clip, self.advantage_clip)
-            for agent_idx in range(self.num_agents):
-                agent_advantages = advantages[:, agent_idx]
-                agent_mean = agent_advantages.mean()
-                agent_std = agent_advantages.std() + 1e-8
-                advantages[:, agent_idx] = (agent_advantages - agent_mean) / agent_std
-
-            # Create dataset and loader
-            dataset = torch.utils.data.TensorDataset(
-                states_cat, actions_cat, log_probs_old_cat, advantages, returns
-            )
-            loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
-
-            # Training loop
-            for batch in loader:
-                batch_states, batch_actions, batch_log_probs_old, batch_advantages, batch_returns = [
-                    t.to(self.device) for t in batch
-                ]
-
-                # Update critic
-                values_pred = self.critic(batch_states).to(torch.float32)
-                values_mean = values_pred.mean()
-                values_std = values_pred.std() + 1e-8  # Avoid division by zero
-                print(f"Values predicted mean: {values_mean}, std: {values_std}")
-
-                values_normalized = (values_pred - values_mean) / values_std
-                batch_returns_mean = batch_returns.mean()
-                batch_returns_std = batch_returns.std() + 1e-8
-                returns_normalized = (batch_returns - batch_returns_mean) / batch_returns_std
-
-                # Check for NaNs and Infs
-                if not torch.isfinite(values_normalized).all() or not torch.isfinite(returns_normalized).all():
-                    self.logger.error("NaN or Inf detected in normalization!")
-                    raise ValueError("Invalid normalization values!")
-
-                # Compute critic loss
-                critic_loss = self.value_loss_scale * F.mse_loss(values, returns)
-
-                self.critic_optimizer.zero_grad()
-                critic_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-                self.critic_optimizer.step()
-
-                # Update actor
-                actor_loss = self.compute_actor_loss(
-                    batch_states, batch_actions, batch_log_probs_old, batch_advantages
-                )
-                self.actor_optimizer.zero_grad()
-                actor_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                self.actor_optimizer.step()
-
-            # Log training stats
-            self.logger.info(f"Policy update complete. Critic loss: {critic_loss.item():.4f}")
-
-        except Exception as e:
-            self.logger.error(f"Error in update_policy: {e}")
-            raise
-    
-    
-
-
-
-    def update_policy(self, trajectories):
-        """Policy update with actor and critic loss calculations."""
-        try:
-            # Process trajectory components with explicit float32 conversion
+            # Existing trajectory processing code remains unchanged
             def validate_tensor(t):
                 if isinstance(t, list):
                     t = torch.stack(t)
@@ -353,14 +246,12 @@ class MAPPOAgent:
                 t = torch.nan_to_num(t, nan=0.0, posinf=1.0, neginf=-1.0)
                 return t.to(self.device)
 
-            # Extract and validate trajectories
             states = [validate_tensor(t['states']) for t in trajectories]
             actions = [validate_tensor(t['actions']) for t in trajectories]
             log_probs_old = [validate_tensor(t['log_probs']) for t in trajectories]
             rewards = [validate_tensor(t['rewards']) for t in trajectories]
             dones = validate_tensor(torch.tensor(trajectories[0]['dones']))
 
-            # Truncate to minimum length
             min_length = min(s.size(0) for s in states)
             states = [s[:min_length] for s in states]
             actions = [a[:min_length] for a in actions]
@@ -368,25 +259,20 @@ class MAPPOAgent:
             rewards = [r[:min_length] for r in rewards]
             dones = dones[:min_length]
 
-            # Combine tensors with explicit float32 dtype
             states_cat = torch.cat(states, dim=1).float()
             actions_cat = torch.stack(actions, dim=1).float()
             log_probs_old_cat = torch.stack(log_probs_old, dim=1).float()
 
-            # Get critic values safely
             with torch.no_grad():
                 values = self.critic(states_cat).float()
 
-            # Process rewards
             rewards_tensor = torch.stack(rewards, dim=1).float()
             rewards_clamped = torch.clamp(rewards_tensor, min=-10.0, max=10.0)
-            
-            # Safe normalization
+
             rewards_mean = rewards_clamped.mean()
             rewards_std = max(rewards_clamped.std(), 1e-6)
             rewards_normalized = ((rewards_clamped - rewards_mean) / rewards_std).float()
-            
-            # Compute GAE and returns with explicit float32
+
             advantages, returns = self.compute_individual_gae(
                 rewards_normalized.detach(),
                 dones.detach(),
@@ -395,14 +281,12 @@ class MAPPOAgent:
             advantages = advantages.transpose(0, 1).float()
             returns = returns.transpose(0, 1).float()
 
-            # Normalize advantages per agent
             advantages = torch.clamp(advantages, -self.advantage_clip, self.advantage_clip)
             for agent_idx in range(self.num_agents):
                 agent_mean = advantages[:, agent_idx].mean()
                 agent_std = max(advantages[:, agent_idx].std(), 1e-6)
                 advantages[:, agent_idx] = ((advantages[:, agent_idx] - agent_mean) / agent_std).float()
 
-            # Create dataset and loader
             dataset = torch.utils.data.TensorDataset(
                 states_cat, actions_cat, log_probs_old_cat, 
                 advantages.detach(), returns.detach()
@@ -411,95 +295,73 @@ class MAPPOAgent:
                 dataset, batch_size=self.batch_size, shuffle=True
             )
 
-            # Initialize tracking variables
             total_critic_loss = 0.0
             total_actor_loss = 0.0
             total_entropy = 0.0
             policy_losses = [[] for _ in range(self.num_agents)]
+            actor_loss_list = [[] for _ in range(self.num_agents)]  # NEW: Separate actor loss for each agent
 
-            # Training loop
             for _ in range(self.ppo_epochs):
                 for batch in loader:
                     batch_states, batch_actions, batch_log_probs_old, batch_advantages, batch_returns = [
                         b.float().to(self.device) for b in batch
                     ]
 
-                    # Update critic
                     values_pred = self.critic(batch_states).float()
-                    
-                    # Safe normalization for critic
-                    values_mean = values_pred.mean()
-                    values_std = torch.clamp(values_pred.std(), min=1e-6)
-                    values_norm = ((values_pred - values_mean) / values_std).float()
-                    
-                    returns_mean = batch_returns.mean()
-                    returns_std = torch.clamp(batch_returns.std(), min=1e-6)
-                    returns_norm = ((batch_returns - returns_mean) / returns_std).float()
-
-                    # Compute critic loss
-                    critic_loss = self.value_loss_scale * F.mse_loss(
-                        values_norm.float(), 
-                        returns_norm.float()
-                    )
+                    values_norm = ((values_pred - values_pred.mean()) / torch.clamp(values_pred.std(), min=1e-6)).float()
+                    returns_norm = ((batch_returns - batch_returns.mean()) / torch.clamp(batch_returns.std(), min=1e-6)).float()
+                    critic_loss = self.value_loss_scale * F.mse_loss(values_norm, returns_norm)
                     critic_loss += 0.001 * sum(p.pow(2).sum() for p in self.critic.parameters())
 
-                    # Update critic
                     self.critic_optimizer.zero_grad()
                     critic_loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                     self.critic_optimizer.step()
                     total_critic_loss += critic_loss.item()
 
-                    # Actor forward pass and update
                     for agent_idx, agent in enumerate(self.agents):
-                        # Get the correct state slice for this agent
                         start_idx = sum(self.obs_dims[:agent_idx])
                         end_idx = start_idx + self.obs_dims[agent_idx]
                         agent_state = batch_states[:, start_idx:end_idx]
 
-                        # Get policy distribution
                         mean, std = agent(agent_state)
                         std = torch.clamp(std * self.epsilon, min=self.std_min, max=self.std_max)
                         dist = Normal(mean, std)
 
-                        # Compute probabilities and entropy
                         agent_log_prob = dist.log_prob(batch_actions[:, agent_idx]).sum(dim=-1, keepdim=True)
                         entropy = -dist.entropy().sum(dim=-1, keepdim=True)
 
-                        # Compute surrogate losses
                         ratio = torch.exp(agent_log_prob - batch_log_probs_old[:, agent_idx].unsqueeze(1))
                         surr1 = ratio * batch_advantages[:, agent_idx].unsqueeze(1)
                         surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * batch_advantages[:, agent_idx].unsqueeze(1)
 
-                        # Compute actor loss
                         policy_loss = -torch.min(surr1, surr2).mean()
                         entropy_loss = -self.entropy_scale * entropy.mean()
                         actor_l2_loss = sum(0.001 * torch.norm(param) for param in agent.parameters())
                         actor_loss = policy_loss + entropy_loss + actor_l2_loss
 
-                        # Update actor
                         self.optimizers[agent_idx].zero_grad()
                         actor_loss.backward()
                         torch.nn.utils.clip_grad_norm_(agent.parameters(), self.max_grad_norm)
                         self.optimizers[agent_idx].step()
 
-                        # Track losses
                         policy_losses[agent_idx].append(policy_loss.item())
+                        actor_loss_list[agent_idx].append(actor_loss.item())  # Track per-agent actor loss
                         total_actor_loss += actor_loss.item()
                         total_entropy += entropy.mean().item()
 
-            # Compute final metrics
-            num_updates = self.ppo_epochs * len(loader) * self.num_agents
-            avg_actor_loss = total_actor_loss / num_updates
+            avg_actor_loss = total_actor_loss / (self.ppo_epochs * len(loader) * self.num_agents)
             avg_critic_loss = total_critic_loss / (self.ppo_epochs * len(loader))
-            avg_entropy = total_entropy / num_updates
+            avg_entropy = total_entropy / (self.ppo_epochs * len(loader) * self.num_agents)
             avg_policy_losses = [np.mean(losses) for losses in policy_losses]
+            avg_actor_loss_list = [np.mean(losses) for losses in actor_loss_list]  # NEW: Average actor loss per agent
 
             return (
                 float(avg_actor_loss),
                 float(avg_critic_loss), 
                 float(avg_entropy),
                 avg_policy_losses,
+                avg_actor_loss_list,  # NEW: Return per-agent actor loss
                 values_pred.detach().float(),
                 returns.float(),
                 advantages.float()
@@ -509,7 +371,6 @@ class MAPPOAgent:
             self.logger.error(f"Error in policy update: {str(e)}")
             self.logger.error(f"Traceback: {traceback.format_exc()}")
             raise
-
 
 
     def compute_individual_gae(self, rewards, dones, values):
@@ -712,7 +573,7 @@ class MAPPOAgent:
         torch.autograd.set_detect_anomaly(True)
         
         # Initialize curriculum manager
-        curriculum_manager = CurriculumManager(
+        self.curriculum_manager = CurriculumManager(
             initial_difficulty=0.0, 
             max_difficulty=3.0, 
             success_threshold=0.8
@@ -720,7 +581,7 @@ class MAPPOAgent:
 
         for episode in range(self.num_episodes):
             self.current_episode = episode
-            difficulty = curriculum_manager.get_current_difficulty()
+            difficulty = self.curriculum_manager.get_current_difficulty()
             state = self.env.reset(difficulty=difficulty)
             done = False
             step = 0
@@ -774,15 +635,15 @@ class MAPPOAgent:
                     for reward in rewards
                 ]
 
-                # Store experience in HER buffer
-                self.her_buffer.add_experience_with_info(
-                    state=state,
-                    action=actions,
-                    reward=scaled_rewards,
-                    next_state=next_state,
-                    done=done,
-                    info=info
-                )
+                # # Store experience in HER buffer
+                # self.her_buffer.add_experience_with_info(
+                #     state=state,
+                #     action=actions,
+                #     reward=scaled_rewards,
+                #     next_state=next_state,
+                #     done=done,
+                #     info=info
+                # )
 
                 # Process next state
                 processed_next_state_list = self._process_state(next_state)
@@ -824,6 +685,7 @@ class MAPPOAgent:
                     angular_weights=angular_weights,
                     success_threshold=self.env.success_threshold,
                     episode_number=episode,
+                    curriculum_manager=self.curriculum_manager,
                     total_episodes=self.num_episodes
                 )
 
@@ -846,7 +708,7 @@ class MAPPOAgent:
                 step += 1
 
             # Update policy and log results
-            actor_loss, critic_loss, entropy, policy_loss_per_agent, values, returns, advantages = \
+            actor_loss, critic_loss, entropy, policy_loss_per_agent,avg_actor_loss_list, values, returns, advantages = \
                 self.update_policy(trajectories)
 
             # Log episode statistics
@@ -863,6 +725,7 @@ class MAPPOAgent:
                 policy_loss=policy_loss_per_agent,
                 advantages=advantages.cpu().numpy(),
                 env=self.env,
+                actor_loss_per_actor=avg_actor_loss_list,  # Pass actor losses per actor
                 success_threshold=self.env.success_threshold
             )
 

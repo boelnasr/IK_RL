@@ -5,6 +5,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import logging
 from config import config
+from .curriculum import CurriculumManager
 from .reward_function import (
     compute_position_error,         # To compute position errors between current and target positions
     compute_quaternion_distance,    # To compute quaternion distance between current and target orientations
@@ -35,7 +36,12 @@ class InverseKinematicsEnv(gym.Env):
 
         # Initialize success threshold to the maximum value
         self.success_threshold = self.max_success_threshold
-
+        self.curriculum_manager = CurriculumManager(
+            initial_difficulty=0.0, 
+            max_difficulty=2.0, 
+            success_threshold=1.0,  # Set to 1.0 for maximum difficulty
+            window_size=10
+        )
         # PyBullet setup
         self.physics_client = p.connect(p.DIRECT)  # Use p.DIRECT for headless simulation
         p.setAdditionalSearchPath(pybullet_data.getDataPath())  # PyBullet data path
@@ -184,8 +190,8 @@ class InverseKinematicsEnv(gym.Env):
         """
         # Adjust success threshold based on episode progress
         #episode_progress = self.episode_number / self.total_episodes
-        #self.success_threshold = self.update_success_threshold()+
-        self.success_threshold = 0.01
+        self.success_threshold = self.update_success_threshold()
+        #self.success_threshold = 0.01
         #print(f"Success Threshold: {self.success_threshold}")
         #self.success_threshold = 0.01
         self.current_difficulty = difficulty
@@ -305,6 +311,7 @@ class InverseKinematicsEnv(gym.Env):
                     linear_weights=self.linear_weights.tolist(),
                     angular_weights=self.angular_weights.tolist(),
                     episode_number=self.episode_number,
+                    curriculum_manager=self.curriculum_manager,
                     total_episodes=self.total_episodes,
                     success_threshold=float(self.success_threshold)
                 )
@@ -316,8 +323,8 @@ class InverseKinematicsEnv(gym.Env):
             agent_successes = [self.is_agent_success(i, self.joint_errors) for i in range(self.num_joints)]
             success_rate = sum(agent_successes) / self.num_joints
             overall_success = success_rate == 1.0  # Overall success if all agents succeed
-            individual_rewards= np.clip(individual_rewards, -20.0, 1200.0)
-            
+            # for i in range(self.num_joints):
+            #     print(f"Agent {i} success: {agent_successes[i]}, reward: {individual_rewards[i]}")
 
             # Check if episode is done
             done = self.current_step >= self.max_episode_steps or overall_success
@@ -460,7 +467,7 @@ class InverseKinematicsEnv(gym.Env):
             bool: True if the joint's error is below the error threshold, False otherwise.
         """
         # Define success criteria for joint error
-        error_threshold = 0.01  # Define a threshold for joint error
+        # Define a threshold for joint error
 
         # Get the specific joint error
         joint_error = joint_errors[joint_index]
@@ -472,7 +479,7 @@ class InverseKinematicsEnv(gym.Env):
         # joint_success = np.nanmean(joint_error) < error_threshold
 
         # Log details about the success criterion
-        print(f"Joint {joint_index} - Joint Error: {joint_error:.6f} (Threshold: {error_threshold}), Success: {joint_success}")
+        # print(f"Joint {joint_index} - Joint Error: {joint_error:.6f} (Threshold: {self.success_threshold:.4f}), Success: {joint_success}")
 
         return joint_success
     
