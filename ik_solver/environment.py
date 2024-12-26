@@ -5,6 +5,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import logging
 from config import config
+from .exploration import ExplorationModule
 from .curriculum import CurriculumManager
 from .reward_function import (
     compute_position_error,         # To compute position errors between current and target positions
@@ -93,7 +94,40 @@ class InverseKinematicsEnv(gym.Env):
 
         # Track previous joint angles
         self.previous_joint_angles = None  # Will be initialized in reset
+        self.link_lengths = []
+        for i in range(p.getNumJoints(self.robot_id)):
+            # Get joint info
+            joint_info = p.getJointInfo(self.robot_id, i)
+            # Get link state
+            link_state = p.getLinkState(self.robot_id, i)
+            
+            # Calculate link length from joint positions
+            if i > 0:  # Skip the base link
+                prev_joint_pos = p.getLinkState(self.robot_id, i-1)[0]
+                current_joint_pos = link_state[0]
+                link_length = np.linalg.norm(
+                    np.array(current_joint_pos) - np.array(prev_joint_pos)
+                )
+                self.link_lengths.append(link_length)
+        
+        # Ensure we have at least one link length
+        if not self.link_lengths:
+            self.link_lengths = [0.2, 0.3, 0.2]  # Default values
+            print("Warning: Using default link lengths")
+        
+        print(f"Calculated link lengths: {self.link_lengths}")
+        
+        # Calculate total reach for workspace validation
+        self.total_reach = sum(self.link_lengths)
+        self.min_reach = self.total_reach * 0.1  # 10% of total reach
+        self.max_reach = self.total_reach * 0.9  # 90% of total reach
 
+        # Define workspace bounds based on total reach
+        self.workspace_bounds = {
+            'x': (self.min_reach, self.max_reach),
+            'y': (-self.max_reach/2, self.max_reach/2),
+            'z': (0.1, self.max_reach * 0.8)
+        }
         # Define action and observation spaces per agent
         self.action_spaces = []
         self.observation_spaces = []
@@ -184,16 +218,118 @@ class InverseKinematicsEnv(gym.Env):
         
         return np.concatenate([position, orientation])
     
+    def is_position_reachable(self, position):
+        """
+        Check if a position is reachable by the robot.
+        
+        Args:
+            position: numpy array [x, y, z] of the target position
+        
+        Returns:
+            bool: True if position is reachable, False otherwise
+        """
+        # Calculate distance from base to position
+        distance_from_base = np.linalg.norm(position[:2])  # XY distance from base
+        
+        # Check if position is within workspace boundaries
+        is_within_bounds = (
+            self.workspace_bounds['x'][0] <= position[0] <= self.workspace_bounds['x'][1] and
+            self.workspace_bounds['y'][0] <= position[1] <= self.workspace_bounds['y'][1] and
+            self.workspace_bounds['z'][0] <= position[2] <= self.workspace_bounds['z'][1]
+        )
+        
+        # Check if the point is within the reachable sphere
+        is_within_reach = (
+            self.min_reach <= distance_from_base <= self.max_reach
+        )
+        
+        return is_within_bounds and is_within_reach
+
+    def sample_valid_target_position(self, max_attempts=100):
+        """
+        Sample a valid target position within the robot's workspace.
+        
+        Args:
+            max_attempts: Maximum number of sampling attempts
+        
+        Returns:
+            numpy array: Valid target position or None if no valid position found
+        """
+        for _ in range(max_attempts):
+            # Sample random position within bounds
+            position = np.array([
+                np.random.uniform(self.workspace_bounds['x'][0], self.workspace_bounds['x'][1]),
+                np.random.uniform(self.workspace_bounds['y'][0], self.workspace_bounds['y'][1]),
+                np.random.uniform(self.workspace_bounds['z'][0], self.workspace_bounds['z'][1])
+            ])
+            
+            if self.is_position_reachable(position):
+                return position
+                
+        print("Warning: Could not find valid target position")
+        # Fallback to a known reachable position
+        return np.array([
+            (self.workspace_bounds['x'][0] + self.workspace_bounds['x'][1]) / 2,
+            0,  # Middle of Y range
+            (self.workspace_bounds['z'][0] + self.workspace_bounds['z'][1]) / 2
+        ])
+
+    def validate_orientation(self, position, orientation):
+        """
+        Validate if an orientation is feasible at a given position.
+        
+        Args:
+            position: numpy array [x, y, z] of the target position
+            orientation: numpy array [qx, qy, qz, qw] quaternion
+        
+        Returns:
+            bool: True if orientation is feasible, False otherwise
+        """
+        # Convert quaternion to euler angles for easier checking
+        euler = p.getEulerFromQuaternion(orientation)
+        
+        # Define reasonable angle limits for each axis
+        angle_limits = {
+            'roll': (-np.pi, np.pi),
+            'pitch': (-np.pi/2, np.pi/2),  # More restrictive pitch
+            'yaw': (-np.pi, np.pi)
+        }
+        
+        # Check if angles are within limits
+        if not (angle_limits['roll'][0] <= euler[0] <= angle_limits['roll'][1] and
+                angle_limits['pitch'][0] <= euler[1] <= angle_limits['pitch'][1] and
+                angle_limits['yaw'][0] <= euler[2] <= angle_limits['yaw'][1]):
+            return False
+        
+        return True
+
+    def sample_valid_orientation(self, position, max_attempts=50):
+        """
+        Sample a valid orientation for a given position.
+        
+        Args:
+            position: numpy array [x, y, z] of the target position
+            max_attempts: Maximum number of sampling attempts
+        
+        Returns:
+            numpy array: Valid quaternion orientation or None if no valid orientation found
+        """
+        for _ in range(max_attempts):
+            # Sample random euler angles
+            euler = np.random.uniform(-np.pi, np.pi, 3)
+            # Convert to quaternion
+            quaternion = np.array(p.getQuaternionFromEuler(euler))
+            
+            if self.validate_orientation(position, quaternion):
+                return quaternion
+                
+        return None  # No valid orientation found
+
     def reset(self, difficulty=1.0):
         """
-        Resets the environment and initializes all necessary state tracking variables.
+        Reset environment with workspace validation.
         """
-        # Adjust success threshold based on episode progress
-        #episode_progress = self.episode_number / self.total_episodes
         self.success_threshold = self.update_success_threshold()
-        #self.success_threshold = 0.01
-        #print(f"Success Threshold: {self.success_threshold}")
-        #self.success_threshold = 0.01
         self.current_difficulty = difficulty
 
         # Reset joint angles to random values within limits
@@ -206,10 +342,21 @@ class InverseKinematicsEnv(gym.Env):
         # Track previous joint angles
         self.previous_joint_angles = np.copy(self.joint_angles)
 
-        # Generate random target pose
-        self.target_position = np.random.uniform([0.1, -0.5, 0.1], [0.5, 0.5, 0.5])
-        random_euler = np.random.uniform(-np.pi, np.pi, 3)
-        self.target_orientation = np.array(p.getQuaternionFromEuler(random_euler))
+        # Sample valid target position and orientation
+        max_position_attempts = 100
+        max_orientation_attempts = 50
+        
+        valid_position = self.sample_valid_target_position(max_position_attempts)
+        if valid_position is None:
+            raise RuntimeError("Could not find valid target position after maximum attempts")
+        
+        valid_orientation = self.sample_valid_orientation(valid_position, max_orientation_attempts)
+        if valid_orientation is None:
+            raise RuntimeError("Could not find valid target orientation after maximum attempts")
+
+        # Set target pose
+        self.target_position = valid_position
+        self.target_orientation = valid_orientation
 
         # Get initial end-effector state
         self.current_position, self.current_orientation = self.get_end_effector_pose()
@@ -232,16 +379,6 @@ class InverseKinematicsEnv(gym.Env):
         self.current_step = 0
         self.episode_number += 1
 
-        # Visualize target (optional)
-        # if hasattr(self, 'target_marker'):
-        #     p.removeBody(self.target_marker)
-        # self.target_marker = p.loadURDF(
-        #     "sphere_small.urdf",
-        #     self.target_position,
-        #     globalScaling=0.05,
-        #     useFixedBase=True
-        # )
-
         # Calculate initial errors
         self.position_error = self.current_position - self.target_position
         self.orientation_error = self.compute_orientation_difference(
@@ -249,6 +386,8 @@ class InverseKinematicsEnv(gym.Env):
         )
 
         return self.get_all_agent_observations()
+
+
 
 
     def step(self, actions):

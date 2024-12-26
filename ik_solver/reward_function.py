@@ -2,6 +2,7 @@ import pybullet as p
 import numpy as np
 from collections import deque
 from typing import List, Tuple, Optional
+import math
 def compute_position_error(current_position, target_position):
     """
     Enhanced position error calculation with debugging.
@@ -192,45 +193,58 @@ def compute_overall_distance(current_position, target_position, current_orientat
 #     # Return individual joint rewards along with other values
 #     return reward, joint_rewards, prev_best, success
 
+import numpy as np
+from collections import deque
+
 def compute_reward(
     distance: float,
     begin_distance: float,
     prev_best: float,
     current_orientation: np.ndarray,
     target_orientation: np.ndarray,
-    joint_errors: List[float],
-    linear_weights: List[float],
-    angular_weights: List[float],
+    joint_errors: list,
+    linear_weights: list,
+    angular_weights: list,
     curriculum_manager: object,
     episode_number: int,
     total_episodes: int,
     success_threshold: float = 0.01,
     time_penalty: float = -0.1,
     smoothing_window: int = 10,
-    curriculum_factor: float = 0.5,
     exploration_bonus: float = 0.1
-) -> Tuple[np.ndarray, List[float], float, bool]:
+) -> tuple:
     """
-    Computes the reward for an inverse kinematics (IK) task for multiple agents/joints,
-    taking into account various factors such as distance, orientation, joint errors,
-    and exploration. Uses agent-specific difficulties from curriculum_manager.
+    Computes the reward for inverse kinematics tasks with adaptive clipping for stabilization.
+
+    Args:
+        (various): See original function definition.
+
+    Returns:
+        tuple: (final_rewards, joint_specific_rewards, new_best, success)
     """
 
-    # Constants for reward bounds and scaling factors
-    MAX_REWARD = 15.0
-    MIN_REWARD = -5.0
+    # Constants
+    MAX_REWARD = 10.0
+    MIN_REWARD = -0.50
     POSITION_SCALE = 0.6
     ORIENTATION_SCALE = 0.4
     IMPROVEMENT_SCALE = 0.3
-    ERROR_PENALTY_SCALE = 0.2
+    ERROR_PENALTY_SCALE = 0.1
     NOVELTY_BASE = 0.5
 
     num_joints = len(joint_errors)
 
-    # Initialize storage if not present
+    # Initialize stats tracking
+    if not hasattr(compute_reward, 'reward_stats'):
+        compute_reward.reward_stats = {
+            'running_mean': 0.0,
+            'running_std': 1.0,
+            'history': deque(maxlen=100),
+            'alpha': 0.95  # Exponential moving average factor
+        }
+
     if not hasattr(compute_reward, 'distance_history'):
         compute_reward.distance_history = deque(maxlen=smoothing_window)
-        compute_reward.state_visits = {}
         compute_reward.min_distance = float('inf')
         compute_reward.joint_histories = [deque(maxlen=smoothing_window) for _ in range(num_joints)]
         compute_reward.prev_joint_errors = [float('inf')] * num_joints
@@ -244,7 +258,6 @@ def compute_reward(
     orientation_diff = compute_quaternion_distance(current_orientation, target_orientation)
     norm_quaternion_distance = orientation_diff / np.pi
 
-    joint_errors = np.array(joint_errors)
     joint_specific_rewards = []
     final_rewards = np.zeros(num_joints)
 
@@ -257,39 +270,39 @@ def compute_reward(
         compute_reward.joint_histories[i].append(joint_errors[i])
         smoothed_error = max(np.median(list(compute_reward.joint_histories[i])), 1e-6)
         prev_error = max(compute_reward.prev_joint_errors[i], 1e-6)
-        if not np.isfinite(prev_error) or not np.isfinite(smoothed_error):
-            improvement = 0  # Default value for invalid improvement
-        else:
+        improvement = 0.0
+        if math.isfinite(prev_error) and math.isfinite(smoothed_error) and episode_number >= 0.1 * total_episodes:
             improvement = np.clip((prev_error - smoothed_error) / (prev_error + 1e-8), -1.0, 1.0)
-        
         compute_reward.prev_joint_errors[i] = smoothed_error
 
-        # Scale factors by agent_difficulty
+        # Scale factors by agent difficulty
         SUCCESS_BONUS_BASE = 100 * agent_difficulty
         task_difficulty = 0.2 + 0.3 * agent_difficulty
 
         # Position and orientation rewards
-        position_reward = POSITION_SCALE * (1.0 - norm_distance) * agent_difficulty
-        orientation_reward = ORIENTATION_SCALE * (1.0 - norm_quaternion_distance) * agent_difficulty
+        position_reward = POSITION_SCALE * (1.0 - norm_distance) * linear_weights[i] * agent_difficulty
+        orientation_reward = ORIENTATION_SCALE * (1.0 - norm_quaternion_distance) * angular_weights[i] * agent_difficulty
 
         # Improvement reward
         progress_reward = IMPROVEMENT_SCALE * np.tanh(improvement)
 
         # Error penalty
         normalized_error = np.clip(joint_errors[i] / np.pi, 0.0, 1.0)
-        error_penalty = -normalized_error * task_difficulty * ERROR_PENALTY_SCALE
+        combined_weight = 0.5 * (linear_weights[i] + angular_weights[i])
+        error_penalty = -normalized_error * combined_weight * task_difficulty * ERROR_PENALTY_SCALE
 
-        # Exploration bonus (state_key is global; same environment)
+        # Novelty bonus
         state_key = tuple(np.round([distance, smoothed_error], 3))
-        visits = compute_reward.state_visits.get(state_key, 0) + 1
-        compute_reward.state_visits[state_key] = visits
-        novelty_bonus = exploration_bonus * (NOVELTY_BASE / np.sqrt(visits)) * (1.0 - agent_difficulty)
+        novelty_bonus=0
+        if episode_number >= 0.1*total_episodes:
+            novelty_bonus = exploration_bonus * (NOVELTY_BASE / np.sqrt(compute_reward.reward_stats['history'].count(state_key) + 1))
 
-        # Success bonus per agent
+        # Success bonus
         success_bonus = 0
-        if joint_errors[i] <= success_threshold:
+        if joint_errors[i] <= success_threshold and episode_number >1:
             success_bonus = SUCCESS_BONUS_BASE * (1.0 + agent_difficulty)
-
+        support =0
+        
         # Combine components
         joint_reward = (
             position_reward +
@@ -298,33 +311,51 @@ def compute_reward(
             error_penalty +
             novelty_bonus +
             success_bonus +
+            support +
             time_penalty * task_difficulty
         )
+        joint_reward = np.clip(joint_reward, MIN_REWARD, MAX_REWARD)
+        joint_specific_rewards.append((joint_reward))
+        final_rewards[i] = (joint_reward)
 
-        # Initial clipping
-        joint_reward = np.clip(joint_reward, -50.0, 1200.0)
+    # Adaptive clipping
+    final_rewards = adaptive_clip(final_rewards, compute_reward.reward_stats)
 
-        joint_specific_rewards.append(joint_reward)
-        final_rewards[i] = joint_reward
+    # Scale by episode progress
 
-    # Determine success for each agent and log to curriculum_manager
-    successes = joint_errors <= success_threshold
+
+    # Determine success
+    successes = np.array(joint_errors) <= success_threshold
     for i in range(num_joints):
         curriculum_manager.log_agent_success(i, bool(successes[i]))
         curriculum_manager.update_agent_difficulty(i)
-    for i in range(num_joints):
-                final_rewards[i] = np.clip(final_rewards[i], -50.0, 1200.0)
-    # Overall success if all agents succeed
+
     success = np.all(successes)
     new_best = min(prev_best, compute_reward.min_distance)
 
-    # Scale rewards by episode progression
-    scaling_factor = np.log((episode_number + 1) / total_episodes + 1)
-    final_rewards *= scaling_factor
-    final_rewards = np.clip(final_rewards, MIN_REWARD, MAX_REWARD)
-
     return final_rewards, joint_specific_rewards, new_best, success
 
+
+def adaptive_clip(rewards, stats):
+    """
+    Clip rewards adaptively based on running mean and standard deviation.
+
+    Args:
+        rewards (np.array): Rewards to clip.
+        stats (dict): Dictionary containing running mean and std.
+
+    Returns:
+        np.array: Clipped rewards.
+    """
+    curr_mean = np.mean(rewards)
+    curr_std = np.std(rewards) + 1e-8
+
+    # Update running mean and std
+    stats['running_mean'] = stats['alpha'] * stats['running_mean'] + (1 - stats['alpha']) * curr_mean
+    stats['running_std'] = stats['alpha'] * stats['running_std'] + (1 - stats['alpha']) * curr_std
+
+    # Clip rewards adaptively
+    return np.clip(rewards, stats['running_mean'] - 0.2 * stats['running_std'], stats['running_mean'] + 0.2 * stats['running_std'])
 
 def compute_jacobian_linear(robot_id, joint_indices, joint_angles):
     """

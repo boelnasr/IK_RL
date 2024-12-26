@@ -429,8 +429,8 @@ class TrainingMetrics:
     def plot_metrics(self, metrics: Dict, env: Any, show_plots: bool = True) -> None:
         """Create and save all plots."""
         try:
-            print("Rewards mean:", metrics['rewards']['mean'])
-            print("Per-agent mean rewards:", metrics['rewards']['per_agent_mean'])
+            # print("Rewards mean:", metrics['rewards']['mean'])
+            # print("Per-agent mean rewards:", metrics['rewards']['per_agent_mean'])
 
             self._plot_joint_metrics(metrics, env, show_plots)
             self._plot_per_joint_cumulative_rewards(metrics, env, show_plots)
@@ -688,6 +688,7 @@ class TrainingMetrics:
     def _plot_entropy(self, metrics: Dict, show_plots: bool) -> None:
         """Plot entropy over episodes with enhanced styling."""
         episodes = np.arange(1, len(metrics['training']['entropy']) + 1)
+        episodes = episodes[::-1]
         window = min(10, len(episodes) // 10)
         
         # 1. Plot entropy
@@ -792,7 +793,7 @@ class TrainingMetrics:
             ax = axes[joint_idx]
             rewards = cumulative_rewards[joint_idx]
 
-            ax.plot(episodes, rewards, label=f'Joint {joint_idx + 1}', color=colors(joint_idx), linewidth=1.5)
+            #ax.plot(episodes, rewards, label=f'Joint {joint_idx + 1}', color=colors(joint_idx), linewidth=1.5)
 
             # Apply moving average
             window = max(1, len(episodes) // 50)
@@ -836,14 +837,14 @@ class TrainingMetrics:
             ax = axes[joint_idx]
             joint_rewards = mean_episode_rewards_per_agent[joint_idx]
             # Clip rewards to a reasonable range
-            joint_rewards = np.clip(joint_rewards, -10, 1200)
+            joint_rewards = np.clip(joint_rewards, -1000, 5000)
 
             # Plot raw data
-            ax.plot(episodes, joint_rewards, label=f'Joint {joint_idx + 1} Mean Reward', 
-                    color=colors(joint_idx), linewidth=1.5, alpha=0.5)
+            #ax.plot(episodes, joint_rewards, label=f'Joint {joint_idx + 1} Mean Reward', 
+                    #color=colors(joint_idx), linewidth=1.5, alpha=0.5)
 
             # Compute simple moving average (SMA)
-            window = max(1, len(episodes) // 50)
+            window = max(1, len(episodes) // 5)
             if window > 1:
                 moving_avg = np.convolve(joint_rewards, np.ones(window) / window, mode='valid')
                 ax.plot(episodes[window - 1:], moving_avg, 
@@ -1006,7 +1007,7 @@ class TrainingMetrics:
             for agent_idx in range(num_agents):
                 ax = axes[agent_idx]
                 raw_data = policy_loss_per_agent[agent_idx]
-                raw_data = np.clip(raw_data, -5, 10)  # Clip the data to a reasonable range
+                raw_data = np.clip(raw_data, -5, 2)  # Clip the data to a reasonable range
                 ax.plot(episodes, raw_data, label='Raw Data', color='tab:orange', alpha=0.3, linewidth=1)
 
                 # Add different smoothing levels
@@ -1174,10 +1175,6 @@ class TrainingMetrics:
             self.logger.error(f"Error plotting minimum joint errors: {str(e)}")
             raise
 
-
-
-
-
     def plot_joint_error_convergence(self, metrics, show_plots, num_joints):
         # Ensure 'joint_errors' exists in metrics
         if 'joint_errors' not in metrics:
@@ -1215,7 +1212,6 @@ class TrainingMetrics:
         if show_plots:
             plt.show()
         plt.close(fig)
-
 
     def _plot_normalized_reward(self, metrics: Dict, show_plots: bool, smoothing_window: int = 10) -> None:
         """Plot smoothed and normalized reward over episodes with overshot control."""
@@ -1360,52 +1356,6 @@ class TrainingMetrics:
         except Exception as e:
             self.logger.error(f"Error plotting normalized cumulative reward per agent: {str(e)}")
             raise
-
-    def _plot_advantages(self, metrics: Dict, show_plots: bool) -> None:
-        """Plot advantages over episodes with enhanced styling."""
-        try:
-            advantages = np.array(metrics.get('training', {}).get('advantages', []))
-            if advantages.size == 0:
-                self.logger.warning("Advantages data is empty. Skipping plot.")
-                return
-
-            if advantages.ndim == 1:
-                advantages = advantages.reshape(-1, 1)
-
-            episodes = np.arange(1, advantages.shape[0] + 1)
-            mean_advantages = np.mean(advantages, axis=1)
-            std_advantages = np.std(advantages, axis=1)
-
-            mean_advantages = np.nan_to_num(mean_advantages)
-            std_advantages = np.nan_to_num(std_advantages)
-
-            fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
-            ax.plot(episodes, mean_advantages, label='Mean Advantage', color='tab:blue', linewidth=1.5)
-            ax.fill_between(
-                episodes,
-                mean_advantages - std_advantages,
-                mean_advantages + std_advantages,
-                alpha=0.3,
-                color='tab:blue',
-                label='Std Deviation'
-            )
-            ax.set_title('Advantages Over Episodes', fontsize=14)
-            ax.set_xlabel('Episodes', fontsize=12)
-            ax.set_ylabel('Advantage', fontsize=12)
-            ax.grid(True, alpha=0.3)
-            ax.legend(fontsize=10)
-
-            plt.tight_layout()
-            self.save_figure(fig, 'advantages_plot')
-            self.logger.info("Advantages plot saved successfully.")
-            if show_plots:
-                plt.show()
-            plt.close(fig)
-
-        except Exception as e:
-            self.logger.error(f"Error plotting advantages: {str(e)}")
-            raise
-
     def _plot_value_loss(self, metrics: Dict, show_plots: bool) -> None:
         """Plot value loss over episodes with exponential trendline and enhanced styling."""
         try:
@@ -1413,7 +1363,7 @@ class TrainingMetrics:
             episodes = np.arange(1, len(value_loss) + 1)
 
             # Ensure no zero or negative values for log transformation
-            value_loss = np.clip(value_loss, a_min=1e-8, a_max=None)
+            value_loss = np.clip(value_loss, a_min=1e-8, a_max=2)
 
             # Perform logarithmic transformation of value loss
             log_value_loss = np.log(value_loss)
@@ -1677,7 +1627,7 @@ class TrainingMetrics:
             self.logger.error(f"Error plotting reward standard deviation per agent: {str(e)}")
             raise
 
-    def clip_rewards(self, rewards, lower_bound=-10.0, upper_bound=300.0):
+    def clip_rewards(self, rewards, lower_bound=-1000.0, upper_bound=5000):
         """
         Clip rewards using fixed bounds.
         

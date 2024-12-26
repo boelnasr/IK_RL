@@ -30,11 +30,16 @@ class HindsightReplayBuffer:
         self.success_rate = deque(maxlen=100)
         self.goal_statistics = {}
 
+
     def add_experience_with_info(self, state, action, reward, next_state, done, info):
-        """Add experience with automatic goal extraction"""
-        achieved_goal = self._extract_achieved_goal(state, info)
-        desired_goal = self._extract_desired_goal(state, info)
-        
+        """Add experience with automatic goal extraction."""
+        try:
+            achieved_goal = self._extract_achieved_goal(state, info)
+            desired_goal = self._extract_desired_goal(state, info)
+        except ValueError as e:
+            print(f"Error in goal extraction: {str(e)}")
+            return  # Skip adding experience if goal extraction fails
+
         exp = Experience(
             state=state,
             action=action,
@@ -45,11 +50,14 @@ class HindsightReplayBuffer:
             achieved_goal=achieved_goal,
             info=info
         )
-        
+
         self.episode_buffer.append(exp)
-        
+
         if done:
             self._process_episode()
+
+
+
 
     def _extract_desired_goal(self, state, info):
         """Extract desired goal from state/info"""
@@ -147,9 +155,8 @@ class HindsightReplayBuffer:
         return her_episode
 
     def _store_episode(self, episode):
-        """Store episode in main or validation buffer"""
+        """Store episode in main or validation buffer."""
         is_validation = random.random() < self.validation_ratio
-        
         if is_validation:
             self.validation_buffer.extend(episode)
             self.validation_priorities.extend([1.0] * len(episode))
@@ -161,25 +168,34 @@ class HindsightReplayBuffer:
                     self.buffer[self.pos] = exp
                 self.priorities[self.pos] = max(self.priorities.max(), 1.0)
                 self.pos = (self.pos + 1) % self.capacity
+        print(f"Buffer size: {len(self.buffer)}, Validation buffer size: {len(self.validation_buffer)}")
+
 
     def sample(self, batch_size, beta=0.4):
-        """Sample batch with prioritization"""
-        if len(self.buffer) == self.capacity:
-            priorities = self.priorities
-        else:
-            priorities = self.priorities[:self.pos]
-        
+        """Sample a batch of experiences with prioritization."""
+        if len(self.buffer) == 0:
+            raise ValueError("Replay buffer is empty. Cannot sample experiences.")
+        if len(self.buffer) < batch_size:
+            batch_size = len(self.buffer)  # Adjust batch size if insufficient samples
+
+        priorities = self.priorities[:len(self.buffer)] if len(self.buffer) < self.capacity else self.priorities
+
+        # Handle case where all priorities are zero
+        if np.sum(priorities) == 0:
+            priorities += 1e-6  # Small value to prevent division by zero
+
         probs = priorities ** self.alpha
         probs /= probs.sum()
-        
+
         indices = np.random.choice(len(self.buffer), batch_size, p=probs)
         weights = (len(self.buffer) * probs[indices]) ** (-beta)
         weights /= weights.max()
-        
+
         experiences = [self.buffer[idx] for idx in indices]
-        
+
         return experiences, weights, indices
-    
+
+
     def sample_validation(self, batch_size):
         """Sample from validation buffer"""
         if len(self.validation_buffer) < batch_size:

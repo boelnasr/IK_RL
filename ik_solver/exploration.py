@@ -33,11 +33,20 @@ class CuriosityModule(nn.Module):
         ).to(self.device)
 
     def forward(self, state, action, next_state):
+        # Ensure inputs are at least 2D
+        if state.dim() == 1:
+            state = state.unsqueeze(0)  # Add batch dimension
+        if action.dim() == 1:
+            action = action.unsqueeze(0)  # Add batch dimension
+        if next_state.dim() == 1:
+            next_state = next_state.unsqueeze(0)  # Add batch dimension
+
         # Ensure inputs are on the correct device
         state = state.to(self.device)
         action = action.to(self.device)
         next_state = next_state.to(self.device)
 
+        # Concatenate state and action for the forward model
         concatenated_input = torch.cat([state, action], dim=1)
         predicted_next_state = self.forward_model(concatenated_input)
         intrinsic_reward = F.mse_loss(predicted_next_state, next_state, reduction='none').mean(dim=-1)

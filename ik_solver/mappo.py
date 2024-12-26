@@ -124,7 +124,7 @@ class MAPPOAgent:
             optimizers=all_optimizers,
             initial_lr=self.global_lr,
             warmup_steps=10,  # Set warmup steps as needed
-            min_lr=1e-5
+            min_lr=5e-5
         )
         # Initialize early stopping
         self.init_early_stopping(
@@ -171,10 +171,10 @@ class MAPPOAgent:
             )
                 # Add these new parameters
         self.value_loss_scale = config.get('value_loss_scale', 0.5)  # Critic loss scaling
-        self.entropy_scale = config.get('entropy_scale', 0.01)    # Entropy scaling
+        self.entropy_scale = config.get('entropy_scale', 0.001)    # Entropy scaling
         self.max_grad_norm = config.get('max_grad_norm', 0.5)    # Gradient clipping norm
-        self.ratio_clip = config.get('ratio_clip', 10.0)         # Policy ratio clipping
-        self.advantage_clip = config.get('advantage_clip', 4.0)   # Advantage clipping
+        self.ratio_clip = config.get('ratio_clip', 0.20)         # Policy ratio clipping
+        self.advantage_clip = config.get('advantage_clip', 2.0)   # Advantage clipping
                 
         # Initialize the AdaptiveRewardScaler
         self.reward_scaler = AdaptiveRewardScaler(window_size=100, initial_scale=1.0)
@@ -226,32 +226,35 @@ class MAPPOAgent:
         logging.info("MAPPOAgent initialization complete.")
 
 
-
     def update_policy(self, trajectories):
-        """This method, `update_policy`, is responsible for updating the policy of the MAPPO (Multi-Agent Proximal Policy Optimization) agent. It performs the following steps:
-        
-        1. Processes the input trajectories, including normalizing the states, actions, log probabilities, rewards, and done flags.
-        2. Computes the advantages and returns using the `compute_individual_gae` method.
-        3. Normalizes the advantages and creates a PyTorch dataset and data loader for the training batches.
-        4. Iterates over the training epochs and batches, updating the critic and actor networks.
-        5. Calculates the average actor loss, critic loss, entropy, policy losses, and actor losses per agent.
-        6. Returns the calculated metrics and values for further use.
+        """
+        Update policy with improved entropy handling and stability measures.
         """
         try:
-            # Existing trajectory processing code remains unchanged
             def validate_tensor(t):
                 if isinstance(t, list):
                     t = torch.stack(t)
-                t = t.float()  # Convert to float32
+                t = t.float()
                 t = torch.nan_to_num(t, nan=0.0, posinf=1.0, neginf=-1.0)
                 return t.to(self.device)
 
+            # Initialize entropy stats if needed
+            if not hasattr(self, 'entropy_stats'):
+                self.entropy_stats = {
+                    'running_mean': 1.0,  # Target positive entropy
+                    'target_entropy': 0.001,
+                    'history': deque(maxlen=100)
+                }
+                self.entropy_scale = 0.05  # Initial entropy scale
+
+            # Process trajectory data
             states = [validate_tensor(t['states']) for t in trajectories]
             actions = [validate_tensor(t['actions']) for t in trajectories]
             log_probs_old = [validate_tensor(t['log_probs']) for t in trajectories]
             rewards = [validate_tensor(t['rewards']) for t in trajectories]
             dones = validate_tensor(torch.tensor(trajectories[0]['dones']))
 
+            # Ensure consistent sequence length
             min_length = min(s.size(0) for s in states)
             states = [s[:min_length] for s in states]
             actions = [a[:min_length] for a in actions]
@@ -259,20 +262,24 @@ class MAPPOAgent:
             rewards = [r[:min_length] for r in rewards]
             dones = dones[:min_length]
 
+            # Concatenate tensors
             states_cat = torch.cat(states, dim=1).float()
             actions_cat = torch.stack(actions, dim=1).float()
             log_probs_old_cat = torch.stack(log_probs_old, dim=1).float()
 
+            # Get value predictions
             with torch.no_grad():
                 values = self.critic(states_cat).float()
+                values = torch.clamp(values, -50.0, 50.0)
 
+            # Process rewards
             rewards_tensor = torch.stack(rewards, dim=1).float()
             rewards_clamped = torch.clamp(rewards_tensor, min=-10.0, max=10.0)
-
             rewards_mean = rewards_clamped.mean()
             rewards_std = max(rewards_clamped.std(), 1e-6)
-            rewards_normalized = ((rewards_clamped - rewards_mean) / rewards_std).float()
+            rewards_normalized = (rewards_clamped - rewards_mean) / rewards_std
 
+            # Compute advantages and returns
             advantages, returns = self.compute_individual_gae(
                 rewards_normalized.detach(),
                 dones.detach(),
@@ -281,25 +288,29 @@ class MAPPOAgent:
             advantages = advantages.transpose(0, 1).float()
             returns = returns.transpose(0, 1).float()
 
+            # Normalize advantages
             advantages = torch.clamp(advantages, -self.advantage_clip, self.advantage_clip)
             for agent_idx in range(self.num_agents):
                 agent_mean = advantages[:, agent_idx].mean()
                 agent_std = max(advantages[:, agent_idx].std(), 1e-6)
-                advantages[:, agent_idx] = ((advantages[:, agent_idx] - agent_mean) / agent_std).float()
+                advantages[:, agent_idx] = (advantages[:, agent_idx] - agent_mean) / agent_std
 
+            # Create dataset and loader
             dataset = torch.utils.data.TensorDataset(
-                states_cat, actions_cat, log_probs_old_cat, 
+                states_cat, actions_cat, log_probs_old_cat,
                 advantages.detach(), returns.detach()
             )
             loader = torch.utils.data.DataLoader(
                 dataset, batch_size=self.batch_size, shuffle=True
             )
 
+            # Initialize tracking variables
             total_critic_loss = 0.0
             total_actor_loss = 0.0
             total_entropy = 0.0
+            total_entropy_loss = 0.0
             policy_losses = [[] for _ in range(self.num_agents)]
-            actor_loss_list = [[] for _ in range(self.num_agents)]  # NEW: Separate actor loss for each agent
+            actor_loss_list = [[] for _ in range(self.num_agents)]
 
             for _ in range(self.ppo_epochs):
                 for batch in loader:
@@ -307,10 +318,12 @@ class MAPPOAgent:
                         b.float().to(self.device) for b in batch
                     ]
 
+                    # Update critic
                     values_pred = self.critic(batch_states).float()
-                    values_norm = ((values_pred - values_pred.mean()) / torch.clamp(values_pred.std(), min=1e-6)).float()
-                    returns_norm = ((batch_returns - batch_returns.mean()) / torch.clamp(batch_returns.std(), min=1e-6)).float()
-                    critic_loss = self.value_loss_scale * F.mse_loss(values_norm, returns_norm)
+                    values_pred = torch.clamp(values_pred, -50.0, 50.0)
+                    critic_loss = F.mse_loss(values_pred, batch_returns)
+                    critic_loss = torch.clamp(critic_loss, max=10.0)
+                    critic_loss = self.value_loss_scale * critic_loss
                     critic_loss += 0.001 * sum(p.pow(2).sum() for p in self.critic.parameters())
 
                     self.critic_optimizer.zero_grad()
@@ -319,26 +332,57 @@ class MAPPOAgent:
                     self.critic_optimizer.step()
                     total_critic_loss += critic_loss.item()
 
+                    # Update actors
                     for agent_idx, agent in enumerate(self.agents):
                         start_idx = sum(self.obs_dims[:agent_idx])
                         end_idx = start_idx + self.obs_dims[agent_idx]
                         agent_state = batch_states[:, start_idx:end_idx]
 
+                        # Get policy distribution
                         mean, std = agent(agent_state)
                         std = torch.clamp(std * self.epsilon, min=self.std_min, max=self.std_max)
                         dist = Normal(mean, std)
 
-                        agent_log_prob = dist.log_prob(batch_actions[:, agent_idx]).sum(dim=-1, keepdim=True)
-                        entropy = -dist.entropy().sum(dim=-1, keepdim=True)
+                        # Compute log probabilities
+                        agent_log_prob = dist.log_prob(batch_actions[:, agent_idx])
+                        agent_log_prob = torch.clamp(agent_log_prob, -20.0, 2.0)
+                        agent_log_prob = agent_log_prob.sum(dim=-1, keepdim=True)
 
-                        ratio = torch.exp(agent_log_prob - batch_log_probs_old[:, agent_idx].unsqueeze(1))
-                        surr1 = ratio * batch_advantages[:, agent_idx].unsqueeze(1)
-                        surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * batch_advantages[:, agent_idx].unsqueeze(1)
+                        # Compute probability ratio
+                        old_log_prob = batch_log_probs_old[:, agent_idx].unsqueeze(1)
+                        log_ratio = agent_log_prob - old_log_prob
+                        log_ratio = torch.clamp(log_ratio, -2.0, 2.0)
+                        ratio = torch.exp(log_ratio)
 
+                        # Compute surrogate objectives
+                        agent_advantages = batch_advantages[:, agent_idx].unsqueeze(1)
+                        surr1 = ratio * agent_advantages
+                        surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * agent_advantages
                         policy_loss = -torch.min(surr1, surr2).mean()
-                        entropy_loss = -self.entropy_scale * entropy.mean()
-                        actor_l2_loss = sum(0.001 * torch.norm(param) for param in agent.parameters())
-                        actor_loss = policy_loss + entropy_loss + actor_l2_loss
+
+                        # Compute positive entropy and handle entropy loss
+                        entropy = -dist.entropy().mean()
+                        entropy = torch.clamp(entropy, min=0.001, max=2.0)
+
+                        # Update entropy stats and scale
+                        self.entropy_stats['history'].append(entropy.item())
+                        if len(self.entropy_stats['history']) > 10:
+                            current_mean = np.mean(self.entropy_stats['history'])
+                            entropy_diff = current_mean - self.entropy_stats['target_entropy']
+                            
+                            if entropy_diff > 0:  # Entropy too high
+                                self.entropy_scale *= 1.005  # Increase penalty
+                            else:  # Entropy too low
+                                self.entropy_scale *= 0.995  # Decrease penalty
+                            
+                            self.entropy_scale = np.clip(self.entropy_scale, 0.001, 0.1)
+
+                        entropy_loss = -self.entropy_scale * entropy  # Negative for maximization
+                        entropy_loss = torch.clamp(entropy_loss, -1.0, 1.0)
+
+                        # Compute final actor loss
+                        actor_loss = policy_loss + entropy_loss
+                        actor_loss += 0.001 * sum(p.pow(2).sum() for p in agent.parameters())
 
                         self.optimizers[agent_idx].zero_grad()
                         actor_loss.backward()
@@ -346,33 +390,39 @@ class MAPPOAgent:
                         self.optimizers[agent_idx].step()
 
                         policy_losses[agent_idx].append(policy_loss.item())
-                        actor_loss_list[agent_idx].append(actor_loss.item())  # Track per-agent actor loss
+                        actor_loss_list[agent_idx].append(actor_loss.item())
                         total_actor_loss += actor_loss.item()
-                        total_entropy += entropy.mean().item()
+                        total_entropy += entropy.item()
+                        total_entropy_loss += entropy_loss.item()
 
-            avg_actor_loss = total_actor_loss / (self.ppo_epochs * len(loader) * self.num_agents)
-            avg_critic_loss = total_critic_loss / (self.ppo_epochs * len(loader))
-            avg_entropy = total_entropy / (self.ppo_epochs * len(loader) * self.num_agents)
-            avg_policy_losses = [np.mean(losses) for losses in policy_losses]
-            avg_actor_loss_list = [np.mean(losses) for losses in actor_loss_list]  # NEW: Average actor loss per agent
+                        if agent_idx == 0:  # Debug info for first agent
+                            print(f"Entropy: {entropy.item():.4f}, Scale: {self.entropy_scale:.4f}")
 
+            # Compute averages
+            n_updates = max(self.ppo_epochs * len(loader) * self.num_agents, 1)
+            avg_actor_loss = total_actor_loss / n_updates
+            avg_critic_loss = total_critic_loss / max(self.ppo_epochs * len(loader), 1)
+            avg_entropy = total_entropy / n_updates
+            avg_policy_losses = [np.mean(losses) if losses else 0.0 for losses in policy_losses]
+            avg_actor_loss_list = [np.mean(losses) if losses else 0.0 for losses in actor_loss_list]
+            avg_entropy_loss = total_entropy_loss / n_updates
+            print(f"avg_entropy_loss:{avg_entropy_loss}\n")
             return (
                 float(avg_actor_loss),
-                float(avg_critic_loss), 
+                float(avg_critic_loss),
                 float(avg_entropy),
                 avg_policy_losses,
-                avg_actor_loss_list,  # NEW: Return per-agent actor loss
-                values_pred.detach().float(),
-                returns.float(),
-                advantages.float()
+                avg_actor_loss_list,
+                values_pred.detach(),
+                returns.detach(),
+                advantages.detach()
             )
 
         except Exception as e:
             self.logger.error(f"Error in policy update: {str(e)}")
             self.logger.error(f"Traceback: {traceback.format_exc()}")
             raise
-
-
+    
     def compute_individual_gae(self, rewards, dones, values):
         """
         Computes GAE (Generalized Advantage Estimation) individually for each agent.
@@ -568,6 +618,8 @@ class MAPPOAgent:
         else:
             self.pd_weight = max(self.pd_weight * 0.9, 0.1)  # Decrease
 
+
+
     def train(self):
         self.training_metrics = TrainingMetrics(num_joints=self.num_joints)
         torch.autograd.set_detect_anomaly(True)
@@ -627,23 +679,11 @@ class MAPPOAgent:
                 actions, log_probs = self.get_actions(state, eval_mode=True)
                 next_state, rewards, done, info = self.env.step(actions)
 
-                # Stabilize and scale rewards
-                scaled_rewards = [
-                    self.reward_scaler.update_scale(
-                        self.reward_stabilizer.stabilize_reward(reward, self.current_episode / self.num_episodes)
-                    ) * reward 
-                    for reward in rewards
-                ]
-
-                # # Store experience in HER buffer
-                # self.her_buffer.add_experience_with_info(
-                #     state=state,
-                #     action=actions,
-                #     reward=scaled_rewards,
-                #     next_state=next_state,
-                #     done=done,
-                #     info=info
-                # )
+                # ----------------------------------------------------
+                # Do NOT use RewardStabilizer or AdaptiveRewardScaler
+                # Just take raw rewards from the environment:
+                # ----------------------------------------------------
+                scaled_rewards = rewards  # No scaling or stabilization
 
                 # Process next state
                 processed_next_state_list = self._process_state(next_state)
@@ -673,7 +713,7 @@ class MAPPOAgent:
                 ]
                 total_joint_errors.append(joint_errors)
 
-                # Calculate rewards
+                # Calculate rewards with your original reward function
                 overall_reward, individual_rewards, prev_best, success = compute_reward(
                     distance=distance,
                     begin_distance=begin_distance,
@@ -708,7 +748,7 @@ class MAPPOAgent:
                 step += 1
 
             # Update policy and log results
-            actor_loss, critic_loss, entropy, policy_loss_per_agent,avg_actor_loss_list, values, returns, advantages = \
+            actor_loss, critic_loss, entropy, policy_loss_per_agent, avg_actor_loss_list, values, returns, advantages = \
                 self.update_policy(trajectories)
 
             # Log episode statistics
@@ -736,6 +776,8 @@ class MAPPOAgent:
         self.training_metrics.save_final_report(metrics)
 
         return metrics
+
+
 
 
     def _process_state(self, state):
