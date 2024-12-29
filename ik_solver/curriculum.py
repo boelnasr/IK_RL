@@ -1,164 +1,208 @@
 from collections import deque
+import numpy as np
+import logging
 
 class CurriculumManager:
-    def __init__(self, 
-                 initial_difficulty=1.0, 
-                 max_difficulty=5.0, 
-                 min_difficulty=0.5,
-                 success_threshold=0.7, 
-                 window_size=100, 
-                 difficulty_increment=0.5,
-                 decay_rate=0.9,
-                 num_agents=6):
+    """
+    A sophisticated curriculum manager that handles per-agent difficulty adaptation
+    based on performance history and success rates. It uses rolling windows for
+    more accurate performance tracking and implements proportional difficulty adjustments.
+    """
+    def __init__(
+        self,
+        initial_difficulty=1.0,
+        max_difficulty=5.0,
+        min_difficulty=0.5,
+        success_threshold=0.7,
+        window_size=100,
+        difficulty_increment=0.2,
+        decay_rate=0.95,
+        num_agents=6
+    ):
         """
-        Initializes the CurriculumManager.
-
+        Initialize the curriculum manager with performance tracking for multiple agents.
+        
         Args:
-            initial_difficulty (float): Starting difficulty level.
-            max_difficulty (float): Maximum difficulty level.
-            min_difficulty (float): Minimum difficulty level.
-            success_threshold (float): Success rate required to move to the next stage.
-            window_size (int): Number of episodes over which to calculate success rate.
-            difficulty_increment (float): Increment step for increasing difficulty (global).
-            decay_rate (float): Rate at which difficulty decreases after failure (0 < decay_rate < 1).
-            num_agents (int): Number of agents for per-agent difficulty.
+            initial_difficulty: Starting difficulty level for all agents
+            max_difficulty: Upper bound for difficulty
+            min_difficulty: Lower bound for difficulty
+            success_threshold: Required success rate to increase difficulty
+            window_size: Number of episodes to consider for success rate calculation
+            difficulty_increment: Base increment for difficulty increases
+            decay_rate: Base rate for difficulty decreases
+            num_agents: Number of agents being managed
         """
-        self.current_difficulty = initial_difficulty
+        # Core parameters
         self.max_difficulty = max_difficulty
         self.min_difficulty = min_difficulty
         self.success_threshold = success_threshold
         self.difficulty_increment = difficulty_increment
         self.decay_rate = decay_rate
-        self.success_history = deque(maxlen=window_size)
         self.window_size = window_size
-
-        # Per-agent difficulties and success rates
         self.num_agents = num_agents
+
+        # Initialize per-agent tracking
         self.difficulties = [initial_difficulty] * num_agents
-        self.success_rates = [0.0] * num_agents
+        self.success_histories = [deque(maxlen=window_size) for _ in range(num_agents)]
+        self.success_rates = [0.5] * num_agents  # Start at neutral value
+        
+        # Performance monitoring
+        self.performance_stats = {
+            'difficulty_changes': [[] for _ in range(num_agents)],
+            'success_rate_history': [[] for _ in range(num_agents)]
+        }
 
-    def log_success(self, success: bool):
-        """
-        Logs the success of an episode globally.
-
-        Args:
-            success (bool): Whether the episode was successful.
-        """
-        self.success_history.append(success)
-
-    def calculate_success_rate(self) -> float:
-        """
-        Calculates the success rate over the history window.
-
-        Returns:
-            float: Success rate (0.0 to 1.0).
-        """
-        return sum(self.success_history) / len(self.success_history) if self.success_history else 0.0
-
-    def should_increase_difficulty(self) -> bool:
-        """
-        Determines if the global difficulty should be increased based on recent performance.
-
-        Returns:
-            bool: True if the difficulty should be increased, False otherwise.
-        """
-        if len(self.success_history) == self.window_size:
-            success_rate = self.calculate_success_rate()
-            return success_rate >= self.success_threshold
-        return False
-
-    def should_decrease_difficulty(self) -> bool:
-        """
-        Determines if the global difficulty should be decreased due to poor performance.
-
-        Returns:
-            bool: True if the difficulty should be decreased, False otherwise.
-        """
-        if len(self.success_history) == self.window_size:
-            success_rate = self.calculate_success_rate()
-            return success_rate < (self.success_threshold / 2)
-        return False
-
-    def update_difficulty(self):
-        """
-        Dynamically adjusts the global difficulty level based on agent performance.
-        """
-        if self.should_increase_difficulty():
-            new_difficulty = min(self.current_difficulty + self.difficulty_increment, self.max_difficulty)
-            if new_difficulty != self.current_difficulty:
-                self.current_difficulty = new_difficulty
-                self.success_history.clear()  # Reset history after advancing difficulty
-                print(f"Global difficulty increased to {self.current_difficulty:.2f}")
-
-        elif self.should_decrease_difficulty():
-            new_difficulty = max(self.current_difficulty * self.decay_rate, self.min_difficulty)
-            if new_difficulty != self.current_difficulty:
-                self.current_difficulty = new_difficulty
-                self.success_history.clear()  # Reset history after difficulty decrease
-                print(f"Global difficulty decreased to {self.current_difficulty:.2f}")
-
-    def get_current_difficulty(self) -> float:
-        """
-        Gets the current global difficulty level.
-
-        Returns:
-            float: The current global difficulty level.
-        """
-        return self.current_difficulty
-
-    def reset(self):
-        """
-        Resets the difficulty and history.
-        """
-        self.current_difficulty = self.min_difficulty
-        self.success_history.clear()
-        print("CurriculumManager reset to initial difficulty.")
-
-    def get_agent_difficulty(self, agent_idx: int) -> float:
-        """
-        Gets the difficulty level for a specific agent.
-
-        Args:
-            agent_idx (int): Index of the agent.
-
-        Returns:
-            float: The difficulty level for the given agent.
-        """
-        return self.difficulties[agent_idx]
+        # Setup logging
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger('CurriculumManager')
 
     def log_agent_success(self, agent_idx: int, success: bool):
         """
-        Logs the success for a specific agent, updating its success rate.
-
+        Record an agent's success/failure and update its success rate using
+        a rolling window approach.
+        
         Args:
-            agent_idx (int): Index of the agent.
-            success (bool): True if the agent succeeded in the episode, False otherwise.
+            agent_idx: Index of the agent
+            success: Whether the agent succeeded (True) or failed (False)
         """
-        # Update the per-agent exponential moving average of success
-        self.success_rates[agent_idx] = 0.9 * self.success_rates[agent_idx] + 0.1 * int(success)
+        if not 0 <= agent_idx < self.num_agents:
+            self.logger.error(f"Invalid agent index: {agent_idx}")
+            return
+
+        # Update success history
+        self.success_histories[agent_idx].append(float(success))
+        
+        # Calculate new success rate based on recent history
+        if self.success_histories[agent_idx]:
+            self.success_rates[agent_idx] = np.mean(self.success_histories[agent_idx])
+            
+        # Track performance
+        self.performance_stats['success_rate_history'][agent_idx].append(
+            self.success_rates[agent_idx]
+        )
+        
+        self.logger.info(
+            f"Agent {agent_idx} - Success: {success}, "
+            f"New success rate: {self.success_rates[agent_idx]:.3f}"
+        )
 
     def update_agent_difficulty(self, agent_idx: int):
         """
-        Updates the difficulty level for a specific agent based on its success rate.
-
-        Logic:
-          - If success rate > self.success_threshold, increase agent difficulty slightly.
-          - If success rate < self.success_threshold/2, decrease agent difficulty slightly using decay.
-          - Otherwise, leave it unchanged.
+        Update an agent's difficulty based on its recent performance.
+        Uses proportional adjustments based on success/failure margins.
+        
+        Args:
+            agent_idx: Index of the agent to update
         """
+        if not 0 <= agent_idx < self.num_agents:
+            self.logger.error(f"Invalid agent index: {agent_idx}")
+            return
+
         agent_success_rate = self.success_rates[agent_idx]
-        agent_difficulty = self.difficulties[agent_idx]
+        current_difficulty = self.difficulties[agent_idx]
+        
+        # Store previous difficulty for change tracking
+        previous_difficulty = current_difficulty
 
-        if agent_success_rate > self.success_threshold:
-            # Increase difficulty
-            new_difficulty = min(agent_difficulty + 0.1, self.max_difficulty)
-            if new_difficulty != agent_difficulty:
-                self.difficulties[agent_idx] = new_difficulty
-                print(f"Agent {agent_idx} difficulty increased to {new_difficulty:.2f}")
+        # Calculate performance margins
+        success_margin = agent_success_rate - self.success_threshold
+        
+        # Adjust difficulty based on performance
+        if success_margin > 0:
+            # Increase difficulty proportionally to success margin
+            increase_factor = 1.0 + (self.difficulty_increment * success_margin)
+            new_difficulty = min(
+                current_difficulty * increase_factor,
+                self.max_difficulty
+            )
+        else:
+            # Decrease difficulty proportionally to failure margin
+            decrease_factor = self.decay_rate ** (1 + abs(success_margin))
+            new_difficulty = max(
+                current_difficulty * decrease_factor,
+                self.min_difficulty
+            )
 
-        elif agent_success_rate < (self.success_threshold / 2.0):
-            # Decrease difficulty
-            new_difficulty = max(agent_difficulty * self.decay_rate, self.min_difficulty)
-            if new_difficulty != agent_difficulty:
-                self.difficulties[agent_idx] = new_difficulty
-                print(f"Agent {agent_idx} difficulty decreased to {new_difficulty:.2f}")
+        # Update difficulty and track change
+        self.difficulties[agent_idx] = new_difficulty
+        difficulty_change = new_difficulty - previous_difficulty
+        self.performance_stats['difficulty_changes'][agent_idx].append(difficulty_change)
+
+        # Log the update
+        self.logger.info(
+            f"Agent {agent_idx} - "
+            f"Success rate: {agent_success_rate:.3f}, "
+            f"Previous difficulty: {previous_difficulty:.3f}, "
+            f"New difficulty: {new_difficulty:.3f}, "
+            f"Change: {difficulty_change:+.3f}"
+        )
+
+    def get_agent_difficulty(self, agent_idx: int) -> float:
+        """
+        Get the current difficulty level for a specific agent.
+        
+        Args:
+            agent_idx: Index of the agent
+            
+        Returns:
+            Current difficulty level for the agent
+        """
+        if not 0 <= agent_idx < self.num_agents:
+            self.logger.error(f"Invalid agent index: {agent_idx}")
+            return self.min_difficulty
+        return self.difficulties[agent_idx]
+
+    def get_agent_stats(self, agent_idx: int) -> dict:
+        """
+        Get detailed statistics for a specific agent's performance.
+        
+        Args:
+            agent_idx: Index of the agent
+            
+        Returns:
+            Dictionary containing agent statistics
+        """
+        if not 0 <= agent_idx < self.num_agents:
+            self.logger.error(f"Invalid agent index: {agent_idx}")
+            return {}
+
+        recent_changes = self.performance_stats['difficulty_changes'][agent_idx][-10:]
+        recent_success_rates = self.performance_stats['success_rate_history'][agent_idx][-10:]
+
+        return {
+            'current_difficulty': self.difficulties[agent_idx],
+            'current_success_rate': self.success_rates[agent_idx],
+            'recent_difficulty_changes': recent_changes,
+            'recent_success_rates': recent_success_rates,
+            'success_history_length': len(self.success_histories[agent_idx]),
+            'avg_recent_success_rate': np.mean(recent_success_rates) if recent_success_rates else 0.0
+        }
+
+    def reset_agent(self, agent_idx: int, initial_difficulty: float = None):
+        """
+        Reset an agent's curriculum state to initial values.
+        
+        Args:
+            agent_idx: Index of the agent to reset
+            initial_difficulty: Optional starting difficulty (defaults to min_difficulty)
+        """
+        if not 0 <= agent_idx < self.num_agents:
+            self.logger.error(f"Invalid agent index: {agent_idx}")
+            return
+
+        initial_difficulty = initial_difficulty if initial_difficulty is not None else self.min_difficulty
+        self.difficulties[agent_idx] = initial_difficulty
+        self.success_histories[agent_idx].clear()
+        self.success_rates[agent_idx] = 0.5
+        
+        self.logger.info(f"Reset agent {agent_idx} to initial difficulty: {initial_difficulty}")
+
+    def reset_all(self, initial_difficulty: float = None):
+        """
+        Reset all agents to their initial state.
+        
+        Args:
+            initial_difficulty: Optional starting difficulty for all agents
+        """
+        for agent_idx in range(self.num_agents):
+            self.reset_agent(agent_idx, initial_difficulty)

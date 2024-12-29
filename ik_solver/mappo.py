@@ -6,6 +6,8 @@ import torch.optim as optim
 import torch.nn.functional as F  # Import functional module for ELU and other activations
 import numpy as np
 import logging
+import matplotlib.pyplot as plt 
+import seaborn as sns
 from config import config
 from collections import deque
 from .reward_function import (compute_jacobian_angular, compute_jacobian_linear, compute_position_error, compute_quaternion_distance, compute_reward, compute_overall_distance,assign_joint_weights,compute_weighted_joint_rewards)
@@ -395,9 +397,6 @@ class MAPPOAgent:
                         total_entropy += entropy.item()
                         total_entropy_loss += entropy_loss.item()
 
-                        if agent_idx == 0:  # Debug info for first agent
-                            print(f"Entropy: {entropy.item():.4f}, Scale: {self.entropy_scale:.4f}")
-
             # Compute averages
             n_updates = max(self.ppo_epochs * len(loader) * self.num_agents, 1)
             avg_actor_loss = total_actor_loss / n_updates
@@ -406,7 +405,7 @@ class MAPPOAgent:
             avg_policy_losses = [np.mean(losses) if losses else 0.0 for losses in policy_losses]
             avg_actor_loss_list = [np.mean(losses) if losses else 0.0 for losses in actor_loss_list]
             avg_entropy_loss = total_entropy_loss / n_updates
-            print(f"avg_entropy_loss:{avg_entropy_loss}\n")
+            # print(f"avg_entropy_loss:{avg_entropy_loss}\n")
             return (
                 float(avg_actor_loss),
                 float(avg_critic_loss),
@@ -522,49 +521,46 @@ class MAPPOAgent:
         torch.save(actor.state_dict(), model_path)
         logging.info(f"Saved new best model for agent {agent_idx} at episode {episode} with Avg {criterion}: {avg_error:.6f}")
 
-
     def get_actions(self, state, eval_mode=False):
         processed_states = self._process_state(state)
         actions = []
         log_probs = []
-        
+
         for agent_idx, agent in enumerate(self.agents):
             state_tensor = processed_states[agent_idx].unsqueeze(0)
-            
+
             # Get RL policy action
             with torch.no_grad():
                 mean, std = agent(state_tensor)
+            
+            
+
             std = torch.clamp(std * self.epsilon, min=1e-4)
             dist = Normal(mean, std)
             rl_action = dist.sample()
             rl_action = rl_action.clamp(-1, 1)
             log_prob = dist.log_prob(rl_action).sum(dim=-1)
-            
+
             # Extract scalar action value
             rl_action_value = float(rl_action.squeeze().cpu().item())
-            
+
             if eval_mode:
                 # Calculate PD correction
                 current_angle = state[agent_idx]['joint_angle'].flatten()[0]
                 target_angle = self.env.target_joint_angles[agent_idx] if hasattr(self.env, 'target_joint_angles') else 0.0
                 error = target_angle - current_angle
-                
+
                 pd_correction = self.pd_controllers[agent_idx].compute(error)
-                pd_correction = np.clip(pd_correction, -1, 1)
-                
-                # Ensure PD correction is in the same range as RL action
                 pd_correction = np.clip(pd_correction, -1, 1)
 
                 # Combine RL and PD actions
                 combined_action = (1 - self.pd_weight) * rl_action_value + self.pd_weight * pd_correction
                 combined_action = np.clip(combined_action, -1, 1)
                 actions.append(combined_action)
-
             else:
                 # During training, use RL action directly
-                action = rl_action_value
-                actions.append(action)
-            
+                actions.append(rl_action_value)
+
             # Ensure log_prob is a single scalar
             log_probs.append(log_prob.item())
 
@@ -619,78 +615,198 @@ class MAPPOAgent:
             self.pd_weight = max(self.pd_weight * 0.9, 0.1)  # Decrease
 
 
-
     def train(self):
+        """
+        Main training loop with curriculum learning and comprehensive metrics tracking.
+        """
         self.training_metrics = TrainingMetrics(num_joints=self.num_joints)
         torch.autograd.set_detect_anomaly(True)
         
-        # Initialize curriculum manager
+        # Initialize curriculum manager with proper agent count
         self.curriculum_manager = CurriculumManager(
-            initial_difficulty=0.0, 
-            max_difficulty=3.0, 
-            success_threshold=0.8
+            initial_difficulty=0.0,
+            max_difficulty=3.0,
+            success_threshold=0.8,
+            num_agents=self.num_agents
         )
 
         for episode in range(self.num_episodes):
             self.current_episode = episode
-            difficulty = self.curriculum_manager.get_current_difficulty()
-            state = self.env.reset(difficulty=difficulty)
+            
+            # Get current difficulties for each agent before reset
+            current_difficulties = [
+                self.curriculum_manager.get_agent_difficulty(i) 
+                for i in range(self.num_agents)
+            ]
+            
+            # Reset environment with current difficulties
+            state = self.env.reset(difficulties=current_difficulties)
             done = False
             step = 0
             
-            # Initialize tracking lists
+            # Initialize tracking lists for metrics
             total_rewards = [[] for _ in range(self.num_agents)]
             total_errors = [[] for _ in range(self.num_agents)]
             total_joint_errors = []
+            difficulties_history = [[] for _ in range(self.num_agents)]  # Track difficulties for each agent
             
-            # Update learning rate
+            # Update learning rate based on mean error
             mean_error = np.mean([np.nanmean(errors) for errors in total_errors if errors])
             self.lr_manager.step(mean_error)
 
-            # Episode variables
+            # Initialize episode variables
             begin_distance = None
             prev_best = float('inf')
             cumulative_reward = 0
+            
+            # Save attention visualization periodically
+            
+            # if episode > 0 and episode % 100 == 0:  # Visualization frequency
+            #     try:
+            #         # Create base attention visualization directory if it doesn't exist
+            #         viz_path = os.path.join(self.base_path, 'attention_visualizations')
+            #         os.makedirs(viz_path, exist_ok=True)
+                    
+            #         # Process states and create a figure with multiple subplots
+            #         processed_states = self._process_state(state)
+                    
+            #         # For each agent, create a separate figure with subplots for attention components
+            #         for agent_idx in range(self.num_agents):
+            #             # Create a figure for this agent with 2x2 subplots
+            #             fig = plt.figure(figsize=(20, 15))
+                        
+            #             with torch.no_grad():
+            #                 # Get state tensor for this agent
+            #                 state_tensor = processed_states[agent_idx].unsqueeze(0)
+                            
+            #                 # Forward pass to get attention weights
+            #                 _, _ = self.agents[agent_idx](state_tensor)
+                            
+            #                 # Get attention components
+            #                 attn_components = self.agents[agent_idx].get_attention_weights()
+                            
+            #                 if attn_components is not None:
+            #                     # Get attention matrices
+            #                     attn_matrix = attn_components['attention']     # [batch, heads, dim, dim]
+            #                     query_matrix = attn_components['query']        # [batch, dim, 1]
+            #                     key_matrix = attn_components['key']           # [batch, dim, 1]
 
-            # Log initial state
+            #                     # Print shapes and statistics
+            #                     print(f"\nAgent {agent_idx} Matrices:")
+            #                     print("Attention shape:", attn_matrix.shape)
+            #                     print("Query shape:", query_matrix.shape)
+            #                     print("Key shape:", key_matrix.shape)
+
+            #                     # 1. Raw Attention Matrix (averaged over heads)
+            #                     plt.subplot(2, 2, 1)
+            #                     raw_attn = attn_matrix.mean(dim=[0, 1]).cpu().numpy()
+            #                     sns.heatmap(raw_attn, cmap='coolwarm', center=0, annot=False, 
+            #                             square=True, cbar=True)
+            #                     plt.title(f'Agent {agent_idx} Raw Attention Matrix')
+            #                     plt.xlabel('Feature Index')
+            #                     plt.ylabel('Feature Index')
+
+            #                     # 2. Query Matrix
+            #                     plt.subplot(2, 2, 2)
+            #                     query_data = query_matrix.squeeze().cpu().numpy()
+            #                     query_data = query_data.reshape(int(np.sqrt(len(query_data))), -1)
+            #                     sns.heatmap(query_data, cmap='viridis', annot=False, 
+            #                             square=True, cbar=True)
+            #                     plt.title(f'Agent {agent_idx} Query Matrix')
+            #                     plt.xlabel('Feature Dimension')
+            #                     plt.ylabel('Feature Dimension')
+
+            #                     # 3. Key Matrix
+            #                     plt.subplot(2, 2, 3)
+            #                     key_data = key_matrix.squeeze().cpu().numpy()
+            #                     key_data = key_data.reshape(int(np.sqrt(len(key_data))), -1)
+            #                     sns.heatmap(key_data, cmap='viridis', annot=False, 
+            #                             square=True, cbar=True)
+            #                     plt.title(f'Agent {agent_idx} Key Matrix')
+            #                     plt.xlabel('Feature Dimension')
+            #                     plt.ylabel('Feature Dimension')
+
+            #                     # 4. Attention Pattern
+            #                     plt.subplot(2, 2, 4)
+            #                     attn_pattern = torch.matmul(query_matrix.transpose(-2, -1), 
+            #                                             key_matrix).squeeze().cpu().numpy()
+            #                     sns.heatmap(attn_pattern, cmap='coolwarm', center=0, 
+            #                             annot=False, square=True, cbar=True)
+            #                     plt.title(f'Agent {agent_idx} Attention Pattern')
+            #                     plt.xlabel('Key Dimension')
+            #                     plt.ylabel('Query Dimension')
+
+            #                     # Save statistics
+            #                     print(f"\nAgent {agent_idx} Statistics:")
+            #                     print("Attention mean:", torch.mean(attn_matrix).item())
+            #                     print("Attention std:", torch.std(attn_matrix).item())
+            #                     print("Query mean:", torch.mean(query_matrix).item())
+            #                     print("Query std:", torch.std(query_matrix).item())
+            #                     print("Key mean:", torch.mean(key_matrix).item())
+            #                     print("Key std:", torch.std(key_matrix).item())
+
+            #                 else:
+            #                     print(f"No attention weights available for agent {agent_idx}")
+
+            #             plt.tight_layout()
+                        
+            #             # Save agent-specific visualization
+            #             attention_file = os.path.join(viz_path, f'attention_agent_{agent_idx}_episode_{episode:05d}.png')
+            #             plt.savefig(attention_file, dpi=300, bbox_inches='tight')
+            #             plt.close()
+                    
+            #         print(f"Saved attention visualizations for episode {episode}")
+                    
+            #     except Exception as e:
+            #         print(f"Failed to save attention visualization: {str(e)}")
+            #         traceback.print_exc()
+            
+            # # Log initial state
             initial_joint_angles = [
-                p.getJointState(self.env.robot_id, i)[0] for i in self.env.joint_indices
+                p.getJointState(self.env.robot_id, i)[0] 
+                for i in self.env.joint_indices
             ]
             logging.info(f"Episode {episode} - Initial joint angles: {initial_joint_angles}")
+            logging.info(f"Episode {episode} - Initial difficulties: {current_difficulties}")
 
-            # Initialize trajectories
+            # Initialize trajectory storage for each agent
             trajectories = [{
-                'states': [], 
-                'actions': [], 
-                'log_probs': [], 
-                'rewards': [], 
-                'dones': []
+                'states': [],
+                'actions': [],
+                'log_probs': [],
+                'rewards': [],
+                'dones': [],
+                'difficulties': []  # Add difficulties to trajectories
             } for _ in range(self.num_agents)]
 
             while not done and step < self.max_steps_per_episode:
                 if step % 10 == 0:
                     logging.debug(f"Step {step}: Executing action")
 
-                # Process current state
+                # Process states and get actions
                 processed_state_list = self._process_state(state)
                 global_state = torch.cat(processed_state_list).unsqueeze(0).to(self.device)
-
-                # Get actions and execute
                 actions, log_probs = self.get_actions(state, eval_mode=True)
+                
+                # Execute action in environment
                 next_state, rewards, done, info = self.env.step(actions)
+                
+                # Extract difficulties from info
+                agent_difficulties = info.get('agent_difficulties', [0.0] * self.num_agents)
+                
+                # Track difficulties
+                for i in range(self.num_agents):
+                    difficulties_history[i].append(agent_difficulties[i])
 
-                # ----------------------------------------------------
-                # Do NOT use RewardStabilizer or AdaptiveRewardScaler
-                # Just take raw rewards from the environment:
-                # ----------------------------------------------------
-                scaled_rewards = rewards  # No scaling or stabilization
+                # Use raw rewards without scaling
+                scaled_rewards = rewards
 
-                # Process next state
+                # Process next state and prepare tensors
                 processed_next_state_list = self._process_state(next_state)
                 global_next_state = torch.cat(processed_next_state_list).unsqueeze(0).to(self.device)
                 actions_tensor = torch.tensor(actions, dtype=torch.float32).unsqueeze(0).to(self.device)
 
-                # Calculate distances and errors
+                # Calculate performance metrics
                 current_position, current_orientation = self.get_end_effector_pose()
                 target_position, target_orientation = self.get_target_pose()
                 distance = compute_overall_distance(
@@ -701,7 +817,7 @@ class MAPPOAgent:
                 if begin_distance is None:
                     begin_distance = distance
 
-                # Compute Jacobians and weights
+                # Compute movement weights
                 jacobian_linear = compute_jacobian_linear(self.env.robot_id, self.env.joint_indices, actions)
                 jacobian_angular = compute_jacobian_angular(self.env.robot_id, self.env.joint_indices, actions)
                 linear_weights, angular_weights = assign_joint_weights(jacobian_linear, jacobian_angular)
@@ -713,28 +829,13 @@ class MAPPOAgent:
                 ]
                 total_joint_errors.append(joint_errors)
 
-                # Calculate rewards with your original reward function
-                overall_reward, individual_rewards, prev_best, success = compute_reward(
-                    distance=distance,
-                    begin_distance=begin_distance,
-                    prev_best=prev_best,
-                    current_orientation=current_orientation,
-                    target_orientation=target_orientation,
-                    joint_errors=joint_errors,
-                    linear_weights=linear_weights,
-                    angular_weights=angular_weights,
-                    success_threshold=self.env.success_threshold,
-                    episode_number=episode,
-                    curriculum_manager=self.curriculum_manager,
-                    total_episodes=self.num_episodes
-                )
-
-                # Update trajectories and log results for each agent
+                # Update trajectories for each agent
                 for agent_idx in range(self.num_agents):
+                    # Store rewards and errors
                     total_rewards[agent_idx].append(scaled_rewards[agent_idx])
                     total_errors[agent_idx].append(joint_errors[agent_idx])
                     
-                    # Update trajectories
+                    # Update trajectory data
                     trajectories[agent_idx]['states'].append(processed_state_list[agent_idx])
                     trajectories[agent_idx]['actions'].append(
                         torch.tensor(actions[agent_idx], dtype=torch.float32).to(self.device))
@@ -743,18 +844,24 @@ class MAPPOAgent:
                     trajectories[agent_idx]['rewards'].append(
                         torch.tensor(scaled_rewards[agent_idx], dtype=torch.float32).to(self.device))
                     trajectories[agent_idx]['dones'].append(done)
+                    trajectories[agent_idx]['difficulties'].append(agent_difficulties[agent_idx])
 
+                # Update state
                 state = next_state
                 step += 1
 
-            # Update policy and log results
-            actor_loss, critic_loss, entropy, policy_loss_per_agent, avg_actor_loss_list, values, returns, advantages = \
-                self.update_policy(trajectories)
+            # Update policy using collected trajectories
+            actor_loss, critic_loss, entropy, policy_loss_per_agent, \
+            avg_actor_loss_list, values, returns, advantages = self.update_policy(trajectories)
 
-            # Log episode statistics
+            # Calculate episode statistics
             success_status = info.get('success_per_joint', [False] * self.num_agents)
             episode_rewards = [np.sum(agent_rewards) for agent_rewards in total_rewards]
+            
+            # Calculate average difficulties for the episode
+            mean_difficulties = [np.mean(difficulties_history[i]) for i in range(self.num_agents)]
 
+            # Log comprehensive episode data
             self.training_metrics.log_episode(
                 joint_errors=total_joint_errors,
                 rewards=episode_rewards,
@@ -765,11 +872,12 @@ class MAPPOAgent:
                 policy_loss=policy_loss_per_agent,
                 advantages=advantages.cpu().numpy(),
                 env=self.env,
-                actor_loss_per_actor=avg_actor_loss_list,  # Pass actor losses per actor
-                success_threshold=self.env.success_threshold
+                actor_loss_per_actor=avg_actor_loss_list,
+                success_threshold=self.env.success_threshold,
+                curriculum_difficulty=mean_difficulties
             )
 
-        # Save final results
+        # Save final results and generate reports
         self.training_metrics.save_logs()
         metrics = self.training_metrics.calculate_metrics(env=self.env)
         self.training_metrics.plot_metrics(metrics, self.env, show_plots=False)
@@ -777,6 +885,57 @@ class MAPPOAgent:
 
         return metrics
 
+    def plot_attention_evolution(self, episode_dir):
+        """
+        Create a summary plot showing how attention patterns evolved during the episode.
+        
+        Args:
+            episode_dir: Directory containing attention visualizations for the episode
+        """
+        try:
+            import matplotlib.pyplot as plt
+            import glob
+            
+            # Get all step visualization files
+            step_files = sorted(glob.glob(os.path.join(episode_dir, 'step_*.png')))
+            
+            if step_files:
+                num_steps = len(step_files)
+                fig = plt.figure(figsize=(20, 5 * self.num_agents))
+                
+                for agent_idx in range(self.num_agents):
+                    plt.subplot(self.num_agents, 1, agent_idx + 1)
+                    
+                    # Plot attention evolution
+                    attention_evolution = []
+                    step_numbers = []
+                    
+                    for step_file in step_files:
+                        step_num = int(os.path.basename(step_file).split('_')[1].split('.')[0])
+                        step_numbers.append(step_num)
+                        
+                        # Get attention weights for this step
+                        with torch.no_grad():
+                            attn_weights = self.agents[agent_idx].get_attention_weights()
+                            if attn_weights is not None:
+                                weights = attn_weights['attention_weights'].mean(dim=1).cpu().numpy()
+                                attention_evolution.append(weights)
+                    
+                    if attention_evolution:
+                        attention_evolution = np.array(attention_evolution)
+                        plt.imshow(attention_evolution, aspect='auto', cmap='viridis')
+                        plt.colorbar(label='Attention Weight')
+                        plt.xlabel('Attention Head Index')
+                        plt.ylabel('Step Number')
+                        plt.title(f'Agent {agent_idx} Attention Evolution')
+                        
+                plt.tight_layout()
+                plt.savefig(os.path.join(episode_dir, 'attention_evolution.png'), dpi=300, bbox_inches='tight')
+                plt.close()
+                
+        except Exception as e:
+            self.logger.error(f"Failed to create attention evolution plot: {str(e)}")
+            self.logger.error(traceback.format_exc())
 
 
 
@@ -1119,6 +1278,188 @@ class MAPPOAgent:
             return False
 
 
+    def visualize_attention(self, state, save_path=None, normalize=False):
+        """
+        Visualize attention weights for each actor, showing separate plots for each attention head.
+        
+        Args:
+            state: Current state input
+            save_path: Optional path to save the visualization
+            normalize: Whether to normalize attention weights
+        """
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        import os
+
+        try:
+            if save_path:
+                base_dir = os.path.dirname(save_path)
+                os.makedirs(base_dir, exist_ok=True)
+
+            processed_states = self._process_state(state)
+
+            # Process each actor
+            for agent_idx, agent in enumerate(self.agents):
+                if hasattr(agent, 'use_attention') and agent.use_attention:
+                    try:
+                        with torch.no_grad():
+                            state_tensor = processed_states[agent_idx].unsqueeze(0)
+                            _, _ = agent(state_tensor)  # Forward pass
+                            attn_components = agent.get_attention_weights()
+
+                            if attn_components is not None:
+                                # Create a figure for this agent's attention components
+                                num_heads = attn_components['attention_weights'].shape[1]  # Get number of heads
+                                fig = plt.figure(figsize=(20, 5 * num_heads))
+                                
+                                # Plot Q, K, V matrices for each head
+                                for head_idx in range(num_heads):
+                                    # Query visualization
+                                    plt.subplot(num_heads, 4, head_idx * 4 + 1)
+                                    query = attn_components['query'].squeeze()[0, head_idx].cpu().numpy()
+                                    sns.heatmap(query.reshape(-1, 1), 
+                                            cmap='coolwarm',
+                                            center=0,
+                                            annot=True,
+                                            fmt='.2f')
+                                    plt.title(f'Head {head_idx} Query')
+                                    
+                                    # Key visualization
+                                    plt.subplot(num_heads, 4, head_idx * 4 + 2)
+                                    key = attn_components['key'].squeeze()[0, head_idx].cpu().numpy()
+                                    sns.heatmap(key.reshape(-1, 1),
+                                            cmap='coolwarm',
+                                            center=0,
+                                            annot=True,
+                                            fmt='.2f')
+                                    plt.title(f'Head {head_idx} Key')
+                                    
+                                    # Raw attention weights
+                                    plt.subplot(num_heads, 4, head_idx * 4 + 3)
+                                    raw_weights = attn_components['raw_weights'].squeeze()[head_idx].cpu().numpy()
+                                    sns.heatmap(raw_weights,
+                                            cmap='coolwarm',
+                                            center=0,
+                                            annot=True,
+                                            fmt='.2f')
+                                    plt.title(f'Head {head_idx} Raw Attention')
+                                    
+                                    # Final attention weights
+                                    plt.subplot(num_heads, 4, head_idx * 4 + 4)
+                                    attn_weights = attn_components['attention_weights'].squeeze()[head_idx].cpu().numpy()
+                                    
+                                    if normalize:
+                                        attn_weights = (attn_weights - attn_weights.min()) / (
+                                            attn_weights.max() - attn_weights.min() + 1e-8
+                                        )
+                                    
+                                    sns.heatmap(attn_weights,
+                                            cmap='coolwarm',
+                                            vmin=0,
+                                            vmax=1,
+                                            annot=True,
+                                            fmt='.2f')
+                                    plt.title(f'Head {head_idx} Final Attention')
+
+                                plt.suptitle(f'Actor {agent_idx} Attention Analysis', fontsize=16, y=1.02)
+                                plt.tight_layout()
+
+                                # Save or display the plot
+                                if save_path:
+                                    agent_path = os.path.join(base_dir, f'actor_{agent_idx}_attention.png')
+                                    plt.savefig(agent_path, dpi=300, bbox_inches='tight')
+                                    self.logger.info(f"Saved attention visualization for actor {agent_idx} to {agent_path}")
+                                    plt.close()
+                                else:
+                                    plt.show()
+
+                    except Exception as e:
+                        self.logger.warning(f"Failed to visualize attention for actor {agent_idx}: {str(e)}")
+                        self.logger.error(traceback.format_exc())
+
+            # Similar visualization for critic
+            if hasattr(self.critic, 'use_attention') and self.critic.use_attention:
+                try:
+                    with torch.no_grad():
+                        global_state = torch.cat(processed_states).unsqueeze(0)
+                        _ = self.critic(global_state)
+                        critic_weights = self.critic.get_attention_weights()
+
+                        if critic_weights:
+                            for block_idx, block_components in enumerate(critic_weights):
+                                num_heads = block_components['attention_weights'].shape[1]
+                                fig = plt.figure(figsize=(20, 5 * num_heads))
+
+                                for head_idx in range(num_heads):
+                                    # Similar plotting code as above for each head
+                                    # Query visualization
+                                    plt.subplot(num_heads, 4, head_idx * 4 + 1)
+                                    query = block_components['query'].squeeze()[0, head_idx].cpu().numpy()
+                                    sns.heatmap(query.reshape(-1, 1),
+                                            cmap='magma',
+                                            center=0,
+                                            annot=True,
+                                            fmt='.2f')
+                                    plt.title(f'Head {head_idx} Query')
+                                    
+                                    # Key visualization
+                                    plt.subplot(num_heads, 4, head_idx * 4 + 2)
+                                    key = block_components['key'].squeeze()[0, head_idx].cpu().numpy()
+                                    sns.heatmap(key.reshape(-1, 1),
+                                            cmap='magma',
+                                            center=0,
+                                            annot=True,
+                                            fmt='.2f')
+                                    plt.title(f'Head {head_idx} Key')
+                                    
+                                    # Raw attention weights
+                                    plt.subplot(num_heads, 4, head_idx * 4 + 3)
+                                    raw_weights = block_components['raw_weights'].squeeze()[head_idx].cpu().numpy()
+                                    sns.heatmap(raw_weights,
+                                            cmap='magma',
+                                            center=0,
+                                            annot=True,
+                                            fmt='.2f')
+                                    plt.title(f'Head {head_idx} Raw Attention')
+                                    
+                                    # Final attention weights
+                                    plt.subplot(num_heads, 4, head_idx * 4 + 4)
+                                    attn_weights = block_components['attention_weights'].squeeze()[head_idx].cpu().numpy()
+                                    
+                                    if normalize:
+                                        attn_weights = (attn_weights - attn_weights.min()) / (
+                                            attn_weights.max() - attn_weights.min() + 1e-8
+                                        )
+                                    
+                                    sns.heatmap(attn_weights,
+                                            cmap='magma',
+                                            vmin=0,
+                                            vmax=1,
+                                            annot=True,
+                                            fmt='.2f')
+                                    plt.title(f'Head {head_idx} Final Attention')
+
+                                plt.suptitle(f'Critic Block {block_idx} Attention Analysis', fontsize=16, y=1.02)
+                                plt.tight_layout()
+
+                                if save_path:
+                                    critic_path = os.path.join(base_dir, f'critic_block_{block_idx}_attention.png')
+                                    plt.savefig(critic_path, dpi=300, bbox_inches='tight')
+                                    self.logger.info(f"Saved attention visualization for critic block {block_idx} to {critic_path}")
+                                    plt.close()
+                                else:
+                                    plt.show()
+
+                except Exception as e:
+                    self.logger.warning(f"Failed to visualize attention for critic: {str(e)}")
+                    self.logger.error(traceback.format_exc())
+
+        except Exception as e:
+            self.logger.error(f"Error in visualize_attention: {str(e)}")
+            self.logger.error(traceback.format_exc())
+
+
+
 class AdaptiveRewardScaler:
     def __init__(self, window_size=100, initial_scale=1.0, adjustment_rate=0.02):
         self.window_size = window_size
@@ -1208,3 +1549,4 @@ class RewardStabilizer:
             'reward_std': np.std(self.reward_history) if len(self.reward_history) > 0 else 0,
             'reward_mean': np.mean(self.reward_history) if len(self.reward_history) > 0 else 0
         }
+

@@ -39,9 +39,9 @@ class InverseKinematicsEnv(gym.Env):
         self.success_threshold = self.max_success_threshold
         self.curriculum_manager = CurriculumManager(
             initial_difficulty=0.0, 
-            max_difficulty=2.0, 
-            success_threshold=1.0,  # Set to 1.0 for maximum difficulty
-            window_size=10
+            max_difficulty=4.0, 
+            success_threshold=0.9,  # Set to 1.0 for maximum difficulty
+            window_size=200
         )
         # PyBullet setup
         self.physics_client = p.connect(p.DIRECT)  # Use p.DIRECT for headless simulation
@@ -159,6 +159,7 @@ class InverseKinematicsEnv(gym.Env):
 
         print(f"Number of joints in the robot: {self.num_joints}")
 
+
     def update_success_threshold(self):
         """
         Updates the success threshold in intervals:
@@ -171,17 +172,13 @@ class InverseKinematicsEnv(gym.Env):
         current_episode = self.episode_number
 
         # Define intervals and decrease logic
-        decrease_phase_end = int(3 * total_episodes / 2)  # First 2/3 episodes
+        decrease_phase_end = int(2 * total_episodes / 3)  # First 2/3 episodes
         interval_count = 10  # Number of intervals for decreasing
-        episodes_per_interval = decrease_phase_end // interval_count
+        episodes_per_interval = max(1, decrease_phase_end // interval_count)  # Avoid division by zero
 
         if current_episode <= decrease_phase_end:
-            # Determine the current interval
-            current_interval = current_episode // episodes_per_interval
-
-            # Avoid exceeding the number of intervals
-            if current_interval >= interval_count:
-                current_interval = interval_count - 1
+            # Determine the current interval, clamped to `interval_count - 1`
+            current_interval = min(current_episode // episodes_per_interval, interval_count - 1)
 
             # Calculate the threshold based on the interval
             self.success_threshold = max_threshold - (
@@ -191,7 +188,14 @@ class InverseKinematicsEnv(gym.Env):
             # After 2/3 episodes, hold constant at the minimum threshold
             self.success_threshold = min_threshold
 
+        # Ensure it does not go below the minimum threshold
+        self.success_threshold = max(self.success_threshold, min_threshold)
+
         return self.success_threshold
+
+
+
+
     def compute_forward_kinematics(self, joint_angles):
         """
         Computes the end-effector's position and orientation based on joint angles.
@@ -325,12 +329,12 @@ class InverseKinematicsEnv(gym.Env):
                 
         return None  # No valid orientation found
 
-    def reset(self, difficulty=1.0):
+    def reset(self, difficulties=1.0):
         """
         Reset environment with workspace validation.
         """
         self.success_threshold = self.update_success_threshold()
-        self.current_difficulty = difficulty
+        self.current_difficulty = difficulties
 
         # Reset joint angles to random values within limits
         self.joint_angles = np.array([
@@ -388,41 +392,43 @@ class InverseKinematicsEnv(gym.Env):
         return self.get_all_agent_observations()
 
 
-
-
     def step(self, actions):
         """
-        Executes one environment step with error handling, success computation, and safety checks.
+        Executes one environment step with proper joint error calculation based on 
+        the difference between predicted and target joint angles.
         """
         try:
-            # Apply clipped actions to joints
-            for i, action in enumerate(actions):
-                action = np.clip(float(action), self.joint_limits[i][0], self.joint_limits[i][1])
-                try:
-                    p.setJointMotorControl2(
-                        self.robot_id, self.joint_indices[i], p.POSITION_CONTROL, targetPosition=action
-                    )
-                except Exception as e:
-                    logging.warning(f"Failed to set joint {i} target position: {e}")
+            # Store target angles from actions - these represent our intended joint positions
+            target_joint_angles = np.array([
+                np.clip(float(action), self.joint_limits[i][0], self.joint_limits[i][1])
+                for i, action in enumerate(actions)
+            ])
 
-            # Step simulation
-            try:
-                p.stepSimulation()
-                self.current_step += 1
-            except Exception as e:
-                logging.error(f"Error stepping simulation: {e}")
-                raise
+            # Apply actions to move the robot
+            for i, target_angle in enumerate(target_joint_angles):
+                p.setJointMotorControl2(
+                    self.robot_id, 
+                    self.joint_indices[i], 
+                    p.POSITION_CONTROL, 
+                    targetPosition=target_angle
+                )
+            p.stepSimulation()
+            self.current_step += 1
 
-            # Update joint states
+            # Get the actual achieved joint angles after movement
             self.joint_angles = np.array([
                 p.getJointState(self.robot_id, i)[0] for i in self.joint_indices
             ], dtype=np.float32)
 
-            # Get end-effector pose
+            # Calculate joint errors as the difference between target and achieved angles
+            # This tells us how far each joint is from where we wanted it to be
+            self.joint_errors = np.abs(self.joint_angles - target_joint_angles)
+
+            # Update end effector state and compute task space errors
             self.current_position, self.current_orientation = self.get_end_effector_pose()
             self.current_quaternion = np.array(self.current_orientation, dtype=np.float32)
 
-            # Compute errors
+            # Calculate position and orientation errors in task space
             self.position_error = self.current_position - self.target_position
             self.orientation_error = self.compute_orientation_difference(
                 self.current_orientation, self.target_orientation
@@ -431,14 +437,51 @@ class InverseKinematicsEnv(gym.Env):
                 self.current_position, self.target_position,
                 self.current_orientation, self.target_orientation
             )
-            self.joint_errors = np.abs(self.joint_angles - self.previous_joint_angles)
 
-            # Compute Jacobians and weights
+            # Calculate movement weights using Jacobians
             jacobian_linear = compute_jacobian_linear(self.robot_id, self.joint_indices, self.joint_angles)
             jacobian_angular = compute_jacobian_angular(self.robot_id, self.joint_indices, self.joint_angles)
             self.linear_weights, self.angular_weights = assign_joint_weights(jacobian_linear, jacobian_angular)
 
-            # Compute rewards
+            # Evaluate success and update curriculum for each joint
+            agent_successes = []
+            step_difficulties = []
+            success_details = []  # Track detailed metrics for debugging
+
+            for i in range(self.num_joints):
+                # Determine success based on how close we got to the target angle
+                agent_success = self.is_agent_success(i, self.joint_errors)
+                agent_successes.append(agent_success)
+
+                # Update the curriculum based on achievement of target angles
+                self.curriculum_manager.log_agent_success(i, agent_success)
+                self.curriculum_manager.update_agent_difficulty(i)
+                current_difficulty = self.curriculum_manager.get_agent_difficulty(i)
+                step_difficulties.append(current_difficulty)
+
+                # Store detailed information for analysis
+                success_details.append({
+                    'joint_idx': i,
+                    'target_angle': float(target_joint_angles[i]),
+                    'achieved_angle': float(self.joint_angles[i]),
+                    'error': float(self.joint_errors[i]),
+                    'success': agent_success,
+                    'difficulty': current_difficulty
+                })
+                
+                # print(f"Joint {i}: Target={target_joint_angles[i]:.4f}, "
+                #     f"Achieved={self.joint_angles[i]:.4f}, "
+                #     f"Error={self.joint_errors[i]:.4f}, "
+                #     f"Success={agent_success}, "
+                #     f"Difficulty={current_difficulty:.3f}")
+
+            # Track difficulty history
+            if not hasattr(self, 'difficulties_history'):
+                self.difficulties_history = [[] for _ in range(self.num_joints)]
+            for i in range(self.num_joints):
+                self.difficulties_history[i].append(step_difficulties[i])
+
+            # Compute rewards with the corrected joint errors
             try:
                 rewards, individual_rewards, self.previous_best_distance, overall_success = compute_reward(
                     distance=float(self.current_distance),
@@ -446,32 +489,29 @@ class InverseKinematicsEnv(gym.Env):
                     prev_best=float(self.previous_best_distance),
                     current_orientation=self.current_quaternion.tolist(),
                     target_orientation=self.target_quaternion.tolist(),
-                    joint_errors=self.joint_errors.tolist(),
+                    joint_errors=self.joint_errors.tolist(),  # Now using target-based errors
                     linear_weights=self.linear_weights.tolist(),
                     angular_weights=self.angular_weights.tolist(),
+                    difficulties=step_difficulties,
                     episode_number=self.episode_number,
-                    curriculum_manager=self.curriculum_manager,
                     total_episodes=self.total_episodes,
                     success_threshold=float(self.success_threshold)
                 )
+
             except Exception as e:
                 logging.error(f"Reward computation error: {e}")
-                rewards, individual_rewards, overall_success = -1.0, [-1.0] * len(self.joint_indices), False
+                rewards = np.array([-0.1] * self.num_joints)  # Smaller penalty for stability
+                individual_rewards = [-0.1] * self.num_joints
+                overall_success = False
 
-            # Determine success for each agent and overall success rate
-            agent_successes = [self.is_agent_success(i, self.joint_errors) for i in range(self.num_joints)]
+            # Calculate success metrics
             success_rate = sum(agent_successes) / self.num_joints
-            overall_success = success_rate == 1.0  # Overall success if all agents succeed
-            # for i in range(self.num_joints):
-            #     print(f"Agent {i} success: {agent_successes[i]}, reward: {individual_rewards[i]}")
-
-            # Check if episode is done
             done = self.current_step >= self.max_episode_steps or overall_success
-            self.previous_joint_angles = np.copy(self.joint_angles)
 
-            # Construct info dictionary
+            # Create comprehensive info dictionary
             info = {
                 'success_per_joint': agent_successes,
+                'success_details': success_details,  # Added detailed metrics
                 'overall_success_rate': success_rate,
                 'current_distance': float(self.current_distance),
                 'initial_distance': float(self.initial_distance),
@@ -480,20 +520,38 @@ class InverseKinematicsEnv(gym.Env):
                 'orientation_error': float(np.linalg.norm(self.orientation_error)),
                 'mean_joint_error': float(np.mean(self.joint_errors)),
                 'step': self.current_step,
-                'individual_rewards': individual_rewards,
+                'individual_rewards': rewards.tolist(),
+                'agent_difficulties': step_difficulties,
+                'joint_errors': self.joint_errors.tolist(),
+                'target_angles': target_joint_angles.tolist()  # Added for analysis
             }
 
+            # Log comprehensive performance metrics
+            logging.info(
+                f"Step {self.current_step}: "
+                f"Success Rate={success_rate:.3f}, "
+                f"Mean Joint Error={np.mean(self.joint_errors):.4f}, "
+                f"Distance={self.current_distance:.4f}, "
+                f"Difficulties={step_difficulties}"
+            )
+
+            # Store current angles for next step
+            self.previous_joint_angles = np.copy(self.joint_angles)
             return self.get_all_agent_observations(), rewards.tolist(), done, info
 
         except Exception as e:
             logging.error(f"Critical error in step: {e}")
             return (
                 self.get_all_agent_observations(),
-                [-1.0] * len(self.joint_indices),
+                [-0.1] * len(self.joint_indices),  # Smaller penalty for stability
                 True,
-                {'error': str(e)}
+                {
+                    'error': str(e),
+                    'agent_difficulties': [0.0] * self.num_joints,
+                    'step': self.current_step if hasattr(self, 'current_step') else 0,
+                    'rewards_valid': False
+                }
             )
-
 
     def get_all_agent_observations(self):
         """
@@ -613,7 +671,7 @@ class InverseKinematicsEnv(gym.Env):
                 # Determine if the mean joint error is below the current success threshold
         mean_position_error = np.nanmin(self.position_error)
         mean_orientation_error = np.nanmin(self.orientation_error)
-        joint_success = joint_error < self.success_threshold and mean_position_error < self.success_threshold and mean_orientation_error < self.success_threshold
+        joint_success = joint_error < self.success_threshold and mean_position_error < self.position_threshold and mean_orientation_error < self.orientation_threshold
         # Determine success based on joint error
         # joint_success = np.nanmean(joint_error) < error_threshold
 
