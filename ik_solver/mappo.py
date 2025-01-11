@@ -7,6 +7,9 @@ import torch.nn.functional as F  # Import functional module for ELU and other ac
 import numpy as np
 import logging
 import matplotlib.pyplot as plt 
+import matplotlib
+matplotlib.use('TkAgg')
+from .tester import MAPPOAgentTester
 import seaborn as sns
 from config import config
 from collections import deque
@@ -32,7 +35,8 @@ else:
     print("CUDA not available. Using CPU.")
 # Assuming compute_combined_reward and TrainingMetrics are defined elsewhere
 from .training_metrics import TrainingMetrics
-
+import json
+import datetime
 
 
 class MAPPOAgent:
@@ -226,6 +230,19 @@ class MAPPOAgent:
             validation_episodes=config.get('validation_episodes', 10)
         )
         logging.info("MAPPOAgent initialization complete.")
+    # Initialize best metrics tracking - simpler version
+        self.best_metrics = {
+        'mean_joint_error': [float('inf')] * self.num_agents
+    }
+        # Add for model selection
+        self.reward_min = float('inf')
+        self.reward_max = float('-inf')
+        self.model_history = {
+            'errors': [deque(maxlen=50) for _ in range(self.num_agents)],
+            'rewards': [deque(maxlen=50) for _ in range(self.num_agents)],
+            'success_rates': [deque(maxlen=50) for _ in range(self.num_agents)],
+            'best_scores': [float('-inf')] * self.num_agents
+        }
 
 
     def update_policy(self, trajectories):
@@ -364,7 +381,7 @@ class MAPPOAgent:
 
                         # Compute positive entropy and handle entropy loss
                         entropy = -dist.entropy().mean()
-                        entropy = torch.clamp(entropy, min=0.001, max=2.0)
+                        entropy = torch.clamp(entropy, min=0.001, max=10.0)
 
                         # Update entropy stats and scale
                         self.entropy_stats['history'].append(entropy.item())
@@ -505,7 +522,8 @@ class MAPPOAgent:
         agent_returns = torch.stack(agent_returns)
         
         return agent_advantages, agent_returns
-    
+
+
     def save_best_model(self, agent_idx, actor, episode, avg_error, criterion='mean_error'):
         """
         Save the best model for the specified agent based on the average joint error or other criteria.
@@ -615,6 +633,7 @@ class MAPPOAgent:
             self.pd_weight = max(self.pd_weight * 0.9, 0.1)  # Decrease
 
 
+
     def train(self):
         """
         Main training loop with curriculum learning and comprehensive metrics tracking.
@@ -659,108 +678,49 @@ class MAPPOAgent:
             prev_best = float('inf')
             cumulative_reward = 0
             
-            # Save attention visualization periodically
-            
-            # if episode > 0 and episode % 100 == 0:  # Visualization frequency
+            # # Save attention visualization periodically
+            # if episode > 0 and episode % 3000 == 0:  # Visualization frequency
             #     try:
             #         # Create base attention visualization directory if it doesn't exist
             #         viz_path = os.path.join(self.base_path, 'attention_visualizations')
             #         os.makedirs(viz_path, exist_ok=True)
                     
-            #         # Process states and create a figure with multiple subplots
             #         processed_states = self._process_state(state)
                     
-            #         # For each agent, create a separate figure with subplots for attention components
             #         for agent_idx in range(self.num_agents):
-            #             # Create a figure for this agent with 2x2 subplots
-            #             fig = plt.figure(figsize=(20, 15))
+            #             # Create a figure for this agent
+            #             fig = plt.figure(figsize=(10, 8))
                         
             #             with torch.no_grad():
-            #                 # Get state tensor for this agent
             #                 state_tensor = processed_states[agent_idx].unsqueeze(0)
-                            
-            #                 # Forward pass to get attention weights
             #                 _, _ = self.agents[agent_idx](state_tensor)
                             
             #                 # Get attention components
-            #                 attn_components = self.agents[agent_idx].get_attention_weights()
+            #                 attn_weights = self.agents[agent_idx].get_attention_weights()
                             
-            #                 if attn_components is not None:
-            #                     # Get attention matrices
-            #                     attn_matrix = attn_components['attention']     # [batch, heads, dim, dim]
-            #                     query_matrix = attn_components['query']        # [batch, dim, 1]
-            #                     key_matrix = attn_components['key']           # [batch, dim, 1]
-
-            #                     # Print shapes and statistics
-            #                     print(f"\nAgent {agent_idx} Matrices:")
-            #                     print("Attention shape:", attn_matrix.shape)
-            #                     print("Query shape:", query_matrix.shape)
-            #                     print("Key shape:", key_matrix.shape)
-
-            #                     # 1. Raw Attention Matrix (averaged over heads)
-            #                     plt.subplot(2, 2, 1)
-            #                     raw_attn = attn_matrix.mean(dim=[0, 1]).cpu().numpy()
-            #                     sns.heatmap(raw_attn, cmap='coolwarm', center=0, annot=False, 
-            #                             square=True, cbar=True)
-            #                     plt.title(f'Agent {agent_idx} Raw Attention Matrix')
-            #                     plt.xlabel('Feature Index')
-            #                     plt.ylabel('Feature Index')
-
-            #                     # 2. Query Matrix
-            #                     plt.subplot(2, 2, 2)
-            #                     query_data = query_matrix.squeeze().cpu().numpy()
-            #                     query_data = query_data.reshape(int(np.sqrt(len(query_data))), -1)
-            #                     sns.heatmap(query_data, cmap='viridis', annot=False, 
-            #                             square=True, cbar=True)
-            #                     plt.title(f'Agent {agent_idx} Query Matrix')
-            #                     plt.xlabel('Feature Dimension')
-            #                     plt.ylabel('Feature Dimension')
-
-            #                     # 3. Key Matrix
-            #                     plt.subplot(2, 2, 3)
-            #                     key_data = key_matrix.squeeze().cpu().numpy()
-            #                     key_data = key_data.reshape(int(np.sqrt(len(key_data))), -1)
-            #                     sns.heatmap(key_data, cmap='viridis', annot=False, 
-            #                             square=True, cbar=True)
-            #                     plt.title(f'Agent {agent_idx} Key Matrix')
-            #                     plt.xlabel('Feature Dimension')
-            #                     plt.ylabel('Feature Dimension')
-
-            #                     # 4. Attention Pattern
-            #                     plt.subplot(2, 2, 4)
-            #                     attn_pattern = torch.matmul(query_matrix.transpose(-2, -1), 
-            #                                             key_matrix).squeeze().cpu().numpy()
-            #                     sns.heatmap(attn_pattern, cmap='coolwarm', center=0, 
-            #                             annot=False, square=True, cbar=True)
-            #                     plt.title(f'Agent {agent_idx} Attention Pattern')
-            #                     plt.xlabel('Key Dimension')
-            #                     plt.ylabel('Query Dimension')
-
-            #                     # Save statistics
-            #                     print(f"\nAgent {agent_idx} Statistics:")
-            #                     print("Attention mean:", torch.mean(attn_matrix).item())
-            #                     print("Attention std:", torch.std(attn_matrix).item())
-            #                     print("Query mean:", torch.mean(query_matrix).item())
-            #                     print("Query std:", torch.std(query_matrix).item())
-            #                     print("Key mean:", torch.mean(key_matrix).item())
-            #                     print("Key std:", torch.std(key_matrix).item())
-
+            #                 if attn_weights is not None:
+            #                     # Shape: [batch_size, num_heads, seq_len, seq_len]
+            #                     avg_attn_weights = attn_weights.mean(dim=(0, 1)).cpu().numpy()  # Average over batch and heads
+                                
+            #                     sns.heatmap(avg_attn_weights, cmap='coolwarm', square=True, annot=False, cbar=True)
+            #                     plt.title(f'Agent {agent_idx} Average Attention Weights')
+            #                     plt.xlabel('Key Index')
+            #                     plt.ylabel('Query Index')
             #                 else:
-            #                     print(f"No attention weights available for agent {agent_idx}")
-
-            #             plt.tight_layout()
+            #                     plt.text(0.5, 0.5, "No Attention Weights", ha='center', va='center')
                         
-            #             # Save agent-specific visualization
+            #             # Save the plot
             #             attention_file = os.path.join(viz_path, f'attention_agent_{agent_idx}_episode_{episode:05d}.png')
             #             plt.savefig(attention_file, dpi=300, bbox_inches='tight')
-            #             plt.close()
+            #             plt.close(fig)
                     
             #         print(f"Saved attention visualizations for episode {episode}")
-                    
             #     except Exception as e:
             #         print(f"Failed to save attention visualization: {str(e)}")
             #         traceback.print_exc()
-            
+
+
+
             # # Log initial state
             initial_joint_angles = [
                 p.getJointState(self.env.robot_id, i)[0] 
@@ -849,7 +809,21 @@ class MAPPOAgent:
                 # Update state
                 state = next_state
                 step += 1
-
+            # At the end of each episode, update best models if needed
+            for agent_idx in range(self.num_agents):
+                if total_joint_errors:  # Check if we have any errors to process
+                    current_avg_error = np.nanmean([errors[agent_idx] for errors in total_joint_errors])
+                    
+                    # Check if this is the best performance so far
+                    if current_avg_error < self.best_metrics['mean_joint_error'][agent_idx]:
+                        self.best_metrics['mean_joint_error'][agent_idx] = current_avg_error
+                        self.save_best_model(
+                            agent_idx=agent_idx,
+                            actor=self.agents[agent_idx],
+                            episode=episode,
+                            avg_error=current_avg_error,
+                            criterion='mean_error'
+                        )
             # Update policy using collected trajectories
             actor_loss, critic_loss, entropy, policy_loss_per_agent, \
             avg_actor_loss_list, values, returns, advantages = self.update_policy(trajectories)
@@ -857,7 +831,7 @@ class MAPPOAgent:
             # Calculate episode statistics
             success_status = info.get('success_per_joint', [False] * self.num_agents)
             episode_rewards = [np.sum(agent_rewards) for agent_rewards in total_rewards]
-            
+            total_joint_errors = info.get('joint_errors', [0.0] * self.num_agents)
             # Calculate average difficulties for the episode
             mean_difficulties = [np.mean(difficulties_history[i]) for i in range(self.num_agents)]
 
@@ -884,6 +858,8 @@ class MAPPOAgent:
         self.training_metrics.save_final_report(metrics)
 
         return metrics
+
+
 
     def plot_attention_evolution(self, episode_dir):
         """
@@ -1011,23 +987,30 @@ class MAPPOAgent:
         """
         return self.env.target_position, self.env.target_orientation
 
-    def test_agent(self, env, num_episodes, max_steps=1000):
+
+    def test_agent(self, env, num_episodes, max_steps=5000):
+        tester = MAPPOAgentTester(agent=self, env=env, base_path=self.base_path)
+        
+        return tester.test_agent(num_episodes=num_episodes, max_steps=max_steps)
+
+
+    def restore_best_models(self):
         """
-        Test the trained agent in the environment.
+        Restore the best models for all agents from the saved files.
         """
-        for episode in range(num_episodes):
-            state = env.reset()
-            done = False
-            episode_reward = 0
-            step_count = 0
-            while not done and step_count < max_steps:
-                actions, _ = self.get_actions(state)
-                next_state, rewards, done, _ = env.step(actions)
-                episode_reward += sum(rewards)  # Sum rewards across agents
-                state = next_state
-                step_count += 1
-            print(f"Test Episode {episode+1}, Total Reward: {episode_reward}")
-        env.close()
+        for agent_idx in range(self.num_agents):
+            agent_dir = os.path.join(self.base_path, f"agent_{agent_idx}")
+            model_path = os.path.join(agent_dir, "best_model.pth")
+            metadata_path = os.path.join(agent_dir, "metadata.json")
+
+            if os.path.exists(model_path):
+                self.agents[agent_idx].load_state_dict(torch.load(model_path))
+                logging.info(f"Restored best model for agent {agent_idx} from {model_path}")
+
+            if os.path.exists(metadata_path):
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                logging.info(f"Loaded metadata for agent {agent_idx}: {metadata}")
 
 
     # Add these methods to your existing MAPPOAgent class
@@ -1276,6 +1259,66 @@ class MAPPOAgent:
         except Exception as e:
             self.logger.error(f"Experience validation error: {str(e)}")
             return False
+
+    def combine_best_models(self):
+        """
+        Combine the best models for all joints into a single file.
+        """
+        try:
+            combined_model = {
+                'joint_models': {},
+                'metadata': {
+                    'num_joints': self.num_joints,
+                    'date_combined': datetime.datetime.now().isoformat(),
+                    'hidden_dim': self.hidden_dim,
+                    'obs_dims': self.obs_dims
+                }
+            }
+
+            # Load each best model
+            for joint_idx in range(self.num_joints):
+                model_path = os.path.join(self.base_path, f"best_agent_joint_{joint_idx}")
+                if os.path.exists(model_path):
+                    model_state = torch.load(model_path)
+                    combined_model['joint_models'][f'joint_{joint_idx}'] = {
+                        'state_dict': model_state,
+                        'obs_dim': self.obs_dims[joint_idx],
+                        'hidden_dim': self.hidden_dim
+                    }
+                    logging.info(f"Added model for joint {joint_idx}")
+
+            # Save combined model
+            save_path = os.path.join(self.base_path, "combined_ik_model.pth")
+            torch.save(combined_model, save_path)
+            logging.info(f"Successfully saved combined model to {save_path}")
+
+            return save_path
+
+        except Exception as e:
+            logging.error(f"Error combining models: {str(e)}")
+            logging.error(traceback.format_exc())
+            raise
+
+    def load_combined_model_for_inference(self, model_path):
+        """
+        Load combined model for inference.
+        """
+        try:
+            combined_data = torch.load(model_path)
+            for joint_idx in range(self.num_joints):
+                if f'joint_{joint_idx}' in combined_data['joint_models']:
+                    joint_data = combined_data['joint_models'][f'joint_{joint_idx}']
+                    self.agents[joint_idx].load_state_dict(joint_data['state_dict'])
+                    logging.info(f"Loaded model for joint {joint_idx}")
+
+            logging.info("Successfully loaded all joint models")
+            return True
+
+        except Exception as e:
+            logging.error(f"Error loading combined model: {str(e)}")
+            logging.error(traceback.format_exc())
+            return False
+
 
 
     def visualize_attention(self, state, save_path=None, normalize=False):

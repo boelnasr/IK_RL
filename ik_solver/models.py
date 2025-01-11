@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import math
 
+
 class MultiHeadAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout=0.1):
         super(MultiHeadAttention, self).__init__()
@@ -24,20 +25,14 @@ class MultiHeadAttention(nn.Module):
         
         # Store attention components
         self.attention_weights = None
-        self.query_value = None
-        self.key_value = None
 
     def forward(self, x, mask=None):
         batch_size, seq_len, embed_dim = x.size()
 
         # Project inputs
-        Q = self.q_proj(x)  # [batch_size, seq_len, embed_dim]
-        K = self.k_proj(x)  # [batch_size, seq_len, embed_dim]
-        V = self.v_proj(x)  # [batch_size, seq_len, embed_dim]
-
-        # Store for visualization
-        self.query_value = Q.detach()
-        self.key_value = K.detach()
+        Q = self.q_proj(x)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
 
         # Reshape for multi-head attention
         Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -49,10 +44,10 @@ class MultiHeadAttention(nn.Module):
 
         if mask is not None:
             attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
-        # print(f"attn_scores: {attn_scores.shape}")
+
         # Apply softmax and dropout
         attention_weights = F.softmax(attn_scores, dim=-1)
-        self.attention_weights = attention_weights.detach()  # Store for visualization
+        self.attention_weights = attention_weights.detach()
         attention_weights = self.dropout(attention_weights)
 
         # Apply attention to values
@@ -67,13 +62,8 @@ class MultiHeadAttention(nn.Module):
 
         return out
 
-    def get_attention_weights(self):
-        """Returns attention weights and Q, K values for visualization"""
-        return {
-            'attention': self.attention_weights,
-            'query': self.query_value,
-            'key': self.key_value
-        }
+
+
 class TransformerEncoderBlock(nn.Module):
     def __init__(self, embed_dim, num_heads, ff_dim=2048, dropout=0.1):
         super(TransformerEncoderBlock, self).__init__()
@@ -85,36 +75,39 @@ class TransformerEncoderBlock(nn.Module):
             nn.Linear(ff_dim, embed_dim),
             nn.Dropout(dropout)
         )
-        self.layer_norm = nn.LayerNorm(embed_dim)
-        
+        self.layer_norm1 = nn.LayerNorm(embed_dim)
+        self.layer_norm2 = nn.LayerNorm(embed_dim)
+        self.attention_weights = None
+
     def forward(self, x, mask=None):
         attended = self.attention(x, mask)
-        x = attended + x  # Residual connection
-        x = self.layer_norm(x)
-        
+        self.attention_weights = self.attention.attention_weights  # Save weights for visualization
+        x = self.layer_norm1(x + attended)
         ff_out = self.feed_forward(x)
-        x = ff_out + x  # Residual connection
-        x = self.layer_norm(x)
-        
+        x = self.layer_norm2(x + ff_out)
         return x
 
     def get_attention_weights(self):
-        return self.attention.get_attention_weights()
+        return self.attention_weights
+
 
 class JointActor(nn.Module):
-    def __init__(self, input_dim, hidden_dim, action_dim=1, use_attention=False, num_heads=4, dropout=0.1):
+    def __init__(self, input_dim, hidden_dim, action_dim=1, use_attention=True, num_heads=4, dropout=0.1):
         super(JointActor, self).__init__()
         self.use_attention = use_attention
         self.hidden_dim = hidden_dim
 
-        # Feature extractor
+        # Input normalization for stability
+        self.input_norm = nn.LayerNorm(input_dim)
+
+        # Enhanced feature extractor with residual connections
         self.feature_extractor = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.LayerNorm(hidden_dim)
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout)
         )
 
-        # Attention mechanism
         if use_attention:
             self.transformer = TransformerEncoderBlock(
                 embed_dim=hidden_dim,
@@ -123,20 +116,33 @@ class JointActor(nn.Module):
                 dropout=dropout
             )
 
-        # Actor network
-        self.policy_net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+        # Policy network with residual connections
+        self.policy_net = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.LayerNorm(hidden_dim),
+                nn.Dropout(dropout)
+            ),
+            nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.LayerNorm(hidden_dim),
+                nn.Dropout(dropout)
+            ),
             nn.Linear(hidden_dim, action_dim)
-        )
-        
-        # Learnable standard deviation
-        self.log_std = nn.Parameter(torch.zeros(action_dim))
-        
+        ])
+
+        # Log standard deviation for actions
+        self.log_std = nn.Parameter(torch.ones(action_dim) * -2.0)
+        self.log_std_min = -20
+        self.log_std_max = -1
+
         # Initialize weights
         self.apply(self._init_weights)
+
+        # Store attention weights
+        self.attention_weights = None
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -144,31 +150,39 @@ class JointActor(nn.Module):
             module.bias.data.zero_()
 
     def forward(self, state):
-        x = self.feature_extractor(state)
-        
+        # Input normalization
+        x = self.input_norm(state)
+        x = self.feature_extractor(x)
+
+        # Attention mechanism
         if self.use_attention:
-            # Add sequence dimension for attention
             if len(x.shape) == 2:
-                x = x.unsqueeze(1)
+                x = x.unsqueeze(1)  # Add sequence dimension for transformer
             x = self.transformer(x)
-            x = x.squeeze(1)
-        
-        # Compute mean action
-        action_mean = self.policy_net(x)
-        action_mean = torch.tanh(action_mean)  # Bound actions to [-1, 1]
-        
-        # Compute action standard deviation
-        action_std = torch.exp(torch.clamp(self.log_std, min=-20, max=2))
-        
+            self.attention_weights = self.transformer.get_attention_weights()  # Store attention weights
+            x = x.squeeze(1)  # Remove sequence dimension
+
+        # Policy network with residual connections
+        identity = x
+        for layer in self.policy_net[:-1]:
+            x = layer(x) + identity
+            identity = x
+
+        # Final action computation
+        action_mean = self.policy_net[-1](x)
+        action_mean = torch.tanh(action_mean) * 0.1  # Scale actions for safety
+
+        # Bounded standard deviation
+        action_std = torch.exp(torch.clamp(self.log_std, min=self.log_std_min, max=self.log_std_max))
+
         return action_mean, action_std
 
     def get_attention_weights(self):
-        if self.use_attention:
-            return self.transformer.get_attention_weights()
-        return None
+        """Retrieve attention weights for visualization."""
+        return self.attention_weights if self.use_attention else None
 
 class CentralizedCritic(nn.Module):
-    def __init__(self, state_dim, hidden_dim, num_agents, use_attention=False, num_heads=4, dropout=0.1):
+    def __init__(self, state_dim, hidden_dim, num_agents, use_attention=True, num_heads=4, dropout=0.1):
         super(CentralizedCritic, self).__init__()
         self.use_attention = use_attention
         self.hidden_dim = hidden_dim
@@ -203,7 +217,7 @@ class CentralizedCritic(nn.Module):
         
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+            nn.init.orthogonal_(module.weight, np.sqrt(2))
             module.bias.data.zero_()
 
     def forward(self, state):

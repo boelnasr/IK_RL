@@ -218,12 +218,12 @@ def compute_reward(
         tuple: (final_rewards, joint_specific_rewards, new_best, success)
     """
     # Constants
-    MAX_REWARD = 100.0
-    MIN_REWARD = -100.0
+    MAX_REWARD = 10.0
+    MIN_REWARD = -10.0
     POSITION_SCALE = 0.6
     ORIENTATION_SCALE = 0.4
     IMPROVEMENT_SCALE = 0.3
-    ERROR_PENALTY_SCALE = 0.1
+    ERROR_PENALTY_SCALE = 0.3
     NOVELTY_BASE = 0.5
 
     num_joints = len(joint_errors)

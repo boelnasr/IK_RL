@@ -824,7 +824,7 @@ class TrainingMetrics:
         episodes = np.arange(1, metrics['mean_episode_rewards_per_agent'].shape[1] + 1)
         num_joints = env.num_joints if env else self.num_joints
         mean_episode_rewards_per_agent = metrics['mean_episode_rewards_per_agent']
-        print(f"Mean Episode Rewards Per Agent: {mean_episode_rewards_per_agent}")
+        #print(f"Mean Episode Rewards Per Agent: {mean_episode_rewards_per_agent}")
         # Determine subplot grid dimensions
         if num_joints % 2 == 0:
             ncols = 2

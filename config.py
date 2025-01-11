@@ -12,19 +12,19 @@ config = {
     'lr': 1e-4,                            # Global default learning rate
     'gamma': 0.99,                         # Discount factor for rewards
     'tau': 0.95,                           # GAE parameter for advantage estimation
-    'clip_param': 0.3,                     # Global default PPO clip parameter
-    'ppo_epochs': 20,                      # Number of PPO epochs per update
+    'clip_param': 0.2,                     # Global default PPO clip parameter
+    'ppo_epochs': 10,                      # Number of PPO epochs per update
     'batch_size': 64,                      # Batch size for training
     'buffer_size': 4096,                   # Size of the replay buffer
     'initial_epsilon': 0.20,
     'epsilon_decay': 0.999,
     'min_epsilon':0.01,
-    'num_episodes': 200,                  # Number of episodes to train
-    'max_steps_per_episode':1000,       # Maximum number of steps per episode
+    'num_episodes': 3000,                  # Number of episodes to train
+    'max_steps_per_episode':5000,       # Maximum number of steps per episode
 
     'test_agent_after_training': True,     #  Whether to test the agent after training
-    'num_tests': 10,                        # Number of test episodes to run after training
-    'use_cross_validation' : True,
+    'num_tests': 300,                        # Number of test episodes to run after training
+    'use_cross_validation' : False,
     # Per-joint learning rates (optional, fall back to global 'lr' if not provided)
     'lr_joint_0': 3e-4,                    # Learning rate for joint 0
     'lr_joint_1': 3e-4,                    # Learning rate for joint 1
@@ -44,11 +44,11 @@ config = {
     'clip_joint_6': 0.2,                    # PPO clip parameter for joint 6
     # Your existing config parameters
     'value_loss_scale': 0.5,     # Scales critic loss
-    'entropy_scale': 0.01,       # Scales entropy bonus
+    'entropy_scale': 0.001,       # Scales entropy bonus
     'max_grad_norm': 0.5,        # Maximum gradient norm
-    'ratio_clip': 10.0,          # Maximum policy ratio
-    'advantage_clip': 4.0,       # Maximum advantage value
-    'use_scheduler': True,     # Whether to use a learning rate scheduler
+    'ratio_clip': 0.20,          # Maximum policy ratio
+    'advantage_clip': 2.0,       # Maximum advantage value
+    'use_scheduler': False,     # Whether to use a learning rate scheduler
     #GPU config
     'num_envs': 4,              # Number of parallel environments
     'world_size': 1,            # Number of GPUs (1 for single GPU)

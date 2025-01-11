@@ -40,8 +40,9 @@ class InverseKinematicsEnv(gym.Env):
         self.curriculum_manager = CurriculumManager(
             initial_difficulty=0.0, 
             max_difficulty=4.0, 
-            success_threshold=0.9,  # Set to 1.0 for maximum difficulty
-            window_size=200
+            success_threshold=0.7,  # Set to 1.0 for maximum difficulty
+            window_size=20,
+            difficulty_increment=0.1
         )
         # PyBullet setup
         self.physics_client = p.connect(p.DIRECT)  # Use p.DIRECT for headless simulation
