@@ -62,15 +62,16 @@ class TrainingMetrics:
 
         # Global plot configurations
         plt.rcParams.update({
-            'font.size': 12,
-            'axes.titlesize': 14,
-            'axes.labelsize': 12,
-            'lines.linewidth': 1.5,
-            'legend.fontsize': 10,
-            'xtick.labelsize': 10,
-            'ytick.labelsize': 10,
-            'text.usetex': False,  # Disable LaTeX rendering
-            # 'text.latex.preamble': r'\usepackage{amsmath}'  # Commented out
+          "text.usetex": False,  # Enable LaTeX-style rendering
+    "font.family": "serif",  # Use serif fonts
+    "font.size": 14,  # Base font size
+    "axes.titlesize": 16,  # Title font size
+    "axes.labelsize": 14,  # Axis label font size
+    "xtick.labelsize": 12,  # X-tick font size
+    "ytick.labelsize": 12,  # Y-tick font size
+    "legend.fontsize": 12,  # Legend font size
+    "lines.linewidth": 2,  # Line width
+    "lines.markersize": 8,  # Marker size
         })
 
         # Define colorblind-friendly palettes
@@ -422,13 +423,17 @@ class TrainingMetrics:
         # Define file paths
         png_path = os.path.join(self.base_path, f"{name}.png")
         pdf_path = os.path.join(self.base_path, f"{name}.pdf")
+        svg_path = os.path.join(self.base_path, f"{name}.svg")
         
-        # Save in both PNG and PDF formats
-        fig.savefig(png_path, dpi=300, bbox_inches='tight')  # High-quality PNG
-       #fig.savefig(pdf_path, format='pdf', bbox_inches='tight')  # Vector PDF
+        # Save in PNG, PDF, and SVG formats
+        fig.savefig(png_path, dpi=600, bbox_inches='tight')  # High-quality PNG
+        #fig.savefig(pdf_path, format='pdf', bbox_inches='tight')  # Vector PDF
+        fig.savefig(svg_path, format='svg', bbox_inches='tight')  # Scalable SVG
         plt.close(fig)
 
-        self.logger.info(f"Saved figure '{name}' as PNG and PDF.")
+        self.logger.info(f"Saved figure '{name}' as PNG, PDF, and SVG.")
+
+
 
     def plot_metrics(self, metrics: Dict, env: Any, show_plots: bool = True) -> None:
         """Create and save all plots."""
@@ -533,7 +538,7 @@ class TrainingMetrics:
             ncols = 1
             nrows = num_joints
 
-        fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10 * ncols, 3 * nrows), dpi=300)
+        fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(12* ncols, 5 * nrows), dpi=600)
         axes = np.atleast_1d(axes).flatten()
 
         colors = self.color_palette
@@ -544,7 +549,7 @@ class TrainingMetrics:
             std_errors = metrics['joint_errors']['std'][:, joint_idx]
 
             # Plot mean error with shaded standard deviation
-            ax.plot(episodes, mean_errors, label='Mean Error', color=colors(joint_idx % 10), linewidth=1.5)
+            ax.plot(episodes, mean_errors, label='Mean Error', color=colors(joint_idx % 10), linewidth=2)
             ax.fill_between(episodes,
                             mean_errors - std_errors,
                             mean_errors + std_errors,
@@ -584,7 +589,7 @@ class TrainingMetrics:
             ncols = 1
             nrows = num_joints
 
-        fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10 * ncols, 3 * nrows), dpi=300)
+        fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(12* ncols, 5 * nrows), dpi=600)
         axes = np.atleast_1d(axes).flatten()
 
         colors = self.color_palette
@@ -593,7 +598,7 @@ class TrainingMetrics:
             ax = axes[joint_idx]
             rewards = cumulative_rewards_per_agent[joint_idx]
 
-            ax.plot(episodes, rewards, label=f'Joint {joint_idx + 1}', color=colors(joint_idx % 10), linewidth=1.5)
+            ax.plot(episodes, rewards, label=f'Joint {joint_idx + 1}', color=colors(joint_idx % 10), linewidth=2)
 
             # Apply moving average
             window = max(1, len(episodes) // 50)
@@ -727,8 +732,8 @@ class TrainingMetrics:
         episodes = np.arange(1, len(metrics['success_rate']['per_episode']) + 1)
         success_rate = metrics['success_rate']['cumulative']
 
-        fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
-        ax.plot(episodes, success_rate, label='Success Rate', color='tab:green', linewidth=1.5)
+        fig, ax = plt.subplots(figsize=(10, 6), dpi=600)
+        ax.plot(episodes, success_rate, label='Success Rate', color='tab:green', linewidth=2)
 
         # Apply moving average for smoothing
         window = max(1, len(episodes) // 50)
@@ -756,12 +761,12 @@ class TrainingMetrics:
         episodes = np.arange(1, num_episodes + 1)
         success_rate_per_agent = metrics['success_rate_per_agent']  # Shape: (num_agents, num_episodes)
 
-        fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
+        fig, ax = plt.subplots(figsize=(10, 6), dpi=600)
         colors = self.color_palette
 
         for joint_idx in range(num_agents):
             agent_success_rate = success_rate_per_agent[joint_idx]
-            ax.plot(episodes, agent_success_rate, label=f'Joint {joint_idx + 1} Success Rate', color=colors(joint_idx), linewidth=1.5)
+            ax.plot(episodes, agent_success_rate, label=f'Joint {joint_idx + 1} Success Rate', color=colors(joint_idx), linewidth=2)
 
         ax.set_xlabel('Episodes', fontsize=12)
         ax.set_ylabel('Success Rate', fontsize=12)
@@ -789,7 +794,7 @@ class TrainingMetrics:
             ncols = 1
             nrows = num_joints
 
-        fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10 * ncols, 3 * nrows), dpi=300)
+        fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(12* ncols, 5 * nrows), dpi=600)
         axes = np.atleast_1d(axes).flatten()
 
         colors = self.color_palette
@@ -798,7 +803,7 @@ class TrainingMetrics:
             ax = axes[joint_idx]
             rewards = cumulative_rewards[joint_idx]
 
-            #ax.plot(episodes, rewards, label=f'Joint {joint_idx + 1}', color=colors(joint_idx), linewidth=1.5)
+            #ax.plot(episodes, rewards, label=f'Joint {joint_idx + 1}', color=colors(joint_idx), linewidth=2)
 
             # Apply moving average
             window = max(1, len(episodes) // 50)
@@ -833,7 +838,7 @@ class TrainingMetrics:
             ncols = 1
             nrows = num_joints
 
-        fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10 * ncols, 3 * nrows), dpi=300)
+        fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(12* ncols, 5 * nrows), dpi=600)
         axes = np.atleast_1d(axes).flatten()
 
         colors = self.color_palette
@@ -846,7 +851,7 @@ class TrainingMetrics:
 
             # Plot raw data
             #ax.plot(episodes, joint_rewards, label=f'Joint {joint_idx + 1} Mean Reward', 
-                    #color=colors(joint_idx), linewidth=1.5, alpha=0.5)
+                    #color=colors(joint_idx), linewidth=2, alpha=0.5)
 
             # # Compute simple moving average (SMA)
             window = max(1, len(episodes) // 10)
@@ -894,10 +899,10 @@ class TrainingMetrics:
             # Normalize joint error mean (invert to represent accuracy)
             norm_joint_error = 1.0 - (joint_error_mean - np.min(joint_error_mean)) / (np.max(joint_error_mean) - np.min(joint_error_mean) + 1e-8)
 
-            fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
-            ax.plot(episodes, norm_rewards, label='Normalized Reward', color='tab:blue', linewidth=1.5)
-            ax.plot(episodes, norm_success_rate, label='Success Rate', color='tab:green', linewidth=1.5)
-            ax.plot(episodes, norm_joint_error, label='Normalized Accuracy', color='tab:red', linewidth=1.5)
+            fig, ax = plt.subplots(figsize=(10, 6), dpi=600)
+            ax.plot(episodes, norm_rewards, label='Normalized Reward', color='tab:blue', linewidth=2)
+            ax.plot(episodes, norm_success_rate, label='Success Rate', color='tab:green', linewidth=2)
+            ax.plot(episodes, norm_joint_error, label='Normalized Accuracy', color='tab:red', linewidth=2)
 
             # Smoothing
             window = max(1, len(episodes) // 50)
@@ -928,7 +933,7 @@ class TrainingMetrics:
 
 
     def _plot_policy_loss(self, metrics: Dict, show_plots: bool) -> None:
-        """Plot Policy Loss over episodes with enhanced styling and robust handling."""
+        """Plot Policy Loss over episodes with enhanced styling and EMA levels."""
         try:
             raw_policy_loss = np.array(metrics['training']['policy_loss'])
             episodes = np.arange(1, len(raw_policy_loss) + 1)
@@ -937,14 +942,14 @@ class TrainingMetrics:
                 self.logger.error("No policy loss data available to plot.")
                 return
 
-            fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
+            fig, ax = plt.subplots(figsize=(16, 10), dpi=600)
 
             # Plot raw data
-            ax.plot(episodes, raw_policy_loss, label='Raw Policy Loss', color='tab:orange', alpha=0.3, linewidth=1)
+            ax.plot(episodes, raw_policy_loss, label='Raw Policy Loss', color='#8B4513', alpha=0.6, linewidth=1.5)
 
-            # Add different smoothing levels
+            # Add different EMA levels
             windows = [5, 20, 50]  # Smoothing window sizes
-            colors = ['tab:red', 'tab:blue', 'tab:green']  # Colors for each smoothing level
+            colors = ['tab:red', 'tab:blue', 'tab:green']  # Colors for each EMA level
 
             for window, color in zip(windows, colors):
                 if len(episodes) > window:
@@ -952,35 +957,20 @@ class TrainingMetrics:
                     smoothed = np.zeros_like(raw_policy_loss)
                     smoothed[0] = raw_policy_loss[0]
                     for i in range(1, len(raw_policy_loss)):
-                        smoothed[i] = alpha_val * raw_policy_loss[i] + (1 - alpha_val) * smoothed[i-1]
+                        smoothed[i] = alpha_val * raw_policy_loss[i] + (1 - alpha_val) * smoothed[i - 1]
 
                     ax.plot(episodes, smoothed, label=f'EMA (window={window})', color=color, linewidth=2)
 
-            # Add trend line
-            if len(raw_policy_loss) > 1:
-                z = np.polyfit(episodes, raw_policy_loss, 1)
-                p = np.poly1d(z)
-                ax.plot(episodes, p(episodes), '--', color='tab:purple', label='Trend', linewidth=2)
-
-            # Calculate and display statistics
-            stats_text = (
-                f'Mean: {np.mean(raw_policy_loss):.4f}\n'
-                f'Std: {np.std(raw_policy_loss):.4f}\n'
-                f'Min: {np.min(raw_policy_loss):.4f}\n'
-                f'Max: {np.max(raw_policy_loss):.4f}'
-            )
-            ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, verticalalignment='top',
-                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8), fontsize=10)
-
-            ax.set_xlabel('Episodes', fontsize=12)
-            ax.set_ylabel('Policy Loss', fontsize=12)
-            ax.set_title('Policy Loss Over Time (with Smoothing)', fontsize=14)
+            # Customize plot
+            ax.set_xlabel('Episodes', fontsize=14)
+            ax.set_ylabel('Policy Loss', fontsize=14)
+            ax.set_title('Policy Loss Over Time (with EMA Levels)', fontsize=16)
             ax.grid(True, alpha=0.3)
-            ax.legend(loc='upper right', fontsize=10)
+            ax.legend(loc='upper right', fontsize=12)
 
             plt.tight_layout()
-            self.save_figure(fig, 'policy_loss_smoothed')
-            self.logger.info("Smoothed policy loss plot saved successfully.")
+            self.save_figure(fig, 'policy_loss_with_ema')
+            self.logger.info("Policy loss plot with EMA levels saved successfully.")
             if show_plots:
                 plt.show()
             plt.close(fig)
@@ -988,6 +978,8 @@ class TrainingMetrics:
         except Exception as e:
             self.logger.error(f"Error plotting policy loss: {str(e)}")
             raise
+
+
 
     def _plot_policy_loss_per_agent(self, metrics: Dict, show_plots: bool) -> None:
         """Plot policy loss per agent over episodes with enhanced styling and robust handling."""
@@ -1005,7 +997,7 @@ class TrainingMetrics:
             ncols = 2 if num_agents > 1 else 1
             nrows = (num_agents + 1) // 2
 
-            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10 * ncols, 3 * nrows), dpi=300)
+            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(12* ncols, 5 * nrows), dpi=600)
             axes = np.atleast_1d(axes).flatten()
 
             # Plot for each agent
@@ -1083,7 +1075,7 @@ class TrainingMetrics:
                 nrows = num_joints
 
             fig_min_errors, axes_min = plt.subplots(
-                nrows=nrows, ncols=ncols, figsize=(10 * ncols, 3 * nrows), dpi=300
+                nrows=nrows, ncols=ncols, figsize=(12* ncols, 5 * nrows), dpi=600
             )
             axes_min = np.atleast_1d(axes_min).flatten()
 
@@ -1096,7 +1088,7 @@ class TrainingMetrics:
                 min_errors = np.array([np.min(errors[max(0, i - window):i + 1]) for i in range(len(errors))])
 
                 # Raw minimum errors
-                ax.plot(episodes, min_errors, label=' Error', color=colors(0), alpha=0.5, linewidth=1.5)
+                ax.plot(episodes, min_errors, label=' Error', color=colors(0), alpha=0.5, linewidth=2)
 
                 # Moving average
                 if window > 1:
@@ -1143,7 +1135,7 @@ class TrainingMetrics:
 
             # Create subplots for joint error convergence
             fig_convergence, axes_conv = plt.subplots(
-                nrows=nrows, ncols=ncols, figsize=(10 * ncols, 3 * nrows), dpi=300
+                nrows=nrows, ncols=ncols, figsize=(12* ncols, 5 * nrows), dpi=600
             )
             axes_conv = np.atleast_1d(axes_conv).flatten()
 
@@ -1244,8 +1236,8 @@ class TrainingMetrics:
                 normalized_rewards = smoothed_rewards - min_reward  # All zeros in this case
 
             # Plotting
-            fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
-            ax.plot(adjusted_episodes, normalized_rewards, label='Smoothed Normalized Reward', color='tab:blue', linewidth=1.5)
+            fig, ax = plt.subplots(figsize=(10, 6), dpi=600)
+            ax.plot(adjusted_episodes, normalized_rewards, label='Smoothed Normalized Reward', color='tab:blue', linewidth=2)
             ax.set_title('Smoothed and Normalized Reward Over Episodes', fontsize=14)
             ax.set_xlabel('Episodes', fontsize=12)
             ax.set_ylabel('Normalized Reward', fontsize=12)
@@ -1272,7 +1264,7 @@ class TrainingMetrics:
 
             # Determine subplot grid dimensions
             ncols, nrows = (2, num_agents // 2) if num_agents % 2 == 0 else (1, num_agents)
-            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10 * ncols, 3 * nrows), dpi=300)
+            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(12* ncols, 5 * nrows), dpi=600)
             axes = np.atleast_1d(axes).flatten()
 
             colors = self.color_palette
@@ -1292,7 +1284,7 @@ class TrainingMetrics:
                 
                 # Adjust the episodes to match the length of smoothed_rewards
                 adjusted_episodes = episodes[:len(smoothed_rewards)]
-                axes[agent_idx].plot(adjusted_episodes, normalized_rewards, label=f'Agent {agent_idx + 1}', color=colors(agent_idx), linewidth=1.5)
+                axes[agent_idx].plot(adjusted_episodes, normalized_rewards, label=f'Agent {agent_idx + 1}', color=colors(agent_idx), linewidth=2)
                 axes[agent_idx].set_title(f'Agent {agent_idx + 1}', fontsize=14)
                 axes[agent_idx].set_ylabel('Normalized Reward', fontsize=12)
                 axes[agent_idx].grid(True, alpha=0.3)
@@ -1327,7 +1319,7 @@ class TrainingMetrics:
                 ncols = 1
                 nrows = num_agents
 
-            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10 * ncols, 3 * nrows), dpi=300)
+            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(12* ncols, 5 * nrows), dpi=600)
             axes = np.atleast_1d(axes).flatten()
 
             fig.suptitle('Normalized Cumulative Reward Per Agent Over Episodes', fontsize=16)
@@ -1343,7 +1335,7 @@ class TrainingMetrics:
                     normalized_rewards = (rewards - min_reward) / (max_reward - min_reward)
                 else:
                     normalized_rewards = rewards - min_reward  # All zeros in this case
-                axes[agent_idx].plot(episodes, normalized_rewards, label=f'Agent {agent_idx + 1}', color=colors(agent_idx), linewidth=1.5)
+                axes[agent_idx].plot(episodes, normalized_rewards, label=f'Agent {agent_idx + 1}', color=colors(agent_idx), linewidth=2)
                 axes[agent_idx].set_title(f'Agent {agent_idx + 1}', fontsize=14)
                 axes[agent_idx].set_ylabel('Normalized Cumulative Reward', fontsize=12)
                 axes[agent_idx].grid(True, alpha=0.3)
@@ -1377,8 +1369,8 @@ class TrainingMetrics:
             poly_coeffs = np.polyfit(episodes, log_value_loss, 1)
             exponential_fit = np.exp(poly_coeffs[1]) * np.exp(poly_coeffs[0] * episodes)
 
-            fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
-            ax.plot(episodes, value_loss, label='Raw Value Loss', color='tab:red', alpha=0.5, linewidth=1.5)
+            fig, ax = plt.subplots(figsize=(10, 6), dpi=600)
+            ax.plot(episodes, value_loss, label='Raw Value Loss', color='tab:red', alpha=0.5, linewidth=2)
             ax.plot(episodes, exponential_fit, label='Exponential Fit', color='tab:blue', linewidth=2)
 
             ax.set_title('Value Loss Over Episodes (Exponential Trendline)', fontsize=14)
@@ -1408,7 +1400,7 @@ class TrainingMetrics:
             num_agents = cumulative_rewards_per_agent.shape[0]
             episodes = np.arange(1, cumulative_rewards_per_agent.shape[1] + 1)
     
-            fig, axs = plt.subplots(num_agents, 1, figsize=(10, 3 * num_agents), dpi=300, sharex=True)
+            fig, axs = plt.subplots(num_agents, 1, figsize=(10, 3 * num_agents), dpi=600, sharex=True)
             if num_agents == 1:
                 axs = [axs]
             fig.suptitle('Normalized Cumulative Reward Per Agent Over Episodes', fontsize=16)
@@ -1424,7 +1416,7 @@ class TrainingMetrics:
                     normalized_rewards = (rewards - min_reward) / (max_reward - min_reward)
                 else:
                     normalized_rewards = rewards - min_reward  # All zeros in this case
-                axs[agent_idx].plot(episodes, normalized_rewards, label=f'Agent {agent_idx + 1}', color=colors(agent_idx), linewidth=1.5)
+                axs[agent_idx].plot(episodes, normalized_rewards, label=f'Agent {agent_idx + 1}', color=colors(agent_idx), linewidth=2)
     
                 # Apply moving average smoothing
                 window = max(1, len(episodes) // 50)
@@ -1468,8 +1460,8 @@ class TrainingMetrics:
             mean_advantages = np.nan_to_num(mean_advantages)
             std_advantages = np.nan_to_num(std_advantages)
 
-            fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
-            ax.plot(episodes, mean_advantages, label='Mean Advantage', color='tab:blue', linewidth=1.5)
+            fig, ax = plt.subplots(figsize=(10, 6), dpi=600)
+            ax.plot(episodes, mean_advantages, label='Mean Advantage', color='tab:blue', linewidth=2)
             ax.fill_between(
             episodes,
             mean_advantages - std_advantages,
@@ -1513,7 +1505,7 @@ class TrainingMetrics:
             moving_avg_success_rate = np.convolve(success_rates, np.ones(window) / window, mode='valid')
             adjusted_episodes = episodes[window - 1:]
 
-            fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
+            fig, ax = plt.subplots(figsize=(10, 6), dpi=600)
 
             # Plot raw success rates
             ax.plot(episodes, success_rates, label='Success Rate', color='tab:blue', alpha=0.3, linewidth=1)
@@ -1551,8 +1543,8 @@ class TrainingMetrics:
             reward_std = metrics['rewards']['std_per_episode']  # Per-episode std of rewards
 
             # Plot the std over episodes
-            fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
-            ax.plot(episodes, reward_std, label='Reward Standard Deviation', color='tab:blue', linewidth=1.5)
+            fig, ax = plt.subplots(figsize=(10, 6), dpi=600)
+            ax.plot(episodes, reward_std, label='Reward Standard Deviation', color='tab:blue', linewidth=2)
 
             # Optionally, apply moving average smoothing
             window = max(1, len(episodes) // 50)
@@ -1593,7 +1585,7 @@ class TrainingMetrics:
                 ncols = 1
                 nrows = num_agents
 
-            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10 * ncols, 3 * nrows), dpi=300)
+            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(12* ncols, 5 * nrows), dpi=600)
             axes = np.atleast_1d(axes).flatten()
 
             colors = self.color_palette
@@ -1609,7 +1601,7 @@ class TrainingMetrics:
                     adjusted_episodes = episodes[window - 1:]
                     ax.plot(adjusted_episodes, smoothed_std, label=f'Smoothed Std (window={window})', color='tab:red', linewidth=2, linestyle='--')
                 else:
-                    ax.plot(episodes, std_over_episodes, label=f'Agent {agent_idx + 1} Reward Std', color=colors(agent_idx % 10), linewidth=1.5)
+                    ax.plot(episodes, std_over_episodes, label=f'Agent {agent_idx + 1} Reward Std', color=colors(agent_idx % 10), linewidth=2)
 
                 ax.set_xlabel('Episodes', fontsize=12)
                 ax.set_ylabel('Standard Deviation', fontsize=12)
@@ -1681,7 +1673,7 @@ class TrainingMetrics:
             ncols = 2 if num_agents > 1 else 1
             nrows = (num_agents + 1) // 2
 
-            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10 * ncols, 3 * nrows), dpi=300)
+            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(12* ncols, 5 * nrows), dpi=600)
             axes = np.atleast_1d(axes).flatten()
 
             # Plot for each agent
@@ -1765,7 +1757,7 @@ class TrainingMetrics:
             ncols = 2 if num_agents > 1 else 1
             nrows = (num_agents + 1) // 2  # Ensure sufficient rows for all agents
 
-            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10 * ncols, 3 * nrows), dpi=300)
+            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(12* ncols, 5 * nrows), dpi=600)
             axes = np.atleast_1d(axes).flatten()
 
             for agent_idx, ax in enumerate(axes[:num_agents]):
@@ -1773,7 +1765,7 @@ class TrainingMetrics:
                 difficulty = difficulty_per_episode[:, agent_idx]
 
                 # Plot raw difficulty
-                ax.plot(episodes, difficulty, label=f'Agent {agent_idx + 1}', linewidth=1.5)
+                ax.plot(episodes, difficulty, label=f'Agent {agent_idx + 1}', linewidth=2)
 
                 # Apply moving average smoothing
                 window = max(1, len(episodes) // 50)

@@ -29,6 +29,24 @@ class MAPPOAgentTester:
 
         # We'll also track steps to convergence
         # Each episode will append the step at which convergence was reached (or max_steps if not).
+        # Global plot configurations
+        plt.rcParams.update({
+            'font.size': 14,                  # Base font size for all text
+            'axes.titlesize': 18,             # Title font size
+            'axes.labelsize': 16,             # Axis label font size
+            'legend.fontsize': 14,            # Legend font size
+            'xtick.labelsize': 12,            # X-axis tick label size
+            'ytick.labelsize': 12,            # Y-axis tick label size
+            'lines.linewidth': 2.0,           # Default line width
+            'figure.figsize': (12, 8),        # Default figure size
+            'axes.grid': True,                # Enable grid by default
+            'grid.alpha': 0.3,                # Grid transparency
+            'grid.color': "gray",             # Grid color
+            'savefig.dpi': 300,               # Default DPI for saved figures
+            'savefig.bbox': "tight",          # Tight layout for saved figures
+        })
+
+        self.logger.info("MAPPOAgentTester initialized with global plot styling.")
 
 
     def test_agent(self, num_episodes: int, max_steps: int = 5000) -> Dict[str, List]:
@@ -236,124 +254,125 @@ class MAPPOAgentTester:
         # Plot joint errors
         self._plot_joint_errors(plots_dir)
 
+
     def _plot_metric(self, metric_key, title, xlabel, ylabel, plots_dir):
-        """Plot a single metric with its average."""
+        """Plot a single metric with its average and save in PNG and SVG formats."""
         if metric_key not in self.metrics or len(self.metrics[metric_key]) == 0:
             self.logger.warning(f"No data for metric {metric_key}. Skipping plot.")
             return
 
-        # Smooth the data and calculate the average
-        smoothed_data = self.moving_average(self.metrics[metric_key], window_size=10)
-        avg_value = np.mean(self.metrics[metric_key])
+        data = np.array(self.metrics[metric_key])
+        ema_data = self._compute_ema(data, alpha=0.2)  # Use EMA for smoothing
+        avg_value = np.mean(data)
 
-        plt.figure(figsize=(12, 8))
-        plt.plot(smoothed_data, label=f"{title} (Smoothed)")
-        plt.axhline(avg_value, color='red', linestyle='--', label=f"Average: {avg_value:.2f}")
-        plt.title(title)
-        plt.xlabel(xlabel)
-        plt.ylabel(ylabel)
-        plt.legend()
-        plt.grid()
-        plt.savefig(plots_dir / f"{metric_key}.png")
-        plt.close()
+        fig, ax = plt.subplots(figsize=(16, 10), dpi=600)
+        ax.plot(ema_data, label=f"{title} (Smoothed)", color="tab:blue", linewidth=2)
+        ax.axhline(avg_value, color="red", linestyle="--", label=f"Average: {avg_value:.2f}")
+        ax.set_title(title, fontsize=16)
+        ax.set_xlabel(xlabel, fontsize=14)
+        ax.set_ylabel(ylabel, fontsize=14)
+        ax.legend(fontsize=12)
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+
+        # Save in PNG and SVG formats
+        fig.savefig(plots_dir / f"{metric_key}.png", format="png", bbox_inches="tight")
+        fig.savefig(plots_dir / f"{metric_key}.svg", format="svg", bbox_inches="tight")
+        plt.close(fig)
 
     def _plot_separate_errors(self, metric_keys, title, xlabel, ylabel, plots_dir):
-        """Plot separate position or orientation errors in a 3x1 subplot layout."""
-        fig, axes = plt.subplots(3, 1, figsize=(12, 15))
+        """Plot separate position or orientation errors in a 3x1 subplot layout and save in PNG and SVG."""
+        fig, axes = plt.subplots(3, 1, figsize=(16, 15), dpi=600)
 
-        for i, (key, axis) in enumerate(zip(metric_keys, ['x', 'y', 'z'])):
+        for i, (key, axis) in enumerate(zip(metric_keys, ["x", "y", "z"])):
             if key not in self.metrics or len(self.metrics[key]) == 0:
                 self.logger.warning(f"No data for {key}. Skipping subplot.")
                 axes[i].set_visible(False)
                 continue
 
-            # Smooth the data and calculate the average
-            smoothed_data = self.moving_average(self.metrics[key], window_size=10)
-            avg_value = np.mean(self.metrics[key])
+            data = np.array(self.metrics[key])
+            ema_data = self._compute_ema(data, alpha=0.2)  # Use EMA for smoothing
+            avg_value = np.mean(data)
 
-            # Plot the smoothed data and average line
-            axes[i].plot(smoothed_data, label=f'{axis.upper()}-axis Error (Smoothed)')
-            axes[i].axhline(avg_value, color='red', linestyle='--', label=f"Average: {avg_value:.2f}")
-            axes[i].set_title(f'{axis.upper()}-Axis', fontsize=14)
+            axes[i].plot(ema_data, label=f"{axis.upper()}-axis Error (Smoothed)", color="tab:blue", linewidth=2)
+            axes[i].axhline(avg_value, color="red", linestyle="--", label=f"Average: {avg_value:.2f}")
+            axes[i].set_title(f"{axis.upper()}-Axis", fontsize=14)
             axes[i].set_xlabel(xlabel, fontsize=12)
             axes[i].set_ylabel(ylabel, fontsize=12)
             axes[i].legend(fontsize=10)
-            axes[i].grid()
+            axes[i].grid(alpha=0.3)
 
         plt.tight_layout()
-        plt.savefig(plots_dir / f"{title.lower().replace(' ', '_')}.png")
-        plt.close()
+        file_name = title.lower().replace(" ", "_")
+        fig.savefig(plots_dir / f"{file_name}.png", format="png", bbox_inches="tight")
+        fig.savefig(plots_dir / f"{file_name}.svg", format="svg", bbox_inches="tight")
+        plt.close(fig)
 
     def _plot_success_rate(self, plots_dir):
-        """Plot the success rate over time (cumulative)."""
-        if 'success_flags' not in self.metrics or len(self.metrics['success_flags']) == 0:
+        """Plot the success rate over time (cumulative) and save in PNG and SVG."""
+        if "success_flags" not in self.metrics or len(self.metrics["success_flags"]) == 0:
             self.logger.warning("No success data available. Skipping success rate plot.")
             return
 
-        # Compute cumulative success rate
-        success_flags = np.array(self.metrics['success_flags'])
-        cumulative_success_rate = np.cumsum(success_flags) / (np.arange(1, len(success_flags) + 1))
+        success_flags = np.array(self.metrics["success_flags"])
+        cumulative_success_rate = np.cumsum(success_flags) / np.arange(1, len(success_flags) + 1)
+        overall_rate = self.metrics.get("success_rate", 0.0)
 
-        overall_rate = self.metrics.get('success_rate', 0.0)
+        fig, ax = plt.subplots(figsize=(16, 10), dpi=600)
+        ax.plot(cumulative_success_rate, label="Success Rate (Cumulative)", color="tab:blue", linewidth=2)
+        ax.axhline(y=overall_rate, color="red", linestyle="--", label=f"Overall: {overall_rate:.2f}")
+        ax.set_title("Success Rate Over Time", fontsize=16)
+        ax.set_xlabel("Episode", fontsize=14)
+        ax.set_ylabel("Success Rate", fontsize=14)
+        ax.legend(fontsize=12)
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
 
-        plt.figure(figsize=(12, 8))
-        plt.plot(cumulative_success_rate, label="Success Rate (Cumulative)", color='blue', linestyle='-')
-        plt.axhline(y=overall_rate, color='red', linestyle='--', label=f"Overall: {overall_rate:.2f}")
-        plt.title("Success Rate Over Time")
-        plt.xlabel("Episode")
-        plt.ylabel("Success Rate")
-        plt.legend()
-        plt.grid()
-        plt.savefig(plots_dir / "success_rate.png")
-        plt.close()
+        # Save in PNG and SVG formats
+        fig.savefig(plots_dir / "success_rate.png", format="png", bbox_inches="tight")
+        fig.savefig(plots_dir / "success_rate.svg", format="svg", bbox_inches="tight")
+        plt.close(fig)
 
     def _plot_joint_errors(self, plots_dir):
-        """Plot joint errors as subplots.
-        
-        If the number of joints is even -> 2 columns
-        If the number of joints is odd  -> 1 column
-        """
-        num_joints = len(self.metrics['joint_errors'])
+        """Plot joint errors as subplots and save in PNG and SVG."""
+        num_joints = len(self.metrics["joint_errors"])
         if num_joints < 1:
             self.logger.warning("No joint errors to plot.")
             return
 
-        # Determine rows/cols based on even/odd
-        if num_joints % 2 == 0:
-            rows = num_joints // 2
-            cols = 2
-        else:
-            rows = num_joints
-            cols = 1
+        rows = (num_joints + 1) // 2
+        cols = 2 if num_joints > 1 else 1
 
-        fig, axes = plt.subplots(rows, cols, figsize=(16, 5 * rows), sharex=True)
+        fig, axes = plt.subplots(rows, cols, figsize=(16, 5 * rows), dpi=600, sharex=True)
 
-        # Handle single-joint case where axes might not be iterable
-        if num_joints == 1:
-            axes = [axes]
-
-        # Flatten the axes (in case of multiple subplots) so we can iterate easily
         if isinstance(axes, np.ndarray):
             axes = axes.flatten()
 
-        for i, ax in enumerate(axes):
-            if i >= num_joints:
-                ax.set_visible(False)
-                continue
+        for i, ax in enumerate(axes[:num_joints]):
+            data = np.array(self.metrics["joint_errors"][i])
+            ema_data = self._compute_ema(data, alpha=0.2)  # Use EMA for smoothing
+            avg_value = np.mean(data)
 
-            # Smooth the data and calculate the average
-            smoothed_data = self.moving_average(self.metrics['joint_errors'][i], window_size=10)
-            avg_value = np.mean(self.metrics['joint_errors'][i])
+            ax.plot(ema_data, label=f"Joint {i} Error (Smoothed)", color="tab:blue", linewidth=2)
+            ax.axhline(avg_value, color="red", linestyle="--", label=f"Average: {avg_value:.2f}")
+            ax.set_title(f"Joint {i} Errors Over Episodes", fontsize=14)
+            ax.set_xlabel("Episode", fontsize=12)
+            ax.set_ylabel("Error", fontsize=12)
+            ax.legend(fontsize=10)
+            ax.grid(alpha=0.3)
 
-            # Plot the smoothed data and average line
-            ax.plot(smoothed_data, label=f'Joint {i} Error (Smoothed)')
-            ax.axhline(avg_value, color='red', linestyle='--', label=f"Average: {avg_value:.2f}")
-            ax.set_title(f'Joint {i} Errors Over Episodes')
-            ax.set_xlabel('Episode')
-            ax.set_ylabel('Error')
-            ax.legend()
-            ax.grid()
+        for ax in axes[num_joints:]:
+            ax.set_visible(False)
 
         plt.tight_layout()
-        plt.savefig(plots_dir / "joint_errors.png")
-        plt.close()
+        fig.savefig(plots_dir / "joint_errors.png", format="png", bbox_inches="tight")
+        fig.savefig(plots_dir / "joint_errors.svg", format="svg", bbox_inches="tight")
+        plt.close(fig)
+
+    def _compute_ema(self, data, alpha=0.2):
+        """Compute the Exponential Moving Average (EMA) for a given dataset."""
+        ema_data = np.zeros_like(data)
+        ema_data[0] = data[0]
+        for i in range(1, len(data)):
+            ema_data[i] = alpha * data[i] + (1 - alpha) * ema_data[i - 1]
+        return ema_data

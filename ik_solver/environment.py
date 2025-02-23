@@ -156,7 +156,7 @@ class InverseKinematicsEnv(gym.Env):
         # Initialize step counter and thresholds
         self.current_step = 0
         self.position_threshold = 0.1  # Define appropriate value
-        self.orientation_threshold = 0.1  # Define appropriate value in radians
+        self.orientation_threshold = 0.05  # Define appropriate value in radians
 
         print(f"Number of joints in the robot: {self.num_joints}")
 
