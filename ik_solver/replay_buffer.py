@@ -79,47 +79,57 @@ class PrioritizedReplayBuffer:
             self.priority_stats['max'].append(np.max(self.priorities[:len(self.buffer)]))
             self.priority_stats['min'].append(np.min(self.priorities[:len(self.buffer)]))
 
-    def sample(self, batch_size, device=None):
+    def sample(self, batch_size, beta=0.4, device=None):
         """
-        Enhanced sampling with device support and better numerical stability.
+        Sample a batch of experiences with proper importance sampling.
         
         Args:
-            batch_size (int): Size of batch to sample
-            device: torch device to send tensors to
+            batch_size (int): Number of experiences to sample
+            beta (float): Importance sampling exponent (0 to 1)
+            device: Optional device to place tensors on
+            
+        Returns:
+            tuple: (experiences, weights, indices)
         """
+        if len(self.buffer) == 0:
+            return [], np.array([]), np.array([])
+        
+        # Adjust batch_size if buffer not large enough
+        batch_size = min(batch_size, len(self.buffer))
+        
+        # Get priorities and compute sampling probabilities
         if len(self.buffer) == self.capacity:
             priorities = self.priorities
         else:
             priorities = self.priorities[:self.pos]
-
-        # Compute sampling probabilities with numerical stability
-        probabilities = (priorities + 1e-7) ** self.alpha
-        probabilities /= probabilities.sum()
-
-        # Sample indices and compute importance sampling weights
-        indices = np.random.choice(len(self.buffer), batch_size, p=probabilities)
-        beta = self._get_current_beta()
         
-        # Compute weights with numerical stability
-        weights = (len(self.buffer) * probabilities[indices] + 1e-10) ** (-beta)
-        weights /= weights.max()  # Normalize weights
-
-        # Prepare batch
-        batch = [self.buffer[idx] for idx in indices]
+        # Ensure stability with small epsilon
+        priorities = priorities + 1e-7
         
-        # Convert to torch tensors if device is specified
+        # Convert priorities to probabilities using alpha
+        probs = priorities ** self.alpha
+        probs /= probs.sum()
+        
+        # Sample indices based on priorities
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs, replace=False)
+        
+        # Compute importance sampling weights: (P(i) * N)^(-beta) / max(w)
+        # Higher beta (closer to 1) gives more correction for non-uniform sampling
+        weights = (len(self.buffer) * probs[indices]) ** (-beta)
+        weights /= weights.max()  # Normalize to stabilize updates
+        
+        # Get sampled experiences
+        experiences = [self.buffer[idx] for idx in indices]
+        
+        # Convert to tensors if device is specified
         if device is not None:
             weights = torch.FloatTensor(weights).to(device)
-            batch = [Experience(
-                torch.FloatTensor(exp.state).to(device),
-                torch.FloatTensor(exp.action).to(device),
-                torch.FloatTensor([exp.reward]).to(device),
-                torch.FloatTensor(exp.next_state).to(device),
-                torch.FloatTensor([float(exp.done)]).to(device),
-                exp.info
-            ) for exp in batch]
+            # Optionally convert experiences to tensors on device
+            # This depends on your specific Experience implementation
+        
+        return experiences, weights, indices
 
-        return batch, weights, indices
+
 
     def update_priorities(self, indices, priorities):
         """

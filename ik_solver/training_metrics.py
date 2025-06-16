@@ -699,7 +699,7 @@ class TrainingMetrics:
     def _plot_entropy(self, metrics: Dict, show_plots: bool) -> None:
         """Plot entropy over episodes with enhanced styling."""
         episodes = np.arange(1, len(metrics['training']['entropy']) + 1)
-        episodes = episodes[::-1]
+        episodes = episodes
         window = min(10, len(episodes) // 10)
         
         # 1. Plot entropy
@@ -815,7 +815,7 @@ class TrainingMetrics:
             ax.set_ylabel('Cumulative Reward', fontsize=12)
             ax.set_title(f'Joint {joint_idx + 1} Cumulative Reward Over Time', fontsize=14)
             ax.grid(True, alpha=0.3)
-            ax.legend(fontsize=10)
+            #ax.legend(fontsize=10)
 
         plt.tight_layout()
         self.save_figure(fig, 'cumulative_rewards_per_agent')
@@ -1172,20 +1172,34 @@ class TrainingMetrics:
             self.logger.error(f"Error plotting minimum joint errors: {str(e)}")
             raise
 
+
     def plot_joint_error_convergence(self, metrics, show_plots, num_joints):
         # Ensure 'joint_errors' exists in metrics
         if 'joint_errors' not in metrics:
             print("Error: 'joint_errors' is missing in metrics.")
             return
 
-        joint_errors = metrics['joint_errors']
-
-        # Ensure joint_errors is not empty and has the correct shape
-        if not joint_errors or len(joint_errors) == 0:
-            print("Error: 'joint_errors' is empty.")
+        # Get the mean joint errors from the metrics structure
+        if 'mean' in metrics['joint_errors']:
+            joint_errors = metrics['joint_errors']['mean']
+        else:
+            print("Error: 'joint_errors' does not have 'mean' data.")
             return
 
+        # Ensure joint_errors is not empty and has the correct shape
         joint_errors = np.array(joint_errors)
+        if joint_errors.size == 0:
+            print("Error: 'joint_errors' is empty.")
+            return
+            
+        # Reshape if necessary
+        if joint_errors.ndim == 1:
+            # If it's a 1D array, reshape to (1, num_joints) or (num_episodes, 1) depending on length
+            if len(joint_errors) == num_joints:
+                joint_errors = joint_errors.reshape(1, -1)
+            else:
+                joint_errors = joint_errors.reshape(-1, 1)
+        
         if joint_errors.ndim != 2 or joint_errors.shape[1] != num_joints:
             print(f"Error: 'joint_errors' has an invalid shape. Expected (?, {num_joints}), got {joint_errors.shape}.")
             return
@@ -1193,22 +1207,33 @@ class TrainingMetrics:
         # Proceed with plotting
         episodes = np.arange(1, len(joint_errors) + 1)
         fig, ax = plt.subplots(figsize=(15, 6))
+        
+        # Track if any lines were plotted
+        lines_plotted = False
+        
         for joint_idx in range(num_joints):
             errors = joint_errors[:, joint_idx]
             window = min(10, len(episodes) // 5)
-            convergence = np.array([np.std(errors[max(0, i - window):i + 1]) for i in range(len(errors))])
-            ax.plot(episodes, convergence, label=f'Joint {joint_idx + 1}', alpha=0.7)
+            if window > 0 and len(errors) > window:
+                convergence = np.array([np.std(errors[max(0, i - window):i + 1]) for i in range(len(errors))])
+                ax.plot(episodes, convergence, label=f'Joint {joint_idx + 1}', alpha=0.7)
+                lines_plotted = True
 
         ax.set_xlabel('Episodes')
         ax.set_ylabel('Error Stability (Std Dev)')
         ax.set_title('Joint Error Convergence Analysis')
         ax.grid(True, alpha=0.3)
-        ax.legend()
+        
+        # Only add legend if lines were plotted
+        if lines_plotted:
+            ax.legend()
+        
         plt.tight_layout()
         self.save_figure(fig, 'joint_errors_convergence')
         if show_plots:
             plt.show()
         plt.close(fig)
+
 
     def _plot_normalized_reward(self, metrics: Dict, show_plots: bool, smoothing_window: int = 10) -> None:
         """Plot smoothed and normalized reward over episodes with overshot control."""

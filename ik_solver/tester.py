@@ -78,7 +78,7 @@ class MAPPOAgentTester:
             converged = False  
 
             while not done and steps < max_steps:
-                actions, policy_info = self.agent.get_actions(state, eval_mode=True)
+                actions, policy_info, _ = self.agent.get_actions(state, eval_mode=True)
                 next_state, rewards, done, info = self.env.step(actions)
 
                 total_reward += sum(rewards)
