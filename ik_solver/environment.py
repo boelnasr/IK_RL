@@ -65,6 +65,7 @@ class InverseKinematicsEnv(gym.Env):
             xarm_urdf_directory = os.path.dirname(xarm_urdf_path)
             p.setAdditionalSearchPath(xarm_urdf_directory)  # Add XArm model path
             self.robot_id = p.loadURDF(xarm_urdf_path, useFixedBase=True)
+
         else:
             raise ValueError(f"Robot {robot_name} is not available in PyBullet data.")
 
@@ -511,21 +512,25 @@ class InverseKinematicsEnv(gym.Env):
 
             # Create comprehensive info dictionary
             info = {
-                'success_per_joint': agent_successes,
-                'success_details': success_details,  # Added detailed metrics
-                'overall_success_rate': success_rate,
-                'current_distance': float(self.current_distance),
-                'initial_distance': float(self.initial_distance),
-                'best_distance': float(self.previous_best_distance),
-                'position_error': float(np.linalg.norm(self.position_error)),
-                'orientation_error': float(np.linalg.norm(self.orientation_error)),
-                'mean_joint_error': float(np.mean(self.joint_errors)),
-                'step': self.current_step,
-                'individual_rewards': rewards.tolist(),
-                'agent_difficulties': step_difficulties,
-                'joint_errors': self.joint_errors.tolist(),
-                'target_angles': target_joint_angles.tolist()  # Added for analysis
-            }
+    'success_per_joint':       agent_successes,
+    'success_details':         success_details,   # Added detailed metrics
+    'overall_success_rate':    success_rate,
+    'current_distance':        float(self.current_distance),
+    'initial_distance':        float(self.initial_distance),
+    'best_distance':           float(self.previous_best_distance),
+    'position_error':          float(np.linalg.norm(self.position_error)),
+    'orientation_error':       float(np.linalg.norm(self.orientation_error)),
+    'mean_joint_error':        float(np.mean(self.joint_errors)),
+    'step':                    self.current_step,
+    'individual_rewards':      rewards.tolist(),
+    'agent_difficulties':      step_difficulties,
+    'joint_errors':            self.joint_errors.tolist(),
+    'target_angles':           target_joint_angles.tolist(),  # Added for analysis
+    # Expose HER‐friendly goals:
+    'desired_goal':            np.concatenate([self.target_position,    self.target_orientation]).tolist(),
+    'achieved_goal':           np.concatenate([self.current_position,    self.current_orientation]).tolist(),
+}
+
 
             # Log comprehensive performance metrics
             logging.info(
