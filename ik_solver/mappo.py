@@ -1078,7 +1078,7 @@ class MAPPOAgent:
                         self.base_path, 
                         f'pd_performance_agent_{i}_episode_{episode}.png'
                     )
-                    controller.visualize_performance(save_path=viz_path, agent_idx=i)
+                    # controller.visualize_performance(save_path=viz_path, agent_idx=i)
                     
                     # Log PD metrics
                     pd_metrics = controller.get_metrics()

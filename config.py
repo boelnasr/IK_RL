@@ -17,13 +17,13 @@ config = {
     'batch_size': 64,                      # Batch size for training
     'buffer_size': 4096,                   # Size of the replay buffer
     'initial_epsilon': 0.20,
-    'epsilon_decay': 0.999,
+    'epsilon_decay': 0.995,
     'min_epsilon':0.01,
-    'num_episodes': 3000,                  # Number of episodes to train
-    'max_steps_per_episode':5000,       # Maximum number of steps per episode
+    'num_episodes': 10,                  # Number of episodes to train
+    'max_steps_per_episode':20,       # Maximum number of steps per episode
 
     'test_agent_after_training': True,     #  Whether to test the agent after training
-    'num_tests': 300,                        # Number of test episodes to run after training
+    'num_tests': 10,                        # Number of test episodes to run after training
     'use_cross_validation' : False,
     # Per-joint learning rates (optional, fall back to global 'lr' if not provided)
     'lr_joint_0': 3e-4,                    # Learning rate for joint 0
@@ -48,14 +48,21 @@ config = {
     'max_grad_norm': 0.5,        # Maximum gradient norm
     'ratio_clip': 0.20,          # Maximum policy ratio
     'advantage_clip': 2.0,       # Maximum advantage value
-    'use_scheduler': False,     # Whether to use a learning rate scheduler
+    'use_scheduler': True,     # Whether to use a learning rate scheduler
     #GPU config
     'num_envs': 4,              # Number of parallel environments
     'world_size': 1,            # Number of GPUs (1 for single GPU)
     'rank': 0,                  # GPU rank (0 for single GPU)
     #Cross validation config
     'validation_episodes': 10,
-    'k_folds': 3
+    'k_folds': 3,
+    # HER parameters
+    'use_her': True,
+    'her_update_freq': 5,  # Update from HER every N episodes
+    'her_batch_size': 128,
+    'her_k_future': 4,  # Number of future goals to sample
+    'her_reward_type': 'dense',  # 'dense' or 'sparse'
+    'her_success_threshold': 0.05,
 }
 attention_config = {
     'num_heads': 4,               # Number of attention heads
