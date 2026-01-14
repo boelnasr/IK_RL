@@ -710,7 +710,7 @@ class MAPPOAgent:
                 total_joint_errors.append(joint_errors)
 
                 # Calculate rewards
-                overall_reward, individual_rewards, prev_best, success = compute_reward(
+                overall_reward, individual_rewards, prev_best, success, stay_rewards = compute_reward(
                     distance=distance,
                     begin_distance=begin_distance,
                     prev_best=prev_best,
@@ -868,7 +868,9 @@ class MAPPOAgent:
                 policy_loss=policy_loss_per_agent,
                 advantages=advantages.cpu().numpy(),
                 env=self.env,
-                success_threshold=self.env.success_threshold
+                success_threshold=self.env.success_threshold,
+                episode_steps=step,
+                stay_bonus_per_agent=[0.0] * self.num_agents
             )
 
         # Save final results

@@ -200,9 +200,68 @@ class CurriculumManager:
     def reset_all(self, initial_difficulty: float = None):
         """
         Reset all agents to their initial state.
-        
+
         Args:
             initial_difficulty: Optional starting difficulty for all agents
         """
         for agent_idx in range(self.num_agents):
             self.reset_agent(agent_idx, initial_difficulty)
+
+    def is_curriculum_complete(self, threshold: float = 0.9) -> bool:
+        """
+        Check if curriculum ramping is complete for all agents.
+
+        Curriculum is considered complete when all agents have reached
+        near-maximum difficulty and maintained it.
+
+        Args:
+            threshold: Fraction of max_difficulty required (default 0.9 = 90%)
+
+        Returns:
+            True if curriculum is complete, False otherwise
+        """
+        required_difficulty = self.max_difficulty * threshold
+
+        # Check if all agents have reached the required difficulty
+        all_agents_at_max = all(
+            difficulty >= required_difficulty
+            for difficulty in self.difficulties
+        )
+
+        # Also check if agents have sufficient history to be confident
+        sufficient_history = all(
+            len(history) >= self.window_size * 0.5  # At least half window filled
+            for history in self.success_histories
+        )
+
+        is_complete = all_agents_at_max and sufficient_history
+
+        if is_complete:
+            self.logger.info(
+                f"Curriculum complete: all agents >= {required_difficulty:.2f} difficulty "
+                f"(threshold: {threshold*100:.0f}% of max)"
+            )
+
+        return is_complete
+
+    def get_curriculum_progress(self) -> dict:
+        """
+        Get detailed progress information about curriculum ramping.
+
+        Returns:
+            Dict with progress metrics
+        """
+        avg_difficulty = np.mean(self.difficulties)
+        min_difficulty_agent = np.min(self.difficulties)
+        max_difficulty_agent = np.max(self.difficulties)
+
+        progress_percent = (avg_difficulty - self.min_difficulty) / (self.max_difficulty - self.min_difficulty) * 100
+
+        return {
+            'average_difficulty': avg_difficulty,
+            'min_difficulty': min_difficulty_agent,
+            'max_difficulty': max_difficulty_agent,
+            'progress_percent': progress_percent,
+            'is_complete': self.is_curriculum_complete(),
+            'difficulties_per_agent': self.difficulties.copy()
+        }

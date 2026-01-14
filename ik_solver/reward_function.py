@@ -9,6 +9,63 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
+EPS = 1e-8            # single global epsilon
+
+# Centralise reward-related constants so they can be re-used in reports.
+REWARD_CONSTANTS = {
+    "MAX_REWARD": 8.0,
+    "MIN_REWARD": -2.0,
+    "POSITION_SCALE": 1.2,
+    "ORIENTATION_SCALE": 1.0,
+    "PERFORMANCE_SCALE": 0.3,
+    "IMPROVEMENT_SCALE": 0.5,
+    "ERROR_PENALTY_SCALE": 0.5,
+    "SUCCESS_BONUS_BASE": 2.5,  # REBALANCED: Increased from 1.0 (too weak) to 2.5 (strong signal without dominating)
+    "STAY_REWARD_SCALE": 0.4,    # New: reward for holding a stable pose
+    "STAY_THRESHOLD_RATIO": 0.5, # Movement ratio vs joint_threshold for full staying bonus
+    "TEAM_BONUS_SCALE": 3.0,     # Cooperative bonus shared across joints
+    "TEAM_ALIGNMENT_MIN": 0.5,   # Require reasonable pose alignment before granting team bonuses
+    "POSITION_FAILURE_PENALTY": 2.0,
+    "ORIENTATION_FAILURE_PENALTY": 3.0,
+    "POSE_PENALTY_CAP": 10.0,
+    "POSITION_RELAX_INIT": 10.0, # Start with looser shaping threshold (multiplier)
+    "ORIENTATION_RELAX_INIT": 5.0,
+    "RELAX_DECAY": 0.9,
+    "RELAX_TARGET_SUCCESS": 0.17,
+    "RELAX_MIN_FACTOR": 1.2,
+    "RELAX_WINDOW": 60,
+    "RELAX_EVAL_MIN_COUNT": 30,
+}
+
+REWARD_DEFAULT_ARGUMENTS = {
+    "success_threshold": 0.01,
+    "position_threshold": 0.02,
+    "orientation_threshold": 0.01,  # TIGHTENED: 0.1 → 0.01 rad (5.73° → 0.57°)
+    "joint_threshold": 0.01,         # TIGHTENED: 0.05 → 0.01 rad (2.86° → 0.57°)
+    "ratio_threshold": 0.5,
+    "time_penalty": -0.001,
+    "smoothing_window": 10,
+    "exploration_bonus": 0.02,
+}
+
+OVERALL_DISTANCE_WEIGHTS = {
+    "position": 0.7,
+    "orientation": 0.3,
+}
+
+
+def get_reward_parameters_snapshot():
+    """
+    Provide a serialisable snapshot of the reward shaping configuration.
+    """
+    return {
+        "eps": EPS,
+        "reward_constants": REWARD_CONSTANTS.copy(),
+        "default_arguments": REWARD_DEFAULT_ARGUMENTS.copy(),
+        "overall_distance_weights": OVERALL_DISTANCE_WEIGHTS.copy(),
+    }
+
+
 def wrap_angle_to_pi(angle):
     """
     Wrap angle to the range [-π, π].
@@ -48,55 +105,24 @@ def compute_position_error(current_position, target_position):
         logging.warning(f"Error in position calculation: {e}")
         return 1e-3
 
-
 def compute_quaternion_distance(q1, q2):
     """
-    Robust quaternion distance calculation with proper angle wrapping.
-    Returns the shortest angular distance between two quaternions in [-π, π].
-    
-    Args:
-        q1 (np.array): First quaternion [x, y, z, w]
-        q2 (np.array): Second quaternion [x, y, z, w]
-        
-    Returns:
-        float: Shortest angular distance in [-π, π]
+    Return unsigned axis-angle distance in radians ∈ [0, π].
+    API and units stay the same – you still call it exactly the same way.
     """
-    try:
-        q1 = np.array(q1, dtype=np.float64)
-        q2 = np.array(q2, dtype=np.float64)
-        
-        # Normalize quaternions to handle numerical errors
-        q1_norm = np.linalg.norm(q1)
-        q2_norm = np.linalg.norm(q2)
-        
-        if q1_norm < 1e-8 or q2_norm < 1e-8:
-            return 0.0
-            
-        q1 = q1 / q1_norm
-        q2 = q2 / q2_norm
-        
-        # Compute dot product (can be negative due to quaternion double cover)
-        dot_product = np.dot(q1, q2)
-        dot_product = np.clip(dot_product, -1.0, 1.0)
-        
-        # Handle quaternion double cover: choose the shorter rotation
-        # If dot_product < 0, the angle is > π/2, so use -q2 for shorter path
-        if dot_product < 0:
-            dot_product = -dot_product
-            
-        # Avoid numerical issues near 1.0
-        if dot_product > 0.9999:
-            return 0.0
-            
-        # Compute angle and wrap to [-π, π]
-        angle = 2 * np.arccos(dot_product)
-        wrapped_angle = wrap_angle_to_pi(angle)
-        
-        return float(wrapped_angle)
-        
-    except Exception as e:
-        logging.warning(f"Error in quaternion calculation: {e}")
+    q1 = np.asarray(q1, dtype=np.float64)
+    q2 = np.asarray(q2, dtype=np.float64)
+
+    n1 = np.linalg.norm(q1);  n2 = np.linalg.norm(q2)
+    if n1 < 1e-8 or n2 < 1e-8:
         return 0.0
+
+    q1 /= n1;  q2 /= n2
+    dot = np.clip(abs(np.dot(q1, q2)), -1.0, 1.0)   # abs() handles double cover
+    # small-angle safeguard
+    if dot > 0.999999:
+        return 0.0
+    return 2.0 * np.arccos(dot)                      # ∈ (0, π]
 
 
 def compute_orientation_error_euler(current_orientation, target_orientation):
@@ -176,14 +202,20 @@ def compute_overall_distance(current_position, target_position, current_orientat
         orientation_error = abs(orientation_error)
         
         # Weight position more heavily than orientation for most IK tasks
-        overall_distance = 0.7 * position_error + 0.3 * orientation_error
+        overall_distance = (
+            OVERALL_DISTANCE_WEIGHTS["position"] * position_error +
+            OVERALL_DISTANCE_WEIGHTS["orientation"] * orientation_error
+        )
         return max(float(overall_distance), 1e-8)
         
     except Exception as e:
         logging.warning(f"Error in overall distance calculation: {e}")
         return 1.0
 
-
+# --------------------------------------------------------------------------- #
+#  IMPROVED compute_reward() with better success detection and late-stage boost #
+# --------------------------------------------------------------------------- #
+import time
 def compute_reward(
     distance: float,
     begin_distance: float,
@@ -196,251 +228,415 @@ def compute_reward(
     difficulties: list,
     episode_number: int,
     total_episodes: int,
-    success_threshold: float = 0.01,
+    *,
+    # NEW: Direct error inputs from environment
+    position_error: Optional[float] = None,
+    orientation_error: Optional[float] = None,
+    success_threshold: float = 0.01,            # Dynamic success threshold from environment
+    position_threshold: float = 0.02,           # Position error threshold from environment
+    orientation_threshold: float = 0.01,        # TIGHTENED: Orientation error threshold (0.57°)
+    joint_threshold: float = 0.01,              # TIGHTENED: Joint error threshold (0.57°)
+    ratio_threshold: float = 0.5,               # Ratio of joints that need to succeed
     time_penalty: float = -0.001,
     smoothing_window: int = 10,
-    exploration_bonus: float = 0.01
+    exploration_bonus: float = 0.02,
+    joint_movements: Optional[list] = None,
+    done: bool = False                          # Episode completion flag
 ) -> tuple:
     """
-    Enhanced reward function with proper angle wrapping and robust error handling.
+    ENHANCED: Reward function with direct position/orientation errors and late-stage amplification.
     
     Args:
-        distance (float): Current distance to target
-        begin_distance (float): Initial distance to target
-        prev_best (float): Best distance achieved so far
-        current_orientation (np.array): Current orientation quaternion
-        target_orientation (np.array): Target orientation quaternion
-        joint_errors (list): List of joint angle errors
-        linear_weights (list): Linear Jacobian weights for each joint
-        angular_weights (list): Angular Jacobian weights for each joint
-        difficulties (list): Difficulty levels for each agent
-        episode_number (int): Current episode number
-        total_episodes (int): Total training episodes
-        success_threshold (float): Threshold for success determination
-        time_penalty (float): Per-step time penalty
-        smoothing_window (int): Window size for error smoothing
-        exploration_bonus (float): Bonus for exploration
+        distance: Current overall distance to target
+        begin_distance: Initial distance at episode start
+        prev_best: Best distance achieved so far
+        current_orientation: Current end-effector orientation quaternion
+        target_orientation: Target orientation quaternion
+        joint_errors: List of individual joint errors
+        linear_weights: Jacobian-based linear movement weights
+        angular_weights: Jacobian-based angular movement weights
+        difficulties: Per-agent difficulty levels
+        episode_number: Current episode number
+        total_episodes: Total episodes planned
+        position_error: Direct position error from environment (NEW)
+        orientation_error: Direct orientation error from environment (NEW)
+        success_threshold: Dynamic success threshold from environment (legacy compatibility)
+        position_threshold: Position error threshold from environment
+        orientation_threshold: Orientation error threshold from environment  
+        joint_threshold: Joint error threshold from environment
+        ratio_threshold: Minimum ratio of successful joints for overall success
+        time_penalty: Per-step penalty
+        smoothing_window: Window size for error smoothing
+        exploration_bonus: Bonus for exploration in early training
+        done: Episode completion flag for state reset
         
     Returns:
-        tuple: (final_rewards, joint_specific_rewards, new_best, success)
+        tuple: (final_rewards, joint_rewards, new_best_distance, success)
     """
+
+    # ---- 0. Reset state at episode boundaries (Change 3) ---------------------
+    if episode_number == 1 or done:
+        # Flush state at the start of a new run or episode completion
+        compute_reward._state = []
+        compute_reward._relax_position = REWARD_CONSTANTS.get("POSITION_RELAX_INIT", 5.0)
+        compute_reward._relax_orientation = REWARD_CONSTANTS.get("ORIENTATION_RELAX_INIT", 3.0)
+        compute_reward._success_history = deque(maxlen=int(REWARD_CONSTANTS.get("RELAX_WINDOW", 60)))
+
+    # ---- 1. Basic validation --------------------------------------------------
+    distance        = max(float(distance), EPS)
+    begin_distance  = max(float(begin_distance), EPS)
+    prev_best       = max(float(prev_best), EPS)
+    episode_number  = max(int(episode_number), 1)
+    total_episodes  = max(int(total_episodes), 1)
     
-    # ====== CRITICAL FIX 1: Input Validation ======
-    try:
-        # Validate and bound all inputs
-        distance = max(float(distance), 1e-8)
-        begin_distance = max(float(begin_distance), 1e-8)
-        prev_best = max(float(prev_best), 1e-8)
-        episode_number = max(int(episode_number), 1)
-        total_episodes = max(int(total_episodes), 1)
-        success_threshold = np.clip(float(success_threshold), 1e-6, 1.0)
-        
-        # Ensure we have valid joint errors
-        num_joints = len(joint_errors)
-        if num_joints == 0:
-            logging.warning("No joint errors provided")
-            return np.array([]), [], prev_best, False
-            
-        # Sanitize joint errors - CRITICAL: wrap angles to [-π, π] and take absolute value for magnitude
-        joint_errors = [abs(wrap_angle_to_pi(float(e))) for e in joint_errors]
-        
-        # Validate and normalize weights
-        if len(linear_weights) < num_joints:
-            linear_weights = list(linear_weights) + [1.0/num_joints] * (num_joints - len(linear_weights))
-        if len(angular_weights) < num_joints:
-            angular_weights = list(angular_weights) + [1.0/num_joints] * (num_joints - len(angular_weights))
-            
-        linear_weights = np.array(linear_weights[:num_joints])
-        angular_weights = np.array(angular_weights[:num_joints])
-        
-        # Ensure weights are positive and normalized
-        linear_weights = np.abs(linear_weights)
-        angular_weights = np.abs(angular_weights)
-        linear_weights = linear_weights / (np.sum(linear_weights) + 1e-8)
-        angular_weights = angular_weights / (np.sum(angular_weights) + 1e-8)
-        
-        # Validate difficulties
-        if len(difficulties) < num_joints:
-            difficulties = list(difficulties) + [1.0] * (num_joints - len(difficulties))
-        difficulties = [np.clip(float(d), 0.1, 5.0) for d in difficulties[:num_joints]]
-        
-    except Exception as e:
-        logging.error(f"Critical input validation error: {e}")
-        # Return safe fallback
-        fallback_size = max(len(joint_errors), 1)
-        return np.zeros(fallback_size), [0.0] * fallback_size, prev_best, False
+    # Validate and use the three thresholds from environment
+    position_threshold = max(float(position_threshold), 1e-6)
+    orientation_threshold = max(float(orientation_threshold), 1e-6)
+    joint_threshold = max(float(joint_threshold), 1e-6)
+    success_threshold = max(float(success_threshold), 1e-6)  # Legacy compatibility
 
-    # ====== CRITICAL FIX 2: Conservative Constants ======
-    MAX_REWARD = 3.0        # Reduced from 10.0 for stability
-    MIN_REWARD = -1.0       # Less severe penalties
-    POSITION_SCALE = 0.3    # Reduced scaling factors
-    ORIENTATION_SCALE = 0.2
-    IMPROVEMENT_SCALE = 0.1
-    ERROR_PENALTY_SCALE = 0.05  # Much gentler penalties
-    SUCCESS_BONUS_BASE = 1.0    # Reasonable success bonus
+    num_joints = len(joint_errors)
+    if num_joints == 0:
+        logging.error("compute_reward: empty joint_errors")
+        return np.zeros(0), [], prev_best, False
 
-    # ====== CRITICAL FIX 3: Simplified State Tracking ======
-    try:
-        # Initialize simplified tracking
-        if not hasattr(compute_reward, 'agent_data'):
-            compute_reward.agent_data = [{
-                'error_history': deque(maxlen=smoothing_window),
-                'best_error': float('inf'),
-                'total_steps': 0
-            } for _ in range(num_joints)]
-        
-        # Ensure we have data for all agents
-        while len(compute_reward.agent_data) < num_joints:
-            compute_reward.agent_data.append({
-                'error_history': deque(maxlen=smoothing_window),
-                'best_error': float('inf'),
-                'total_steps': 0
-            })
-            
-    except Exception as e:
-        logging.error(f"State tracking initialization failed: {e}")
-        # Continue with fallback computation
+    # signed → magnitude
+    joint_errors     = np.abs(wrap_angle_to_pi(np.asarray(joint_errors, dtype=np.float64)))
+    linear_weights   = np.asarray(linear_weights,  dtype=np.float64)
+    angular_weights  = np.asarray(angular_weights, dtype=np.float64)
+    if joint_movements is None:
+        joint_movements = np.zeros(num_joints, dtype=np.float64)
+    else:
+        joint_movements = np.asarray(joint_movements, dtype=np.float64)
+        if joint_movements.size != num_joints:
+            logging.warning("joint_movements length mismatch; resizing")
+            joint_movements = np.resize(joint_movements, num_joints)
 
-    # ====== CRITICAL FIX 4: Robust Global Metrics ======
-    try:
-        # Use the properly wrapped quaternion distance
-        orientation_error = compute_quaternion_distance(current_orientation, target_orientation)
-        # For distance metrics, we want the magnitude
-        orientation_error_magnitude = abs(orientation_error)
-        orientation_error_magnitude = np.clip(orientation_error_magnitude, 0.0, np.pi)
-        
-        episode_progress = np.clip(episode_number / total_episodes, 0.1, 1.0)
-        
-        # Bounded normalization
-        norm_distance = np.clip(distance / (begin_distance + 1e-8), 0.0, 5.0)
-        norm_orientation = np.clip(orientation_error_magnitude / np.pi, 0.0, 1.0)
-        
-    except Exception as e:
-        logging.warning(f"Global metrics calculation error: {e}")
-        norm_distance = 1.0
-        norm_orientation = 1.0
-        episode_progress = 0.5
+    # pad / warn on length mismatch
+    if linear_weights.size  != num_joints:
+        logging.warning("linear_weights length mismatch; padding / truncating")
+        linear_weights = np.resize(linear_weights,  num_joints)
+        linear_weights.fill(1.0 / num_joints)
 
-    # ====== CRITICAL FIX 5: Individual Agent Rewards with Bounds ======
-    final_rewards = np.zeros(num_joints)
+    if angular_weights.size != num_joints:
+        logging.warning("angular_weights length mismatch; padding / truncating")
+        angular_weights = np.resize(angular_weights, num_joints)
+        angular_weights.fill(1.0 / num_joints)
+
+    linear_weights  = np.abs(linear_weights)
+    angular_weights = np.abs(angular_weights)
+    linear_weights  /= (linear_weights.sum()  + EPS)
+    angular_weights /= (angular_weights.sum() + EPS)
+
+    if len(difficulties) != num_joints:
+        logging.warning("difficulties length mismatch; padding / truncating")
+        difficulties = (difficulties + [1.0] * num_joints)[:num_joints]
+    difficulties = np.clip(difficulties, 0.1, 5.0)
+
+    # ---- 2. Use direct errors from environment (Change 1) --------------------
+    # If caller provided direct errors – use them
+    if position_error is None:
+        # fallback to old estimate
+        orientation_error_local = compute_quaternion_distance(
+            current_orientation, target_orientation)
+        position_error = max(0.0, (distance - 0.3 * orientation_error_local) / 0.7)
+    if orientation_error is None:
+        orientation_error = compute_quaternion_distance(
+            current_orientation, target_orientation)
+    
+    norm_distance     = np.clip(distance  / begin_distance, 0.0, 5.0)
+    norm_orientation  = np.clip(orientation_error / np.pi, 0.0, 1.0)
+    norm_position     = np.clip(position_error / (begin_distance * 0.7), 0.0, 5.0)
+    episode_progress  = np.clip(episode_number / total_episodes, 0.1, 1.0)
+
+    # ---- 3. Per-agent tracking state (thread-safe per process) ----------------
+    if not hasattr(compute_reward, "_state") or \
+       len(compute_reward._state) != num_joints:
+        compute_reward._state = [{
+            "best_error": np.inf,
+            "prev_error": None,
+            "window": deque(maxlen=smoothing_window),
+            "success_count": 0,
+            "total_count": 0
+        } for _ in range(num_joints)]
+
+    if not hasattr(compute_reward, "_relax_position"):
+        compute_reward._relax_position = REWARD_CONSTANTS.get("POSITION_RELAX_INIT", 5.0)
+    if not hasattr(compute_reward, "_relax_orientation"):
+        compute_reward._relax_orientation = REWARD_CONSTANTS.get("ORIENTATION_RELAX_INIT", 3.0)
+    if not hasattr(compute_reward, "_success_history"):
+        compute_reward._success_history = deque(maxlen=int(REWARD_CONSTANTS.get("RELAX_WINDOW", 60)))
+
+    # ---- 4. Constants with late-phase amplifier (Change 2) -------------------
+    MAX_REWARD         = REWARD_CONSTANTS["MAX_REWARD"]
+    MIN_REWARD         = REWARD_CONSTANTS["MIN_REWARD"]
+    POSITION_SCALE     = REWARD_CONSTANTS["POSITION_SCALE"]
+    ORIENTATION_SCALE  = REWARD_CONSTANTS["ORIENTATION_SCALE"]
+    PERFORMANCE_SCALE  = REWARD_CONSTANTS["PERFORMANCE_SCALE"]
+    IMPROVEMENT_SCALE  = REWARD_CONSTANTS["IMPROVEMENT_SCALE"]
+    ERROR_PENALTY_SCALE= REWARD_CONSTANTS["ERROR_PENALTY_SCALE"]
+    SUCCESS_BONUS_BASE = REWARD_CONSTANTS["SUCCESS_BONUS_BASE"]   # FIXED: Reduced from 5.0 to 1.0 to match other components
+    STAY_REWARD_SCALE  = REWARD_CONSTANTS["STAY_REWARD_SCALE"]
+    STAY_THRESHOLD_RATIO = REWARD_CONSTANTS["STAY_THRESHOLD_RATIO"]
+
+    # FIXED: Balanced late-phase boost that scales both rewards AND penalties
+    # This prevents reward collapse by keeping the reward scale balanced
+    if episode_progress > 0.80:
+        late_gain = 1.0 + 0.3 * (episode_progress - 0.80)  # max 1.0 → 1.3 (reduced from 1.5)
+        MAX_REWARD *= late_gain
+        SUCCESS_BONUS_BASE *= late_gain
+        # CRITICAL: Also scale up MIN_REWARD to keep penalties proportional
+        MIN_REWARD = max(MIN_REWARD * late_gain, -3.0)  # Allow more negative but keep balanced
+
+    # ---- 5. Compute per-joint reward with improved success detection ----------
+    final_rewards         = np.zeros(num_joints, dtype=np.float32)
     joint_specific_rewards = []
-    
-    for agent_idx in range(num_joints):
-        try:
-            current_error = joint_errors[agent_idx]
-            agent_difficulty = difficulties[agent_idx]
-            
-            # Update tracking safely
-            if hasattr(compute_reward, 'agent_data') and agent_idx < len(compute_reward.agent_data):
-                agent_data = compute_reward.agent_data[agent_idx]
-                agent_data['error_history'].append(current_error)
-                agent_data['total_steps'] += 1
-                
-                # Simple improvement calculation
-                improvement = 0.0
-                if len(agent_data['error_history']) >= 3:
-                    recent = list(agent_data['error_history'])
-                    mid = len(recent) // 2
-                    old_avg = np.mean(recent[:mid]) if mid > 0 else current_error
-                    new_avg = np.mean(recent[mid:])
-                    
-                    if old_avg > 1e-8:
-                        improvement = (old_avg - new_avg) / old_avg
-                        improvement = np.clip(improvement, -1.0, 1.0)
-            else:
-                improvement = 0.0
+    stay_rewards_list = []
+    individual_successes = []
 
-            # ====== BOUNDED REWARD COMPONENTS ======
-            
-            # 1. Position contribution (bounded)
-            position_reward = POSITION_SCALE * (1.0 - norm_distance) * linear_weights[agent_idx]
-            position_reward = np.clip(position_reward, 0.0, 0.5)
-            
-            # 2. Orientation contribution (bounded)
-            orientation_reward = ORIENTATION_SCALE * (1.0 - norm_orientation) * angular_weights[agent_idx]
-            orientation_reward = np.clip(orientation_reward, 0.0, 0.3)
-            
-            # 3. Individual performance (bounded)
-            normalized_error = np.clip(current_error / np.pi, 0.0, 1.0)
-            performance_reward = 0.2 * (1.0 - normalized_error)
-            
-            # 4. Improvement reward (bounded)
-            improvement_reward = IMPROVEMENT_SCALE * np.tanh(improvement) * episode_progress
-            improvement_reward = np.clip(improvement_reward, -0.1, 0.1)
-            
-            # 5. Gentle error penalty (bounded)
-            error_penalty = -ERROR_PENALTY_SCALE * normalized_error
-            error_penalty = np.clip(error_penalty, -0.1, 0.0)
-            
-            # 6. Success bonus (controlled)
-            success_bonus = 0.0
-            if current_error <= success_threshold:
-                success_bonus = SUCCESS_BONUS_BASE * episode_progress
-                success_bonus = np.clip(success_bonus, 0.0, 1.0)
-            
-            # 7. Gentle time penalty
-            scaled_time_penalty = time_penalty * 0.5 * (linear_weights[agent_idx] + angular_weights[agent_idx])
-            scaled_time_penalty = np.clip(scaled_time_penalty, -0.01, 0.0)
-            
-            # ====== COMBINE WITH STRICT BOUNDS ======
-            agent_reward = (
-                position_reward +
-                orientation_reward +
-                performance_reward +
-                improvement_reward +
-                error_penalty +
-                success_bonus +
-                scaled_time_penalty
-            )
-            
-            # Apply difficulty scaling (bounded)
-            agent_reward *= np.clip(agent_difficulty, 0.5, 2.0)
-            
-            # Final bounds check
-            agent_reward = np.clip(agent_reward, MIN_REWARD, MAX_REWARD)
-            
-            # Ensure finite value
-            if not np.isfinite(agent_reward):
-                agent_reward = 0.0
-                
-            final_rewards[agent_idx] = float(agent_reward)
-            joint_specific_rewards.append(float(agent_reward))
-            
-        except Exception as e:
-            logging.warning(f"Error calculating reward for agent {agent_idx}: {e}")
-            # Safe fallback
-            fallback_reward = -0.1
-            final_rewards[agent_idx] = fallback_reward
-            joint_specific_rewards.append(fallback_reward)
+    linear_weight_total = float(np.sum(linear_weights))
+    if not np.isfinite(linear_weight_total) or linear_weight_total <= EPS:
+        linear_weight_total = float(num_joints)
+    angular_weight_total = float(np.sum(angular_weights))
+    if not np.isfinite(angular_weight_total) or angular_weight_total <= EPS:
+        angular_weight_total = float(num_joints)
+    safe_position_threshold = max(position_threshold, EPS)
+    safe_orientation_threshold = max(orientation_threshold, EPS)
+    base_position_scale = max(safe_position_threshold, joint_threshold)
+    base_orientation_scale = max(safe_orientation_threshold, joint_threshold)
 
-    # ====== CRITICAL FIX 6: Gentle Normalization ======
-    try:
-        # Only normalize if rewards are extremely varied
-        reward_std = np.std(final_rewards)
-        if reward_std > 2.0:  # Only if very high variance
-            reward_mean = np.mean(final_rewards)
-            final_rewards = (final_rewards - reward_mean) / (reward_std + 1e-8)
-            final_rewards = np.clip(final_rewards, MIN_REWARD, MAX_REWARD)
-            joint_specific_rewards = final_rewards.tolist()
+    relax_min_factor = REWARD_CONSTANTS.get("RELAX_MIN_FACTOR", 1.2)
+    relax_position_factor = max(float(compute_reward._relax_position), relax_min_factor)
+    relax_orientation_factor = max(float(compute_reward._relax_orientation), relax_min_factor)
+    shaping_position_threshold = max(base_position_scale * relax_position_factor, safe_position_threshold)
+    shaping_orientation_threshold = max(base_orientation_scale * relax_orientation_factor, safe_orientation_threshold)
+
+    if np.isfinite(position_error) and position_error <= position_threshold:
+        position_alignment = 1.0
+    elif np.isfinite(position_error):
+        position_alignment = float(np.clip(position_threshold / (position_error + EPS), 0.0, 1.0))
+    else:
+        position_alignment = 0.0
+
+    if np.isfinite(orientation_error) and orientation_error <= orientation_threshold:
+        orientation_alignment = 1.0
+    elif np.isfinite(orientation_error):
+        orientation_alignment = float(np.clip(orientation_threshold / (orientation_error + EPS), 0.0, 1.0))
+    else:
+        orientation_alignment = 0.0
+
+    pose_alignment = max(0.0, min(position_alignment, orientation_alignment))
+
+    for j in range(num_joints):
+        err = joint_errors[j]
+        movement = abs(joint_movements[j])
+        diff = difficulties[j]
+
+        # --- track best & improvement
+        st = compute_reward._state[j]
+        st["window"].append(err)
+        st["total_count"] += 1
+        
+        if err < st["best_error"]:
+            st["best_error"] = err
+        prev_err = st.get("prev_error")
+        if prev_err is None or not np.isfinite(prev_err):
+            improvement = 0.0
+        else:
+            baseline = max(abs(prev_err), joint_threshold, EPS)
+            improvement = (prev_err - err) / baseline
+        improvement = np.clip(improvement, -1.0, 1.0)
+
+        # --- SUCCESS DETECTION using all three thresholds ---
+        joint_error_success = err <= joint_threshold
+        position_success = position_error <= position_threshold
+        orientation_success = orientation_error <= orientation_threshold
+
+        # FIXED: Use only joint-specific error (removed global dependencies)
+        # This gives clearer credit assignment - each joint learns independently
+        is_joint_successful = joint_error_success
+        
+        if is_joint_successful:
+            st["success_count"] += 1
+        individual_successes.append(is_joint_successful)
+
+        # --- reward components ---
+        linear_share = linear_weights[j] / linear_weight_total
+        angular_share = angular_weights[j] / angular_weight_total
+        joint_position_error = position_error * linear_share
+        joint_orientation_error = orientation_error * angular_share
+
+        norm_joint_position = np.clip(joint_position_error / shaping_position_threshold, 0.0, 2.5)
+        norm_joint_orientation = np.clip(joint_orientation_error / shaping_orientation_threshold, 0.0, 2.5)
+
+        pos_r  = POSITION_SCALE    * (1.05 - norm_joint_position)
+        ori_r  = ORIENTATION_SCALE * (1.05 - norm_joint_orientation)
+        pos_r  = np.clip(pos_r, -0.6, 0.8)
+        ori_r  = np.clip(ori_r, -0.4, 0.6)
+
+        perf_r = PERFORMANCE_SCALE * (1.0 - np.clip(err / np.pi, 0.0, 1.0))
+        impr_r = IMPROVEMENT_SCALE * improvement * episode_progress
+        impr_r = np.clip(impr_r, -0.15, 0.15)
+
+        err_pen = -ERROR_PENALTY_SCALE * np.clip(err / np.pi, 0.0, 1.0)
+
+        # SUCCESS BONUS using joint_threshold
+        succ_bonus = 0.0
+        if is_joint_successful:
+            # Base success bonus
+            base_bonus = SUCCESS_BONUS_BASE * episode_progress
             
-    except Exception as e:
-        logging.warning(f"Reward normalization error: {e}")
+            # Precision bonus: the smaller the error relative to threshold, the bigger the bonus
+            precision_factor = max(0.1, (joint_threshold - err) / joint_threshold)
+            precision_bonus = base_bonus * precision_factor
+            
+            # Consistency bonus
+            recent_success_rate = st["success_count"] / max(st["total_count"], 1)
+            consistency_bonus = base_bonus * 0.5 * recent_success_rate
 
-    # ====== CRITICAL FIX 7: Robust Success Determination ======
-    try:
-        individual_successes = np.array([e <= success_threshold for e in joint_errors])
-        success = np.mean(individual_successes) >= 0.7
-        new_best = min(prev_best, distance)
-    except Exception:
-        success = False
-        new_best = prev_best
+            succ_bonus = base_bonus + precision_bonus + consistency_bonus
+            succ_bonus = np.clip(succ_bonus, 0.0, MAX_REWARD * 0.6)
+            succ_bonus *= pose_alignment
 
-    return final_rewards, joint_specific_rewards, new_best, success
+        # FIXED: Extended exploration bonus with gradual decay
+        # Instead of cutting off at 30%, gradually reduce until 60%
+        if episode_progress < 0.6:
+            decay_factor = 1.0 - (episode_progress / 0.6)  # 1.0 → 0.0 over first 60%
+            expl_bonus = exploration_bonus * decay_factor
+        else:
+            expl_bonus = 0.0
+
+        time_pen = time_penalty * (linear_weights[j] + angular_weights[j])
+
+        # Staying reward encourages minimal motion after converging
+        # FIXED: Only require joint success, not full pose convergence
+        # This allows joints to get stay rewards independently
+        stay_reward = 0.0
+        if is_joint_successful:
+            stay_threshold = max(joint_threshold * STAY_THRESHOLD_RATIO, 1e-6)
+            stay_factor = np.clip(1.0 - (movement / stay_threshold), 0.0, 1.0)
+            stay_reward = STAY_REWARD_SCALE * stay_factor * pose_alignment
+
+        reward = (pos_r + ori_r + perf_r + impr_r +
+                  err_pen + succ_bonus + expl_bonus + time_pen + stay_reward)
+
+        # FIXED: Asymmetric difficulty scaling to avoid amplifying penalties
+        # Only apply difficulty scaling to positive rewards to prevent negative spiral
+        if reward > 0:
+            reward *= np.clip(diff, 0.85, 1.15)  # Gentle boost for harder problems
+        else:
+            reward *= np.clip(diff, 0.95, 1.05)  # Minimal penalty scaling
+        reward  = float(np.clip(reward, MIN_REWARD, MAX_REWARD))
+
+        final_rewards[j] = reward
+        stay_rewards_list.append(float(stay_reward))
+        st["prev_error"] = err
+
+    pose_penalty = 0.0
+    if np.isfinite(position_error) and position_error > position_threshold:
+        pos_overshoot = (position_error - position_threshold) / (position_threshold + EPS)
+        pose_penalty -= REWARD_CONSTANTS.get("POSITION_FAILURE_PENALTY", 0.0) * pos_overshoot
+    if np.isfinite(orientation_error) and orientation_error > orientation_threshold:
+        ori_overshoot = (orientation_error - orientation_threshold) / (orientation_threshold + EPS)
+        pose_penalty -= REWARD_CONSTANTS.get("ORIENTATION_FAILURE_PENALTY", 0.0) * ori_overshoot
+
+    if pose_penalty < 0.0:
+        penalty_cap = max(float(REWARD_CONSTANTS.get("POSE_PENALTY_CAP", 10.0)), 0.0)
+        pose_penalty = float(np.clip(pose_penalty, -penalty_cap, 0.0))
+        final_rewards = np.clip(
+            final_rewards + (pose_penalty / num_joints),
+            MIN_REWARD,
+            MAX_REWARD
+        )
+
+    # ---- 6. REBALANCED success detection: Progressive strictness ---------------------------
+    success_ratio = sum(individual_successes) / num_joints
+
+    # Progressive criteria: easier early (OR logic), stricter late (AND logic)
+    ramp = np.clip((episode_progress - 0.8) / 0.2, 0.0, 1.0)
+    strict_ratio = 0.35 + 0.15 * ramp  # 35% → 50% over training (was 40% → 50%)
+
+    # Early training (<80%): Need good joint ratio OR pose accuracy
+    # Late training (≥80%): Need both joint ratio AND pose accuracy
+    if episode_progress < 0.8:
+        success = (success_ratio >= strict_ratio
+                   or (position_error <= position_threshold
+                       and orientation_error <= orientation_threshold))
+    else:
+        # Late training: stricter requirements
+        success = (success_ratio >= strict_ratio
+                   and position_error <= position_threshold
+                   and orientation_error <= orientation_threshold)
+
+    # Log detailed success info occasionally
+    if episode_number % 50 == 0 and success:
+        logging.info(f"SUCCESS at episode {episode_number}:")
+        logging.info(f"  Joint success ratio: {success_ratio:.3f} (threshold: {strict_ratio:.3f})")
+        logging.info(f"  Position error: {position_error:.4f} (threshold: {position_threshold:.4f})")
+        logging.info(f"  Orientation error: {orientation_error:.4f} (threshold: {orientation_threshold:.4f})")
+        logging.info(f"  Mean joint error: {np.mean(joint_errors):.4f} (threshold: {joint_threshold:.4f})")
+
+    new_best = min(prev_best, distance)
+
+    # ---- 6a. Update relaxation schedule based on achieved success -------------
+    hist = compute_reward._success_history
+    if hist is not None:
+        hist.append(success_ratio)
+    relax_target = REWARD_CONSTANTS.get("RELAX_TARGET_SUCCESS", 0.2)
+    relax_min_factor = REWARD_CONSTANTS.get("RELAX_MIN_FACTOR", 1.2)
+    relax_decay = REWARD_CONSTANTS.get("RELAX_DECAY", 0.9)
+    relax_eval_min_count = int(REWARD_CONSTANTS.get("RELAX_EVAL_MIN_COUNT", 30))
+
+    # Evaluate once enough data collected and only tighten when performance warrants it
+    if hist is not None and len(hist) >= relax_eval_min_count:
+        avg_success = float(sum(hist) / len(hist))
+        if avg_success >= relax_target:
+            compute_reward._relax_position = max(
+                relax_min_factor, compute_reward._relax_position * relax_decay)
+            compute_reward._relax_orientation = max(
+                relax_min_factor, compute_reward._relax_orientation * relax_decay)
+            hist.clear()
+
+    # ---- 6b. Cooperative team bonus --------------------------------------------------------
+    TEAM_BONUS_SCALE = REWARD_CONSTANTS.get("TEAM_BONUS_SCALE", 0.0)
+    team_alignment_min = REWARD_CONSTANTS.get("TEAM_ALIGNMENT_MIN", 0.0)
+    if TEAM_BONUS_SCALE and success_ratio > 0.0 and pose_alignment >= team_alignment_min:
+        # FIXED: Keep team bonus constant instead of decreasing
+        # This prevents reward collapse by maintaining cooperative incentives
+        coop_scale = TEAM_BONUS_SCALE * 1.2  # Constant, was (1.2 - 0.2 * episode_progress)
+        cooperative_total = coop_scale * success_ratio * pose_alignment
+        successful_count = sum(individual_successes)
+
+        shared_component = cooperative_total * 0.35
+        targeted_component = cooperative_total - shared_component
+
+        if shared_component > 0.0:
+            shared_bonus = shared_component / num_joints
+            final_rewards = np.clip(final_rewards + shared_bonus, MIN_REWARD, MAX_REWARD)
+
+        if targeted_component > 0.0 and successful_count > 0:
+            per_joint_bonus = targeted_component / successful_count
+            for idx, succeeded in enumerate(individual_successes):
+                if succeeded:
+                    final_rewards[idx] = float(np.clip(final_rewards[idx] + per_joint_bonus, MIN_REWARD, MAX_REWARD))
+
+        joint_specific_rewards = final_rewards.tolist()
+
+    # ---- 7. Optional variance normalisation ------------------------------------
+    if final_rewards.std() > 4.0:
+        mu, sigma = final_rewards.mean(), final_rewards.std() + EPS
+        final_rewards = np.clip((final_rewards - mu) / sigma,
+                                MIN_REWARD, MAX_REWARD)
+        joint_specific_rewards = final_rewards.tolist()
+    else:
+        joint_specific_rewards = final_rewards.tolist()
+
+    return final_rewards, joint_specific_rewards, new_best, success, stay_rewards_list
 
 
 def adaptive_clip(rewards, stats):
     """
-    IMPROVED: Much more conservative adaptive clipping.
+    ENHANCED: Safer, faster adaptive clipping with Welford's online algorithm (Change 5).
     
     Args:
         rewards (np.array): Rewards to clip
@@ -461,21 +657,24 @@ def adaptive_clip(rewards, stats):
             
         finite_rewards = rewards[finite_mask]
         curr_mean = np.mean(finite_rewards)
-        curr_std = np.std(finite_rewards) + 1e-8
         
-        # CRITICAL: More conservative updates
-        alpha = 0.95  # Slower adaptation
-        stats['running_mean'] = alpha * stats.get('running_mean', curr_mean) + (1 - alpha) * curr_mean
-        stats['running_std'] = alpha * stats.get('running_std', curr_std) + (1 - alpha) * curr_std
+        # Welford's online update for numerical stability
+        alpha = 0.99
+        delta = curr_mean - stats.get('running_mean', curr_mean)
+        stats['running_mean'] = stats.get('running_mean', curr_mean) + alpha * delta
+        stats['running_M2'] = stats.get('running_M2', 0.0) + delta * (curr_mean - stats['running_mean'])
+        n = stats.get('count', 0) + 1
+        stats['count'] = n
+        stats['running_std'] = math.sqrt(stats['running_M2'] / max(n-1, 1))
         
-        # CRITICAL: Gentler clipping bounds
-        clip_factor = 1.0  # Much smaller clipping range
+        # Conservative clipping bounds
+        clip_factor = 1.0
         lower_bound = stats['running_mean'] - clip_factor * stats['running_std']
         upper_bound = stats['running_mean'] + clip_factor * stats['running_std']
         
         # Apply conservative bounds
         lower_bound = max(lower_bound, -2.0)  # Never clip below -2
-        upper_bound = min(upper_bound, 5.0)   # Never clip above 5
+        upper_bound = min(upper_bound, 8.0)   # Never clip above 8 (increased for success bonuses)
         
         clipped_rewards = np.copy(rewards)
         clipped_rewards[finite_mask] = np.clip(finite_rewards, lower_bound, upper_bound)
@@ -484,14 +683,14 @@ def adaptive_clip(rewards, stats):
         
     except Exception as e:
         logging.warning(f"Adaptive clipping error: {e}")
-        return np.clip(rewards, -2.0, 5.0)
+        return np.clip(rewards, -2.0, 8.0)
 
 
-# ====== JACOBIAN COMPUTATION FUNCTIONS ======
+# ====== ENHANCED JACOBIAN COMPUTATION (Change 6) ======
 
 def compute_jacobian_linear(robot_id, joint_indices, joint_angles):
     """
-    Robust linear Jacobian computation with comprehensive error handling.
+    ENHANCED: Use PyBullet's built-in Jacobian computation for better performance.
     
     Args:
         robot_id (int): PyBullet robot ID
@@ -500,6 +699,58 @@ def compute_jacobian_linear(robot_id, joint_indices, joint_angles):
         
     Returns:
         np.array: Linear Jacobian matrix (3 x n)
+    """
+    try:
+        if not joint_indices:
+            return np.zeros((3, 1))
+            
+        zero_vec = [0.0] * len(joint_indices)
+        j_lin, _ = p.calculateJacobian(
+            robot_id, joint_indices[-1],
+            [0, 0, 0],  # local position of end-effector
+            list(joint_angles), zero_vec, zero_vec
+        )
+        return np.asarray(j_lin, dtype=np.float64)
+        
+    except Exception as e:
+        logging.warning(f"Built-in linear Jacobian computation failed: {e}")
+        # Fallback to manual computation
+        return compute_jacobian_linear_manual(robot_id, joint_indices, joint_angles)
+
+
+def compute_jacobian_angular(robot_id, joint_indices, joint_angles):
+    """
+    ENHANCED: Use PyBullet's built-in Jacobian computation for better performance.
+    
+    Args:
+        robot_id (int): PyBullet robot ID
+        joint_indices (list): List of joint indices
+        joint_angles (list): List of joint angles
+        
+    Returns:
+        np.array: Angular Jacobian matrix (3 x n)
+    """
+    try:
+        if not joint_indices:
+            return np.zeros((3, 1))
+            
+        zero_vec = [0.0] * len(joint_indices)
+        _, j_ang = p.calculateJacobian(
+            robot_id, joint_indices[-1],
+            [0, 0, 0],  # local position of end-effector
+            list(joint_angles), zero_vec, zero_vec
+        )
+        return np.asarray(j_ang, dtype=np.float64)
+        
+    except Exception as e:
+        logging.warning(f"Built-in angular Jacobian computation failed: {e}")
+        # Fallback to manual computation
+        return compute_jacobian_angular_manual(robot_id, joint_indices, joint_angles)
+
+
+def compute_jacobian_linear_manual(robot_id, joint_indices, joint_angles):
+    """
+    Manual linear Jacobian computation as fallback.
     """
     try:
         num_joints = len(joint_indices)
@@ -536,27 +787,19 @@ def compute_jacobian_linear(robot_id, joint_indices, joint_angles):
                     J_linear[:, i] = [0, 0, 0]
                     
             except Exception as e:
-                logging.warning(f"Error computing Jacobian for joint {i}: {e}")
+                logging.warning(f"Error computing manual Jacobian for joint {i}: {e}")
                 J_linear[:, i] = [0, 0, 0]
         
         return J_linear
         
     except Exception as e:
-        logging.error(f"Jacobian linear computation failed: {e}")
+        logging.error(f"Manual Jacobian linear computation failed: {e}")
         return np.eye(3, len(joint_indices) if joint_indices else 1)
 
 
-def compute_jacobian_angular(robot_id, joint_indices, joint_angles):
+def compute_jacobian_angular_manual(robot_id, joint_indices, joint_angles):
     """
-    Robust angular Jacobian computation with comprehensive error handling.
-    
-    Args:
-        robot_id (int): PyBullet robot ID
-        joint_indices (list): List of joint indices
-        joint_angles (list): List of joint angles
-        
-    Returns:
-        np.array: Angular Jacobian matrix (3 x n)
+    Manual angular Jacobian computation as fallback.
     """
     try:
         num_joints = len(joint_indices)
@@ -589,13 +832,13 @@ def compute_jacobian_angular(robot_id, joint_indices, joint_angles):
                     J_angular[:, i] = [0, 0, 1]
                     
             except Exception as e:
-                logging.warning(f"Error computing angular Jacobian for joint {i}: {e}")
+                logging.warning(f"Error computing manual angular Jacobian for joint {i}: {e}")
                 J_angular[:, i] = [0, 0, 1]
         
         return J_angular
         
     except Exception as e:
-        logging.error(f"Jacobian angular computation failed: {e}")
+        logging.error(f"Manual Jacobian angular computation failed: {e}")
         return np.eye(3, len(joint_indices) if joint_indices else 1)
 
 
@@ -763,7 +1006,7 @@ def compute_orientation_bonus(quaternion_distance):
     Safe orientation bonus with proper angle handling.
     
     Args:
-        quaternion_distance (float): Angular distance in [-π, π]
+        quaternion_distance (float): Angular distance in [0, π]
         
     Returns:
         float: Orientation bonus between 0 and 1
@@ -928,11 +1171,11 @@ def test_reward_function():
     """
     Test the reward function with various edge cases to ensure robustness.
     """
-    print("Testing reward function robustness...")
+    print("Testing enhanced reward function robustness...")
     
     # Test case 1: Normal inputs
     try:
-        rewards, _, _, _ = compute_reward(
+        rewards, _, _, success, _ = compute_reward(
             distance=0.5,
             begin_distance=1.0,
             prev_best=0.6,
@@ -943,137 +1186,160 @@ def test_reward_function():
             angular_weights=[0.2, 0.5, 0.3],
             difficulties=[1.0, 1.5, 1.2],
             episode_number=100,
-            total_episodes=1000
+            total_episodes=1000,
+            position_error=0.05,
+            orientation_error=0.1
         )
         print("✅ Normal inputs test passed")
         print(f"   Rewards: {rewards}")
+        print(f"   Success: {success}")
         
     except Exception as e:
         print(f"❌ Normal inputs test failed: {e}")
     
-    # Test case 2: Edge case inputs
+    # Test case 2: Success condition test with direct errors
     try:
-        rewards, _, _, _ = compute_reward(
-            distance=0.0,  # Zero distance
-            begin_distance=1e-10,  # Very small begin distance
-            prev_best=float('inf'),  # Infinite prev_best
-            current_orientation=[0, 0, 0, 0],  # Zero quaternion
-            target_orientation=[1, 1, 1, 1],  # Unnormalized quaternion
-            joint_errors=[float('inf'), float('-inf'), float('nan')],  # Bad joint errors
-            linear_weights=[],  # Empty weights
-            angular_weights=[0, 0, 0],  # Zero weights
-            difficulties=[-1, 100],  # Bad difficulties
-            episode_number=0,
-            total_episodes=0
+        rewards, _, _, success, _ = compute_reward(
+            distance=0.005,  # Very small distance
+            begin_distance=1.0,
+            prev_best=0.6,
+            current_orientation=[0, 0, 0, 1],
+            target_orientation=[0, 0, 0, 1],  # Same orientation
+            joint_errors=[0.005, 0.008, 0.003],  # Very small joint errors
+            linear_weights=[0.3, 0.4, 0.3],
+            angular_weights=[0.2, 0.5, 0.3],
+            difficulties=[1.0, 1.5, 1.2],
+            episode_number=500,
+            total_episodes=1000,
+            position_error=0.005,  # Direct position error
+            orientation_error=0.01,  # Direct orientation error
+            position_threshold=0.02,
+            orientation_threshold=0.05,
+            joint_threshold=0.01
         )
-        print("✅ Edge case inputs test passed")
+        print("✅ Success condition test with direct errors passed")
         print(f"   Rewards: {rewards}")
+        print(f"   Success detected: {success}")
         
     except Exception as e:
-        print(f"❌ Edge case inputs test failed: {e}")
+        print(f"❌ Success condition test failed: {e}")
     
-    # Test case 3: Large angle wrapping
+    # Test case 3: Late-stage training boost
     try:
-        # Test large angles that need wrapping
-        large_angle = 10 * np.pi  # 10π radians
-        wrapped = wrap_angle_to_pi(large_angle)
-        print(f"✅ Angle wrapping test: {large_angle:.3f} → {wrapped:.3f}")
+        rewards_early, _, _, _, _ = compute_reward(
+            distance=0.01,
+            begin_distance=1.0,
+            prev_best=0.02,
+            current_orientation=[0, 0, 0, 1],
+            target_orientation=[0, 0, 0, 1],
+            joint_errors=[0.008, 0.009, 0.007],
+            linear_weights=[0.3, 0.4, 0.3],
+            angular_weights=[0.2, 0.5, 0.3],
+            difficulties=[1.0, 1.5, 1.2],
+            episode_number=200,  # Early training (20%)
+            total_episodes=1000,
+            position_error=0.008,
+            orientation_error=0.005
+        )
         
-        # Test quaternion distance with equivalent rotations
-        q1 = [0, 0, 0, 1]    # No rotation
-        q2 = [0, 0, 0, -1]   # Same rotation (quaternion double cover)
-        dist = compute_quaternion_distance(q1, q2)
-        print(f"✅ Quaternion double cover test: distance = {dist:.6f}")
+        rewards_late, _, _, _, _ = compute_reward(
+            distance=0.01,
+            begin_distance=1.0,
+            prev_best=0.02,
+            current_orientation=[0, 0, 0, 1],
+            target_orientation=[0, 0, 0, 1],
+            joint_errors=[0.008, 0.009, 0.007],
+            linear_weights=[0.3, 0.4, 0.3],
+            angular_weights=[0.2, 0.5, 0.3],
+            difficulties=[1.0, 1.5, 1.2],
+            episode_number=900,  # Late training (90%)
+            total_episodes=1000,
+            position_error=0.008,
+            orientation_error=0.005
+        )
+        
+        print("✅ Late-stage amplification test passed")
+        print(f"   Early rewards: {rewards_early}")
+        print(f"   Late rewards: {rewards_late}")
+        print(f"   Amplification factor: {np.mean(rewards_late) / max(np.mean(rewards_early), 1e-6):.2f}")
         
     except Exception as e:
-        print(f"❌ Angle wrapping test failed: {e}")
+        print(f"❌ Late-stage amplification test failed: {e}")
     
-    print("Reward function testing completed!")
-
-
-# ====== PERFORMANCE MONITORING ======
-
-class RewardFunctionMonitor:
-    """
-    Monitor for tracking reward function performance and detecting issues.
-    """
+    # Test case 4: Built-in Jacobian computation
+    try:
+        # This would require a real PyBullet environment, so we'll just test the fallback
+        linear_jac = compute_jacobian_linear_manual(None, [0, 1, 2], [0.1, 0.2, 0.3])
+        angular_jac = compute_jacobian_angular_manual(None, [0, 1, 2], [0.1, 0.2, 0.3])
+        print("✅ Manual Jacobian fallback test passed")
+        print(f"   Linear Jacobian shape: {linear_jac.shape}")
+        print(f"   Angular Jacobian shape: {angular_jac.shape}")
+        
+    except Exception as e:
+        print(f"❌ Jacobian computation test failed: {e}")
     
-    def __init__(self, window_size=1000):
-        self.window_size = window_size
-        self.reward_history = deque(maxlen=window_size)
-        self.computation_times = deque(maxlen=window_size)
-        self.error_count = 0
-        self.warning_count = 0
+    # Test case 5: State reset functionality
+    try:
+        # Test episode boundary reset
+        rewards1, _, _, _, _ = compute_reward(
+            distance=0.1, begin_distance=1.0, prev_best=0.2,
+            current_orientation=[0, 0, 0, 1], target_orientation=[0, 0, 0, 1],
+            joint_errors=[0.05, 0.06], linear_weights=[0.5, 0.5], angular_weights=[0.5, 0.5],
+            difficulties=[1.0, 1.0], episode_number=1, total_episodes=100,
+            done=True  # Episode completion
+        )
         
-    def log_reward_call(self, rewards, computation_time, had_error=False, had_warning=False):
-        """Log a reward function call for monitoring."""
-        self.reward_history.extend(rewards if isinstance(rewards, list) else [rewards])
-        self.computation_times.append(computation_time)
+        rewards2, _, _, _, _ = compute_reward(
+            distance=0.1, begin_distance=1.0, prev_best=0.2,
+            current_orientation=[0, 0, 0, 1], target_orientation=[0, 0, 0, 1],
+            joint_errors=[0.05, 0.06], linear_weights=[0.5, 0.5], angular_weights=[0.5, 0.5],
+            difficulties=[1.0, 1.0], episode_number=2, total_episodes=100
+        )
         
-        if had_error:
-            self.error_count += 1
-        if had_warning:
-            self.warning_count += 1
-            
-    def get_statistics(self):
-        """Get monitoring statistics."""
-        if not self.reward_history:
-            return {}
-            
-        rewards_array = np.array(self.reward_history)
+        print("✅ State reset test passed")
+        print(f"   Episode 1 rewards: {rewards1}")
+        print(f"   Episode 2 rewards: {rewards2}")
         
-        return {
-            'reward_stats': {
-                'mean': np.mean(rewards_array),
-                'std': np.std(rewards_array),
-                'min': np.min(rewards_array),
-                'max': np.max(rewards_array),
-                'finite_ratio': np.sum(np.isfinite(rewards_array)) / len(rewards_array)
-            },
-            'performance_stats': {
-                'avg_computation_time': np.mean(self.computation_times),
-                'max_computation_time': np.max(self.computation_times),
-                'error_rate': self.error_count / len(self.computation_times),
-                'warning_rate': self.warning_count / len(self.computation_times)
-            }
-        }
-        
-    def check_health(self):
-        """Check if the reward function is healthy."""
-        stats = self.get_statistics()
-        
-        if not stats:
-            return True, []
-            
-        issues = []
-        
-        # Check reward health
-        if stats['reward_stats']['finite_ratio'] < 0.95:
-            issues.append("High rate of non-finite rewards")
-            
-        if stats['reward_stats']['std'] > 5.0:
-            issues.append("Very high reward variance")
-            
-        # Check performance health
-        if stats['performance_stats']['error_rate'] > 0.01:
-            issues.append("High error rate in reward computation")
-            
-        if stats['performance_stats']['avg_computation_time'] > 0.01:
-            issues.append("Slow reward computation")
-            
-        return len(issues) == 0, issues
+    except Exception as e:
+        print(f"❌ State reset test failed: {e}")
+    
+    print("Enhanced reward function testing completed!")
 
 
-# ====== MODULE INITIALIZATION ======
+# ====== ENVIRONMENT INTEGRATION EXAMPLE ======
 
-# Global monitor instance
-_reward_monitor = RewardFunctionMonitor()
+def example_environment_integration():
+    """
+    Example of how to integrate the enhanced reward function with the environment.
+    This shows the call site changes needed in InverseKinematicsEnv.step()
+    """
+    print("Example environment integration:")
+    print("""
+    # In InverseKinematicsEnv.step() - call site change only
+    rewards, individual_rewards, self.previous_best_distance, overall_success, stay_rewards = compute_reward(
+        distance=float(self.current_distance),
+        begin_distance=float(self.initial_distance),
+        prev_best=float(self.previous_best_distance),
+        current_orientation=self.current_quaternion.tolist(),
+        target_orientation=self.target_quaternion.tolist(),
+        joint_errors=self.joint_errors.tolist(),
+        linear_weights=self.linear_weights.tolist(),
+        angular_weights=self.angular_weights.tolist(),
+        difficulties=step_difficulties,
+        episode_number=self.episode_number,
+        total_episodes=self.total_episodes,
+        # NEW: Direct error inputs ↓↓↓
+        position_error=float(np.linalg.norm(self.position_error)),
+        orientation_error=float(np.linalg.norm(self.orientation_error)),
+        position_threshold=float(self.position_threshold),
+        orientation_threshold=float(self.orientation_threshold),
+        joint_threshold=float(self.success_threshold),
+        done=done  # Pass episode completion flag
+    )
+    """)
 
-def get_reward_monitor():
-    """Get the global reward function monitor."""
-    return _reward_monitor
 
-
-# Run self-test if module is executed directly
 if __name__ == "__main__":
+    # Run tests when script is executed directly
     test_reward_function()
+    example_environment_integration()

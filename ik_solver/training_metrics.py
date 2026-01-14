@@ -30,13 +30,16 @@ class TrainingMetrics:
         self.episode_metrics = {
             'joint_errors': [],
             'rewards': [],
+            'reward_threshold_normalized': [],
+            'reward_difficulty_normalized': [],
             'success_rates': [],
             'entropy': [],
             'actor_loss': [],
             'critic_loss': [],
             'advantages': [],
             'policy_loss': [],
-            'overall_actor_loss': []
+            'overall_actor_loss': [],
+            'stay_bonus': []
         }
         
 
@@ -88,10 +91,12 @@ class TrainingMetrics:
                     critic_loss: float, 
                     policy_loss: List[float],
                     advantages: np.ndarray, 
-                    actor_loss_per_actor: List[float],
-                    env: Any, 
-                    success_threshold: float,
-                    curriculum_difficulty: List[float] = None) -> None:
+                    actor_loss_per_actor: List[float] = None,
+                    env: Any = None, 
+                    success_threshold: float = 0.0,
+                    curriculum_difficulty: List[float] = None,
+                    episode_steps: int = None,
+                    stay_bonus_per_agent: List[float] = None) -> None:
         try:
             # Convert inputs to numpy arrays for consistency
             joint_errors = np.array(joint_errors)
@@ -111,6 +116,33 @@ class TrainingMetrics:
             # Calculate per-agent total rewards
             total_rewards_per_agent = np.sum(rewards, axis=0)
             normalized_rewards = self.clip_rewards(total_rewards_per_agent)
+            baseline_success_threshold = float(getattr(env, 'max_success_threshold', success_threshold)) if env is not None else float(success_threshold)
+            baseline_success_threshold = max(baseline_success_threshold, 1e-6)
+            current_success_threshold = max(float(success_threshold), 1e-6)
+            threshold_scaler = baseline_success_threshold / current_success_threshold
+
+            difficulty_scale = 1.0
+            if curriculum_difficulty is not None and len(curriculum_difficulty) > 0:
+                difficulty_scale = float(np.mean(curriculum_difficulty))
+            difficulty_scale = max(difficulty_scale, 1e-6)
+
+            threshold_normalized_rewards = (total_rewards_per_agent * threshold_scaler)
+            difficulty_normalized_rewards = (total_rewards_per_agent / difficulty_scale)
+
+            if actor_loss_per_actor is None:
+                actor_loss_per_actor = [float(actor_loss)] * self.num_joints
+            actor_loss_per_actor = list(actor_loss_per_actor)
+
+            if stay_bonus_per_agent is None:
+                stay_bonus_per_agent = [0.0] * self.num_joints
+            stay_bonus_per_agent = list(stay_bonus_per_agent)
+
+            if episode_steps is None:
+                episode_steps = int(joint_errors.shape[0])
+
+            entropy = float(entropy)
+            if entropy < 0.0:
+                entropy = abs(entropy)
 
             # Construct episode data
             episode_data = {
@@ -123,20 +155,29 @@ class TrainingMetrics:
                 'rewards': {
                     'total': total_rewards_per_agent.tolist(),
                     'normalized': normalized_rewards.tolist(),
+                    'threshold_normalized_total': threshold_normalized_rewards.tolist(),
+                    'difficulty_normalized_total': difficulty_normalized_rewards.tolist(),
                     'mean': float(np.mean(rewards)),
                     'std': float(np.std(rewards)),
                     'std_per_agent': np.std(rewards, axis=0).tolist()
                 },
+                'reward_scalers': {
+                    'threshold_scaler': float(threshold_scaler),
+                    'difficulty_scale': float(difficulty_scale),
+                    'combined_scaler': float(threshold_scaler / difficulty_scale)
+                },
                 'success': success.tolist(),
                 'success_rate': float(np.mean(success)),
-                'entropy': float(entropy),
+                'entropy': entropy,
                 'overall_actor_loss': float(actor_loss),
                 'critic_loss': float(critic_loss),
                 'policy_loss': policy_loss,
                 'advantages': advantages.tolist(),
-                'episode_length': int(joint_errors.shape[0]),
+                'episode_length': int(max(episode_steps, 1)),
                 'success_threshold': float(success_threshold),
-                'actor_loss_per_actor': actor_loss_per_actor
+                'actor_loss_per_actor': actor_loss_per_actor,
+                'stay_bonus_per_agent': stay_bonus_per_agent,
+                'stay_bonus_mean': float(np.mean(stay_bonus_per_agent))
             }
 
             # Add curriculum difficulty
@@ -158,7 +199,8 @@ class TrainingMetrics:
 
             # Update other tracked variables
             self.episode_rewards.append(np.sum(total_rewards_per_agent))
-            self.successes.append(np.any(success))
+            # Treat an episode as successful only if every joint meets the threshold.
+            self.successes.append(bool(np.all(success)))
             self.policy_losses.append(np.mean(policy_loss))
             self.actor_losses.append(actor_loss)
             self.critic_losses.append(critic_loss)
@@ -191,7 +233,9 @@ class TrainingMetrics:
                 f"Episode {self.training_episodes} logged successfully. "
                 f"Mean reward: {episode_data['rewards']['mean']:.4f}, "
                 f"Success rate: {episode_data['success_rate']:.4f}, "
-                f"Success threshold: {success_threshold:.4f}"
+                f"Success threshold: {success_threshold:.4f}, "
+                f"Steps: {episode_data['episode_length']}, "
+                f"Stay bonus (mean): {episode_data['stay_bonus_mean']:.4f}"
             )
 
         except Exception as e:
@@ -203,6 +247,12 @@ class TrainingMetrics:
         """Update running metrics with new episode data."""
         self.episode_metrics['joint_errors'].append(episode_data['joint_errors']['mean'])
         self.episode_metrics['rewards'].append(episode_data['rewards']['total'])
+        self.episode_metrics['reward_threshold_normalized'].append(
+            episode_data['rewards']['threshold_normalized_total']
+        )
+        self.episode_metrics['reward_difficulty_normalized'].append(
+            episode_data['rewards']['difficulty_normalized_total']
+        )
         self.episode_metrics['success_rates'].append(episode_data['success_rate'])
         self.episode_metrics['entropy'].append(episode_data['entropy'])
         # Append per-actor losses (list of floats, one per agent)
@@ -212,6 +262,7 @@ class TrainingMetrics:
         self.episode_metrics['critic_loss'].append(episode_data['critic_loss'])
         self.episode_metrics['policy_loss'].append(episode_data['policy_loss'])
         self.episode_metrics['advantages'].append(episode_data['advantages'])
+        self.episode_metrics['stay_bonus'].append(episode_data['stay_bonus_per_agent'])
 
 
     def calculate_metrics(self, env: Any) -> Dict:
@@ -236,12 +287,36 @@ class TrainingMetrics:
             total_rewards_per_agent = np.array([log['rewards']['total'] for log in self.logs])
             if total_rewards_per_agent.ndim == 1:
                 total_rewards_per_agent = total_rewards_per_agent.reshape(-1, 1)
+
+            threshold_normalized_rewards = np.array([
+                log['rewards'].get('threshold_normalized_total', log['rewards']['total'])
+                for log in self.logs
+            ])
+            if threshold_normalized_rewards.ndim == 1:
+                threshold_normalized_rewards = threshold_normalized_rewards.reshape(-1, 1)
+
+            difficulty_normalized_rewards = np.array([
+                log['rewards'].get('difficulty_normalized_total', log['rewards']['total'])
+                for log in self.logs
+            ])
+            if difficulty_normalized_rewards.ndim == 1:
+                difficulty_normalized_rewards = difficulty_normalized_rewards.reshape(-1, 1)
                     
             # Per-agent cumulative rewards
             cumulative_rewards_per_agent = np.zeros((num_agents, num_episodes))
+            cumulative_threshold_normalized = np.zeros((num_agents, num_episodes))
+            cumulative_difficulty_normalized = np.zeros((num_agents, num_episodes))
             mean_episode_rewards_per_agent = total_rewards_per_agent.T
+            mean_threshold_normalized_per_agent = threshold_normalized_rewards.T
+            mean_difficulty_normalized_per_agent = difficulty_normalized_rewards.T
             for agent_idx in range(num_agents):
                 cumulative_rewards_per_agent[agent_idx] = np.cumsum(total_rewards_per_agent[:, agent_idx])
+                cumulative_threshold_normalized[agent_idx] = np.cumsum(
+                    threshold_normalized_rewards[:, agent_idx]
+                )
+                cumulative_difficulty_normalized[agent_idx] = np.cumsum(
+                    difficulty_normalized_rewards[:, agent_idx]
+                )
 
             # Extract success data
             agent_success = np.array([log['success'] for log in self.logs])
@@ -296,6 +371,21 @@ class TrainingMetrics:
             joint_errors_std = np.array([log['joint_errors']['std'] for log in self.logs])
 
             # Compile all metrics into a structured dictionary
+            reward_scalers = {
+                'threshold': np.array([
+                    log.get('reward_scalers', {}).get('threshold_scaler', 1.0)
+                    for log in self.logs
+                ]),
+                'difficulty': np.array([
+                    log.get('reward_scalers', {}).get('difficulty_scale', 1.0)
+                    for log in self.logs
+                ]),
+                'combined': np.array([
+                    log.get('reward_scalers', {}).get('combined_scaler', 1.0)
+                    for log in self.logs
+                ])
+            }
+
             metrics = {
                 'joint_errors': {
                     'mean': joint_errors_mean,
@@ -306,14 +396,23 @@ class TrainingMetrics:
                 'rewards': {
                     'mean': np.array([log['rewards']['mean'] for log in self.logs]),
                     'total': total_rewards_per_agent,
+                    'threshold_normalized_total': threshold_normalized_rewards,
+                    'difficulty_normalized_total': difficulty_normalized_rewards,
                     'cumulative': np.array(self.cumulative_rewards),
+                    'cumulative_threshold_normalized': cumulative_threshold_normalized,
+                    'cumulative_difficulty_normalized': cumulative_difficulty_normalized,
                     'per_agent_cumulative': cumulative_rewards_per_agent,
                     'per_agent_mean': mean_episode_rewards_per_agent,
+                    'per_agent_threshold_normalized_mean': mean_threshold_normalized_per_agent,
+                    'per_agent_difficulty_normalized_mean': mean_difficulty_normalized_per_agent,
                     'final_cumulative': cumulative_rewards_per_agent[:, -1],
                     'average_per_episode': np.mean(total_rewards_per_agent, axis=1),
+                    'average_threshold_normalized': np.mean(threshold_normalized_rewards, axis=1),
+                    'average_difficulty_normalized': np.mean(difficulty_normalized_rewards, axis=1),
                     'std_per_episode': np.array([log['rewards']['std'] for log in self.logs]),
                     'std_per_agent_per_episode': np.array([log['rewards']['std_per_agent'] for log in self.logs])
                 },
+                'reward_scalers': reward_scalers,
                 'success_rate': {
                     'per_episode': np.array([log['success_rate'] for log in self.logs]),
                     'cumulative': np.cumsum([log['success_rate'] for log in self.logs]) / np.arange(1, num_episodes + 1),
@@ -1821,5 +1920,3 @@ class TrainingMetrics:
         except Exception as e:
             self.logger.error(f"Error plotting difficulty per agent: {str(e)}")
             raise
-
-

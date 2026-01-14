@@ -39,7 +39,7 @@
 | Done | Priority | Item | File / Function |
 |------|----------|------|-----------------|
 | [ ] | 🔧 | Sample 20 % targets on workspace boundary, 10 % near singularities | `sample_valid_target_position` |
-| [ ] | 🔧 | Success threshold **per joint**: `σ_i = 0.1 rad · e^{-3·difficulty_i}` | `is_agent_success` |
+| [**X** ] | 🔧 | Success threshold **per joint**: `σ_i = 0.1 rad · e^{-3·difficulty_i}` | `is_agent_success` |
 | [ ] | 🔧 | Parallelise roll-outs with **SubprocVecEnv / Ray** | `envs/vec_env.py`, training launcher |
 | [ ] | 🔧 | Add **domain randomisation** (mass ± 10 %, friction, sensor noise) | `InverseKinematicsEnv.reset` |
 | [ ] | 🛠 | Swap `POSITION_CONTROL` for **TORQUE_CONTROL + inner PD @ 1 kHz** | `InverseKinematicsEnv.step` |
