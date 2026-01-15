@@ -81,7 +81,7 @@ class MAPPOAgentTester:
 
         for episode in range(num_episodes):
             self.logger.info(f"Episode {episode + 1}/{num_episodes} starting...")
-            state = self.env.reset()
+            state, _ = self.env.reset()  # Gymnasium API returns (obs, info)
             done = False
             total_reward = 0
             steps = 0
@@ -110,7 +110,8 @@ class MAPPOAgentTester:
                     policy_info = None
                 if not isinstance(actions, (list, tuple, np.ndarray)):
                     actions = [actions]
-                next_state, rewards, done, info = self.env.step(actions)
+                next_state, rewards, terminated, truncated, info = self.env.step(actions)  # Gymnasium API
+                done = terminated or truncated
 
                 total_reward += sum(rewards)
                 current_position, current_orientation = self.env.get_end_effector_pose()

@@ -113,7 +113,7 @@ class AgentTester:
         }
 
         for episode in range(num_episodes):
-            state = self.env.reset()
+            state, _ = self.env.reset()  # Gymnasium API returns (obs, info)
             done = False
             steps = 0
             joint_errors = defaultdict(list)
@@ -121,7 +121,8 @@ class AgentTester:
 
             while not done and steps < self.env.max_episode_steps:
                 actions, _ = self.agent.get_actions(state, eval_mode=True)
-                next_state, _, done, info = self.env.step(actions)
+                next_state, _, terminated, truncated, info = self.env.step(actions)  # Gymnasium API
+                done = terminated or truncated
                 state = next_state
 
                 # Record joint errors
@@ -157,13 +158,14 @@ class AgentTester:
         results = {"success_rates": {f"threshold_{t}": [] for t in thresholds}}
 
         for episode in range(num_episodes):
-            state = self.env.reset()
+            state, _ = self.env.reset()  # Gymnasium API returns (obs, info)
             done = False
             convergence_counter = 0
 
             while not done:
                 actions, _ = self.agent.get_actions(state, eval_mode=True)
-                next_state, _, done, info = self.env.step(actions)
+                next_state, _, terminated, truncated, info = self.env.step(actions)  # Gymnasium API
+                done = terminated or truncated
                 state = next_state
 
                 convergence_counter = self._update_convergence_counter(info, convergence_counter)
@@ -192,7 +194,7 @@ class AgentTester:
 
         for config_name, config in configs.items():
             for episode in range(num_episodes):
-                self.env.reset()
+                _, _ = self.env.reset()  # Gymnasium API returns (obs, info)
                 if config["angles"] is not None:
                     for i, angle in enumerate(config["angles"]):
                         p.resetJointState(self.env.robot_id, self.env.joint_indices[i], angle)
@@ -201,7 +203,8 @@ class AgentTester:
                 convergence_counter = 0
                 while not done:
                     actions, _ = self.agent.get_actions(self.env.get_observation(), eval_mode=True)
-                    _, _, done, info = self.env.step(actions)
+                    _, _, terminated, truncated, info = self.env.step(actions)  # Gymnasium API
+                    done = terminated or truncated
 
                     convergence_counter = self._update_convergence_counter(info, convergence_counter)
                     if convergence_counter >= self.convergence_patience:
@@ -226,13 +229,14 @@ class AgentTester:
 
         for episode in range(num_episodes):
             start_time = time.time()
-            self.env.reset()
+            _, _ = self.env.reset()  # Gymnasium API returns (obs, info)
             done = False
             convergence_counter = 0
 
             while not done:
                 actions, _ = self.agent.get_actions(self.env.get_observation(), eval_mode=True)
-                _, _, done, info = self.env.step(actions)
+                _, _, terminated, truncated, info = self.env.step(actions)  # Gymnasium API
+                done = terminated or truncated
 
                 convergence_counter = self._update_convergence_counter(info, convergence_counter)
                 if convergence_counter >= self.convergence_patience:

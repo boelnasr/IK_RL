@@ -129,7 +129,7 @@ class MAPPOAgent:
 
 
         # Process a sample state to determine state_dim
-        sample_state = self.env.reset()
+        sample_state, _ = self.env.reset()  # Gymnasium API returns (obs, info)
         processed_state_list = self._process_state(sample_state)
         global_state = torch.cat(processed_state_list).unsqueeze(0).to(self.device)
         state_dim = global_state.shape[1]
@@ -647,7 +647,7 @@ class MAPPOAgent:
             self.her_buffer.update_beta(current_beta)
 
             difficulty = curriculum_manager.get_current_difficulty()
-            state = self.env.reset(difficulty=difficulty)
+            state, _ = self.env.reset(difficulty=difficulty)  # Gymnasium API
             done = False
             step = 0
             
@@ -689,9 +689,10 @@ class MAPPOAgent:
                 processed_state_list = self._process_state(state)
                 global_state = torch.cat(processed_state_list).unsqueeze(0).to(self.device)
 
-                # Get actions and execute
+                # Get actions and execute (Gymnasium API)
                 actions, log_probs = self.get_actions(state, eval_mode=False)
-                next_state, rewards, done, info = self.env.step(actions)
+                next_state, rewards, terminated, truncated, info = self.env.step(actions)
+                done = terminated or truncated
 
                 # Directly scale rewards (remove stabilization)
                 scaled_rewards = [self.reward_scaler.update_scale(r) * r for r in rewards]
@@ -1001,13 +1002,14 @@ class MAPPOAgent:
         Test the trained agent in the environment.
         """
         for episode in range(num_episodes):
-            state = env.reset()
+            state, _ = env.reset()  # Gymnasium API
             done = False
             episode_reward = 0
             step_count = 0
             while not done and step_count < max_steps:
                 actions, _ = self.get_actions(state)
-                next_state, rewards, done, _ = env.step(actions)
+                next_state, rewards, terminated, truncated, _ = env.step(actions)  # Gymnasium API
+                done = terminated or truncated
                 episode_reward += sum(rewards)  # Sum rewards across agents
                 state = next_state
                 step_count += 1

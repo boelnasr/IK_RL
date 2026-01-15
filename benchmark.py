@@ -133,7 +133,7 @@ def run_benchmark(num_episodes=5, max_steps=100):
     for ep in range(num_episodes):
         ep_start = time.time()
 
-        state = env.reset()
+        state, _ = env.reset()  # Gymnasium API returns (obs, info)
         done = False
         step_count = 0
         ep_step_times = []
@@ -142,7 +142,8 @@ def run_benchmark(num_episodes=5, max_steps=100):
             step_start = time.time()
 
             actions, log_probs = agent.get_actions(state)
-            next_state, rewards, done, info = env.step(actions)
+            next_state, rewards, terminated, truncated, info = env.step(actions)  # Gymnasium API
+            done = terminated or truncated
             state = next_state
             step_count += 1
 

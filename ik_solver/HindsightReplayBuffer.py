@@ -518,12 +518,13 @@ class ValidationManager:
         
         for _ in range(self.validation_episodes):
             episode_reward = 0
-            state = env.reset()
+            state, _ = env.reset()  # Gymnasium API returns (obs, info)
             done = False
-            
+
             while not done:
                 action, _ = agent.get_actions(state)
-                next_state, reward, done, info = env.step(action)
+                next_state, reward, terminated, truncated, info = env.step(action)  # Gymnasium API
+                done = terminated or truncated
                 episode_reward += sum(reward)
                 state = next_state
             

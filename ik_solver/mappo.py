@@ -141,7 +141,7 @@ class MAPPOAgent:
         )
 
         # Process a sample state to determine state_dim
-        sample_state = self.env.reset()
+        sample_state, _ = self.env.reset()  # Gymnasium API returns (obs, info)
         processed_state_list = self._process_state(sample_state)
         global_state = torch.cat(processed_state_list).unsqueeze(0).to(self.device)
         state_dim = global_state.shape[1]
@@ -1053,7 +1053,7 @@ class MAPPOAgent:
             ]
             
             # Reset environment with current difficulties
-            state = self.env.reset(difficulties=current_difficulties)
+            state, _ = self.env.reset(difficulties=current_difficulties)  # Gymnasium API
             done = False
             step = 0
             
@@ -1104,8 +1104,9 @@ class MAPPOAgent:
                 global_state = torch.cat(processed_state_list).unsqueeze(0).to(self.device)
                 actions, log_probs, pd_corrections = self.get_actions(state, eval_mode=False)
                 
-                # Execute action in environment
-                next_state, rewards, done, info = self.env.step(actions)
+                # Execute action in environment (Gymnasium API)
+                next_state, rewards, terminated, truncated, info = self.env.step(actions)
+                done = terminated or truncated
                 rewards_array = np.asarray(rewards, dtype=np.float32)
                 scaled_rewards = (rewards_array * self.reward_scale).astype(np.float32)
                 scaled_rewards_list = scaled_rewards.tolist()

@@ -76,7 +76,7 @@ def test_best_agents(
     # Test the agent over multiple episodes
     for episode in range(num_episodes):
         logging.info(f"Starting test episode {episode+1}/{num_episodes}")
-        state = env.reset()
+        state, _ = env.reset()  # Gymnasium API returns (obs, info)
         done = False
         step = 0
         episode_rewards = []
@@ -88,7 +88,8 @@ def test_best_agents(
 
         while not done and step < max_steps:
             actions, _, _ = agent.get_actions(state, eval_mode=True)
-            next_state, rewards, done, info = env.step(actions)
+            next_state, rewards, terminated, truncated, info = env.step(actions)  # Gymnasium API
+            done = terminated or truncated
 
             # Collect joint errors and rewards
             if hasattr(env, "joint_errors"):

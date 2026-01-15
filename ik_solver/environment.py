@@ -1,4 +1,4 @@
-import gym
+import gymnasium as gym
 import pybullet as p
 import pybullet_data
 from typing import Dict, List, Tuple    
@@ -470,7 +470,13 @@ class InverseKinematicsEnv(gym.Env):
             self.current_orientation, self.target_orientation
         )
 
-        return self.get_all_agent_observations()
+        # Gymnasium API: reset() returns (observation, info)
+        info = {
+            'initial_distance': float(self.initial_distance),
+            'target_position': self.target_position.tolist(),
+            'target_orientation': self.target_orientation.tolist(),
+        }
+        return self.get_all_agent_observations(), info
 
 
     def step(self, actions):
@@ -627,7 +633,11 @@ class InverseKinematicsEnv(gym.Env):
 
             # Calculate success metrics
             success_rate = sum(agent_successes) / self.num_joints
-            done = self.current_step >= self.max_episode_steps or grace_done
+
+            # Gymnasium API: separate terminated (task done) from truncated (time limit)
+            terminated = grace_done  # Episode ended due to achieving success
+            truncated = self.current_step >= self.max_episode_steps  # Episode ended due to time limit
+            done = terminated or truncated  # For backward compatibility in logging
 
             # Debug early termination
             if done and self.current_step < 10:
@@ -684,7 +694,8 @@ class InverseKinematicsEnv(gym.Env):
 
             # Store current angles for next step
             self.previous_joint_angles = np.copy(self.joint_angles)
-            return self.get_all_agent_observations(), rewards.tolist(), done, info
+            # Gymnasium API: return (obs, reward, terminated, truncated, info)
+            return self.get_all_agent_observations(), rewards.tolist(), terminated, truncated, info
 
         except Exception as e:
             import traceback
@@ -694,10 +705,12 @@ class InverseKinematicsEnv(gym.Env):
                 f"Episode will terminate at step {self.current_step}. "
                 f"Target: {self.target_position}, Current: {self.current_position}"
             )
+            # Gymnasium API: return (obs, reward, terminated, truncated, info)
             return (
                 self.get_all_agent_observations(),
                 [-0.1] * len(self.joint_indices),  # Smaller penalty for stability
-                True,  # Terminate episode on critical errors
+                True,  # terminated: episode ended due to error
+                False,  # truncated: not truncated, terminated due to error
                 {
                     'error': str(e),
                     'agent_difficulties': [0.0] * self.num_joints,

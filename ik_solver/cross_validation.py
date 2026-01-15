@@ -48,19 +48,20 @@ class CrossValidator:
         }
         
         for episode in range(num_validation_episodes):
-            state = validation_env.reset()
+            state, _ = validation_env.reset()  # Gymnasium API returns (obs, info)
             done = False
             episode_reward = 0
             episode_steps = 0
             episode_errors = []
-            
+
             while not done and episode_steps < self.config.get('max_steps_per_episode', 1000):
                 # Get actions without exploration noise
                 with torch.no_grad():
                     actions, _ = agent.get_actions(state)
-                
-                next_state, rewards, done, info = validation_env.step(actions)
-                
+
+                next_state, rewards, terminated, truncated, info = validation_env.step(actions)  # Gymnasium API
+                done = terminated or truncated
+
                 episode_reward += sum(rewards)
                 episode_steps += 1
                 if 'joint_errors' in info:
