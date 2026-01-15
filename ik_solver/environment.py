@@ -427,6 +427,11 @@ class InverseKinematicsEnv(gym.Env):
         self._jacobian_cache['linear'] = None
         self._jacobian_cache['angular'] = None
 
+        # Initialize prev_achieved_goal for HER (same as current at reset)
+        self._prev_achieved_goal = np.concatenate(
+            [self.current_position.copy(), self.current_orientation.copy()]
+        )
+
         # Calculate initial errors
         self.position_error = self.current_position - self.target_position
         self.orientation_error = self.compute_orientation_difference(
@@ -473,6 +478,11 @@ class InverseKinematicsEnv(gym.Env):
                 joint_movements = np.abs(self.joint_angles - self.previous_joint_angles)
             else:
                 joint_movements = np.zeros_like(self.joint_errors)
+
+            # Store previous achieved goal for HER (before updating current pose)
+            self._prev_achieved_goal = np.concatenate(
+                [self.current_position.copy(), self.current_orientation.copy()]
+            ) if hasattr(self, 'current_position') else None
 
             # Update end effector state and compute task space errors
             self.current_position, self.current_orientation = self.get_end_effector_pose()
@@ -622,6 +632,9 @@ class InverseKinematicsEnv(gym.Env):
                     [self.target_position, self.target_orientation]
                 ).tolist(),
                 'achieved_goal': np.concatenate(
+                    [self.current_position, self.current_orientation]
+                ).tolist(),
+                'prev_achieved_goal': self._prev_achieved_goal.tolist() if self._prev_achieved_goal is not None else np.concatenate(
                     [self.current_position, self.current_orientation]
                 ).tolist(),
             }

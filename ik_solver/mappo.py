@@ -233,19 +233,21 @@ class MAPPOAgent:
         self.best_agents_state_dict = [None] * self.num_agents
         self.best_joint_errors = [float('inf')] * self.num_agents
 
-        # Initialize HER buffer with hindsight replay - DISABLED
-        self.use_her = config.get('use_her', False)
+        # Initialize HER buffer with hindsight replay - ENABLED by default
+        self.use_her = config.get('use_her', True)
+        self.her_beta_start = config.get('beta_start', 0.4)
+        self.her_beta_end = 1.0  # Anneal to 1.0 for unbiased sampling
         if self.use_her:
             self.her_buffer = HindsightReplayBuffer(
                 capacity=config.get('buffer_size', 100000),
                 alpha=config.get('alpha', 0.6),
-                beta_start=config.get('beta_start', 0.4),
+                beta_start=self.her_beta_start,
                 k_future=config.get('k_future', 4)
             )
             # how often to run off‐policy HER updates
             self.her_update_freq = config.get('her_update_freq', 8)
             self.her_batch_size = config.get('her_batch_size', 256)
-            logging.info("HER Buffer initialized")
+            logging.info("HER Buffer initialized with beta annealing enabled")
         else:
             self.her_buffer = None
             self.her_update_freq = None
@@ -1030,6 +1032,13 @@ class MAPPOAgent:
 
         for episode in range(self.num_episodes):
             self.current_episode = episode
+
+            # HER beta annealing: linearly anneal from beta_start to 1.0 over training
+            # This reduces importance sampling bias as training progresses
+            if self.use_her and self.her_buffer is not None:
+                progress = episode / max(self.num_episodes - 1, 1)
+                current_beta = self.her_beta_start + progress * (self.her_beta_end - self.her_beta_start)
+                self.her_buffer.update_beta(current_beta)
 
             # Reset PD controllers and clear their history for new episode - ONLY IF ENABLED
             if self.use_pd_controller and self.pd_controllers is not None:

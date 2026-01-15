@@ -195,12 +195,14 @@ class MAPPOAgent:
         # Best agent tracking
         self.best_agents_state_dict = [None] * self.num_agents
         self.best_joint_errors = [float('inf')] * self.num_agents
-        # Initialize HER buffer with hindsight replay
-        #Initialize the HindsightReplayBuffer with capacity, alpha, beta, and k_future
+
+        # Initialize HER buffer with hindsight replay and beta annealing
+        self.her_beta_start = config.get('beta_start', 0.4)
+        self.her_beta_end = 1.0  # Anneal to 1.0 for unbiased sampling
         self.her_buffer = HindsightReplayBuffer(
             capacity=config.get('buffer_size', 100000),
             alpha=config.get('alpha', 0.6),
-            beta_start=config.get('beta_start', 0.4),
+            beta_start=self.her_beta_start,
             k_future=config.get('k_future', 4)
         )
         self.reward_stabilizer = RewardStabilizer(
@@ -632,6 +634,13 @@ class MAPPOAgent:
 
         for episode in range(self.num_episodes):
             self.current_episode = episode
+
+            # HER beta annealing: linearly anneal from beta_start to 1.0 over training
+            # This reduces importance sampling bias as training progresses
+            progress = episode / max(self.num_episodes - 1, 1)
+            current_beta = self.her_beta_start + progress * (self.her_beta_end - self.her_beta_start)
+            self.her_buffer.update_beta(current_beta)
+
             difficulty = curriculum_manager.get_current_difficulty()
             state = self.env.reset(difficulty=difficulty)
             done = False
@@ -832,11 +841,21 @@ class MAPPOAgent:
             # Update policy and logging remains the same
 
 
-            # Update policy from experience replay
+            # Update policy from HER experience replay with annealed beta
+            # Use current_beta (which was annealed at episode start) for proper importance sampling
             if len(self.her_buffer.buffer) > self.batch_size:
                 experiences, weights, indices = self.her_buffer.sample(
-                    self.batch_size, beta=self.her_buffer.beta_start)
+                    self.batch_size, beta=self.her_buffer.beta)  # Use current annealed beta
                 self.update_policy_with_experiences(experiences, weights, indices)
+
+                # Log HER statistics periodically
+                if episode % 50 == 0:
+                    her_stats = self.her_buffer.get_statistics()
+                    self.logger.info(
+                        f"HER Buffer - Size: {her_stats['buffer_size']}, "
+                        f"Beta: {her_stats['beta']:.3f}, "
+                        f"Success Rate: {her_stats['success_rate']:.3f}"
+                    )
 
             # Validate if needed
             if self.validation_manager.should_validate(episode):
