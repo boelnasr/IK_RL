@@ -20,7 +20,7 @@ config = {
     'epsilon_decay': 0.998,                # IMPROVED: Slower decay for longer exploration
     'min_epsilon': 0.15,                   # IMPROVED: Increased from 0.10 to maintain exploration
     'num_episodes': 500,                   # IMPROVED: Increased from 100 - agents need more time to learn!
-    'max_steps_per_episode':100,           # OPTIMIZED: Reduced from 500 for faster episodes
+    'max_steps_per_episode': 1000,         # Steps per episode for training
     'enable_anomaly_detection': False,     # Enable PyTorch anomaly detection during debugging
     'jacobian_update_tolerance': 1e-3,     # Angle change threshold before recomputing Jacobians
 
