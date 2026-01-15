@@ -11,41 +11,26 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 EPS = 1e-8            # single global epsilon
 
-# Centralise reward-related constants so they can be re-used in reports.
+# SIMPLIFIED reward constants
 REWARD_CONSTANTS = {
-    "MAX_REWARD": 8.0,
-    "MIN_REWARD": -2.0,
-    "POSITION_SCALE": 1.2,
-    "ORIENTATION_SCALE": 1.0,
-    "PERFORMANCE_SCALE": 0.3,
-    "IMPROVEMENT_SCALE": 0.5,
-    "ERROR_PENALTY_SCALE": 0.5,
-    "SUCCESS_BONUS_BASE": 4.0,  # IMPROVED: Increased from 2.5 for stronger success signal
-    "STAY_REWARD_SCALE": 0.6,    # IMPROVED: Increased from 0.4 for better convergence
-    "STAY_THRESHOLD_RATIO": 0.5, # Movement ratio vs joint_threshold for full staying bonus
-    "TEAM_BONUS_SCALE": 5.0,     # IMPROVED: Increased from 3.0 for better cooperation
-    "TEAM_ALIGNMENT_MIN": 0.5,   # Require reasonable pose alignment before granting team bonuses
-    "POSITION_FAILURE_PENALTY": 2.0,
-    "ORIENTATION_FAILURE_PENALTY": 3.0,
-    "POSE_PENALTY_CAP": 10.0,
-    "POSITION_RELAX_INIT": 10.0, # Start with looser shaping threshold (multiplier)
-    "ORIENTATION_RELAX_INIT": 5.0,
-    "RELAX_DECAY": 0.9,
-    "RELAX_TARGET_SUCCESS": 0.17,
-    "RELAX_MIN_FACTOR": 1.2,
-    "RELAX_WINDOW": 60,
-    "RELAX_EVAL_MIN_COUNT": 30,
+    # Core rewards
+    "IMPROVEMENT_SCALE": 10.0,      # Reward for error reduction
+    "SUCCESS_BONUS": 5.0,           # Bonus when joint is under threshold
+    "TEAM_SUCCESS_BONUS": 10.0,     # Bonus when ALL joints succeed
+
+    # Minimal penalties
+    "STEP_PENALTY": -0.001,         # Small per-step cost to encourage efficiency
+
+    # Bounds
+    "MAX_REWARD": 20.0,
+    "MIN_REWARD": -1.0,             # Minimal negative (no harsh penalties)
 }
 
 REWARD_DEFAULT_ARGUMENTS = {
-    "success_threshold": 0.01,
-    "position_threshold": 0.02,
-    "orientation_threshold": 0.01,  # TIGHTENED: 0.1 → 0.01 rad (5.73° → 0.57°)
-    "joint_threshold": 0.01,         # TIGHTENED: 0.05 → 0.01 rad (2.86° → 0.57°)
-    "ratio_threshold": 0.5,
-    "time_penalty": -0.0001,  # REDUCED: From -0.001 to reduce penalty for longer episodes
-    "smoothing_window": 10,
-    "exploration_bonus": 0.02,
+    "success_threshold": 0.005,     # 5mm default
+    "position_threshold": 0.005,
+    "orientation_threshold": 0.01,
+    "joint_threshold": 0.005,
 }
 
 OVERALL_DISTANCE_WEIGHTS = {
@@ -213,9 +198,11 @@ def compute_overall_distance(current_position, target_position, current_orientat
         return 1.0
 
 # --------------------------------------------------------------------------- #
-#  IMPROVED compute_reward() with better success detection and late-stage boost #
+#  SIMPLIFIED compute_reward() - Clean, minimal, effective
 # --------------------------------------------------------------------------- #
-import time
+# Previous joint errors for computing improvement (stored per-episode)
+_prev_joint_errors = None
+
 def compute_reward(
     distance: float,
     begin_distance: float,
@@ -229,407 +216,94 @@ def compute_reward(
     episode_number: int,
     total_episodes: int,
     *,
-    # NEW: Direct error inputs from environment
     position_error: Optional[float] = None,
     orientation_error: Optional[float] = None,
-    success_threshold: float = 0.01,            # Dynamic success threshold from environment
-    position_threshold: float = 0.02,           # Position error threshold from environment
-    orientation_threshold: float = 0.01,        # TIGHTENED: Orientation error threshold (0.57°)
-    joint_threshold: float = 0.01,              # TIGHTENED: Joint error threshold (0.57°)
-    ratio_threshold: float = 0.5,               # Ratio of joints that need to succeed
+    success_threshold: float = 0.005,
+    position_threshold: float = 0.005,
+    orientation_threshold: float = 0.01,
+    joint_threshold: float = 0.005,
+    ratio_threshold: float = 0.5,
     time_penalty: float = -0.001,
     smoothing_window: int = 10,
     exploration_bonus: float = 0.02,
     joint_movements: Optional[list] = None,
-    done: bool = False                          # Episode completion flag
+    done: bool = False
 ) -> tuple:
     """
-    ENHANCED: Reward function with direct position/orientation errors and late-stage amplification.
-    
-    Args:
-        distance: Current overall distance to target
-        begin_distance: Initial distance at episode start
-        prev_best: Best distance achieved so far
-        current_orientation: Current end-effector orientation quaternion
-        target_orientation: Target orientation quaternion
-        joint_errors: List of individual joint errors
-        linear_weights: Jacobian-based linear movement weights
-        angular_weights: Jacobian-based angular movement weights
-        difficulties: Per-agent difficulty levels
-        episode_number: Current episode number
-        total_episodes: Total episodes planned
-        position_error: Direct position error from environment (NEW)
-        orientation_error: Direct orientation error from environment (NEW)
-        success_threshold: Dynamic success threshold from environment (legacy compatibility)
-        position_threshold: Position error threshold from environment
-        orientation_threshold: Orientation error threshold from environment  
-        joint_threshold: Joint error threshold from environment
-        ratio_threshold: Minimum ratio of successful joints for overall success
-        time_penalty: Per-step penalty
-        smoothing_window: Window size for error smoothing
-        exploration_bonus: Bonus for exploration in early training
-        done: Episode completion flag for state reset
-        
-    Returns:
-        tuple: (final_rewards, joint_rewards, new_best_distance, success)
-    """
+    SIMPLIFIED reward function:
+    1. Improvement reward: Positive reward when error decreases
+    2. Success bonus: Bonus when joint error < threshold
+    3. Team bonus: Extra bonus when ALL joints succeed
+    4. Minimal step penalty: Small cost per step
 
-    # ---- 0. Reset state at episode boundaries (Change 3) ---------------------
-    if episode_number == 1 or done:
-        # Flush state at the start of a new run or episode completion
-        compute_reward._state = []
-        compute_reward._relax_position = REWARD_CONSTANTS.get("POSITION_RELAX_INIT", 5.0)
-        compute_reward._relax_orientation = REWARD_CONSTANTS.get("ORIENTATION_RELAX_INIT", 3.0)
-        compute_reward._success_history = deque(maxlen=int(REWARD_CONSTANTS.get("RELAX_WINDOW", 60)))
+    Returns:
+        tuple: (final_rewards, joint_rewards, new_best_distance, success, stay_rewards)
+    """
+    global _prev_joint_errors
+
+    # Get constants
+    IMPROVEMENT_SCALE = REWARD_CONSTANTS.get("IMPROVEMENT_SCALE", 10.0)
+    SUCCESS_BONUS = REWARD_CONSTANTS.get("SUCCESS_BONUS", 5.0)
+    TEAM_SUCCESS_BONUS = REWARD_CONSTANTS.get("TEAM_SUCCESS_BONUS", 10.0)
+    STEP_PENALTY = REWARD_CONSTANTS.get("STEP_PENALTY", -0.001)
+    MAX_REWARD = REWARD_CONSTANTS.get("MAX_REWARD", 20.0)
+    MIN_REWARD = REWARD_CONSTANTS.get("MIN_REWARD", -1.0)
 
     # ---- 1. Basic validation --------------------------------------------------
-    distance        = max(float(distance), EPS)
-    begin_distance  = max(float(begin_distance), EPS)
-    prev_best       = max(float(prev_best), EPS)
-    episode_number  = max(int(episode_number), 1)
-    total_episodes  = max(int(total_episodes), 1)
-    
-    # Validate and use the three thresholds from environment
-    position_threshold = max(float(position_threshold), 1e-6)
-    orientation_threshold = max(float(orientation_threshold), 1e-6)
-    joint_threshold = max(float(joint_threshold), 1e-6)
-    success_threshold = max(float(success_threshold), 1e-6)  # Legacy compatibility
-
     num_joints = len(joint_errors)
     if num_joints == 0:
-        logging.error("compute_reward: empty joint_errors")
-        return np.zeros(0), [], prev_best, False
+        return np.zeros(0), [], prev_best, False, []
 
-    # signed → magnitude
-    joint_errors     = np.abs(wrap_angle_to_pi(np.asarray(joint_errors, dtype=np.float64)))
-    linear_weights   = np.asarray(linear_weights,  dtype=np.float64)
-    angular_weights  = np.asarray(angular_weights, dtype=np.float64)
-    if joint_movements is None:
-        joint_movements = np.zeros(num_joints, dtype=np.float64)
-    else:
-        joint_movements = np.asarray(joint_movements, dtype=np.float64)
-        if joint_movements.size != num_joints:
-            logging.warning("joint_movements length mismatch; resizing")
-            joint_movements = np.resize(joint_movements, num_joints)
+    # Convert to numpy arrays
+    joint_errors = np.abs(np.asarray(joint_errors, dtype=np.float64))
+    joint_threshold = max(float(joint_threshold), EPS)
 
-    # pad / warn on length mismatch
-    if linear_weights.size  != num_joints:
-        logging.warning("linear_weights length mismatch; padding / truncating")
-        linear_weights = np.resize(linear_weights,  num_joints)
-        linear_weights.fill(1.0 / num_joints)
+    # Initialize previous errors if needed
+    if _prev_joint_errors is None or len(_prev_joint_errors) != num_joints:
+        _prev_joint_errors = joint_errors.copy()
 
-    if angular_weights.size != num_joints:
-        logging.warning("angular_weights length mismatch; padding / truncating")
-        angular_weights = np.resize(angular_weights, num_joints)
-        angular_weights.fill(1.0 / num_joints)
-
-    linear_weights  = np.abs(linear_weights)
-    angular_weights = np.abs(angular_weights)
-    linear_weights  /= (linear_weights.sum()  + EPS)
-    angular_weights /= (angular_weights.sum() + EPS)
-
-    if len(difficulties) != num_joints:
-        logging.warning("difficulties length mismatch; padding / truncating")
-        difficulties = (difficulties + [1.0] * num_joints)[:num_joints]
-    difficulties = np.clip(difficulties, 0.1, 5.0)
-
-    # ---- 2. Use direct errors from environment (Change 1) --------------------
-    # If caller provided direct errors – use them
-    if position_error is None:
-        # fallback to old estimate
-        orientation_error_local = compute_quaternion_distance(
-            current_orientation, target_orientation)
-        position_error = max(0.0, (distance - 0.3 * orientation_error_local) / 0.7)
-    if orientation_error is None:
-        orientation_error = compute_quaternion_distance(
-            current_orientation, target_orientation)
-    
-    norm_distance     = np.clip(distance  / begin_distance, 0.0, 5.0)
-    norm_orientation  = np.clip(orientation_error / np.pi, 0.0, 1.0)
-    norm_position     = np.clip(position_error / (begin_distance * 0.7), 0.0, 5.0)
-    episode_progress  = np.clip(episode_number / total_episodes, 0.1, 1.0)
-
-    # ---- 3. Per-agent tracking state (thread-safe per process) ----------------
-    if not hasattr(compute_reward, "_state") or \
-       len(compute_reward._state) != num_joints:
-        compute_reward._state = [{
-            "best_error": np.inf,
-            "prev_error": None,
-            "window": deque(maxlen=smoothing_window),
-            "success_count": 0,
-            "total_count": 0
-        } for _ in range(num_joints)]
-
-    if not hasattr(compute_reward, "_relax_position"):
-        compute_reward._relax_position = REWARD_CONSTANTS.get("POSITION_RELAX_INIT", 5.0)
-    if not hasattr(compute_reward, "_relax_orientation"):
-        compute_reward._relax_orientation = REWARD_CONSTANTS.get("ORIENTATION_RELAX_INIT", 3.0)
-    if not hasattr(compute_reward, "_success_history"):
-        compute_reward._success_history = deque(maxlen=int(REWARD_CONSTANTS.get("RELAX_WINDOW", 60)))
-
-    # ---- 4. Constants with late-phase amplifier (Change 2) -------------------
-    MAX_REWARD         = REWARD_CONSTANTS["MAX_REWARD"]
-    MIN_REWARD         = REWARD_CONSTANTS["MIN_REWARD"]
-    POSITION_SCALE     = REWARD_CONSTANTS["POSITION_SCALE"]
-    ORIENTATION_SCALE  = REWARD_CONSTANTS["ORIENTATION_SCALE"]
-    PERFORMANCE_SCALE  = REWARD_CONSTANTS["PERFORMANCE_SCALE"]
-    IMPROVEMENT_SCALE  = REWARD_CONSTANTS["IMPROVEMENT_SCALE"]
-    ERROR_PENALTY_SCALE= REWARD_CONSTANTS["ERROR_PENALTY_SCALE"]
-    SUCCESS_BONUS_BASE = REWARD_CONSTANTS["SUCCESS_BONUS_BASE"]   # FIXED: Reduced from 5.0 to 1.0 to match other components
-    STAY_REWARD_SCALE  = REWARD_CONSTANTS["STAY_REWARD_SCALE"]
-    STAY_THRESHOLD_RATIO = REWARD_CONSTANTS["STAY_THRESHOLD_RATIO"]
-
-    # FIXED: Balanced late-phase boost that scales both rewards AND penalties
-    # This prevents reward collapse by keeping the reward scale balanced
-    if episode_progress > 0.80:
-        late_gain = 1.0 + 0.3 * (episode_progress - 0.80)  # max 1.0 → 1.3 (reduced from 1.5)
-        MAX_REWARD *= late_gain
-        SUCCESS_BONUS_BASE *= late_gain
-        # CRITICAL: Also scale up MIN_REWARD to keep penalties proportional
-        MIN_REWARD = max(MIN_REWARD * late_gain, -3.0)  # Allow more negative but keep balanced
-
-    # ---- 5. Compute per-joint reward with improved success detection ----------
-    final_rewards         = np.zeros(num_joints, dtype=np.float32)
-    joint_specific_rewards = []
-    stay_rewards_list = []
+    # ---- 2. Compute rewards per joint ------------------------------------------
+    final_rewards = np.zeros(num_joints, dtype=np.float32)
     individual_successes = []
-
-    linear_weight_total = float(np.sum(linear_weights))
-    if not np.isfinite(linear_weight_total) or linear_weight_total <= EPS:
-        linear_weight_total = float(num_joints)
-    angular_weight_total = float(np.sum(angular_weights))
-    if not np.isfinite(angular_weight_total) or angular_weight_total <= EPS:
-        angular_weight_total = float(num_joints)
-    safe_position_threshold = max(position_threshold, EPS)
-    safe_orientation_threshold = max(orientation_threshold, EPS)
-    base_position_scale = max(safe_position_threshold, joint_threshold)
-    base_orientation_scale = max(safe_orientation_threshold, joint_threshold)
-
-    relax_min_factor = REWARD_CONSTANTS.get("RELAX_MIN_FACTOR", 1.2)
-    relax_position_factor = max(float(compute_reward._relax_position), relax_min_factor)
-    relax_orientation_factor = max(float(compute_reward._relax_orientation), relax_min_factor)
-    shaping_position_threshold = max(base_position_scale * relax_position_factor, safe_position_threshold)
-    shaping_orientation_threshold = max(base_orientation_scale * relax_orientation_factor, safe_orientation_threshold)
-
-    if np.isfinite(position_error) and position_error <= position_threshold:
-        position_alignment = 1.0
-    elif np.isfinite(position_error):
-        position_alignment = float(np.clip(position_threshold / (position_error + EPS), 0.0, 1.0))
-    else:
-        position_alignment = 0.0
-
-    if np.isfinite(orientation_error) and orientation_error <= orientation_threshold:
-        orientation_alignment = 1.0
-    elif np.isfinite(orientation_error):
-        orientation_alignment = float(np.clip(orientation_threshold / (orientation_error + EPS), 0.0, 1.0))
-    else:
-        orientation_alignment = 0.0
-
-    pose_alignment = max(0.0, min(position_alignment, orientation_alignment))
 
     for j in range(num_joints):
         err = joint_errors[j]
-        movement = abs(joint_movements[j])
-        diff = difficulties[j]
+        prev_err = _prev_joint_errors[j]
 
-        # --- track best & improvement
-        st = compute_reward._state[j]
-        st["window"].append(err)
-        st["total_count"] += 1
-        
-        if err < st["best_error"]:
-            st["best_error"] = err
-        prev_err = st.get("prev_error")
-        if prev_err is None or not np.isfinite(prev_err):
-            improvement = 0.0
-        else:
-            baseline = max(abs(prev_err), joint_threshold, EPS)
-            improvement = (prev_err - err) / baseline
-        improvement = np.clip(improvement, -1.0, 1.0)
+        # 1. IMPROVEMENT REWARD: Positive when error decreases
+        improvement = (prev_err - err) / max(prev_err, joint_threshold, EPS)
+        improvement = np.clip(improvement, -0.5, 1.0)  # Cap negative improvement
+        improvement_reward = IMPROVEMENT_SCALE * max(0, improvement)  # Only reward improvement
 
-        # --- SUCCESS DETECTION using all three thresholds ---
-        joint_error_success = err <= joint_threshold
-        position_success = position_error <= position_threshold
-        orientation_success = orientation_error <= orientation_threshold
+        # 2. SUCCESS BONUS: When joint error is under threshold
+        is_successful = err <= joint_threshold
+        individual_successes.append(is_successful)
+        success_bonus = SUCCESS_BONUS if is_successful else 0.0
 
-        # FIXED: Use only joint-specific error (removed global dependencies)
-        # This gives clearer credit assignment - each joint learns independently
-        is_joint_successful = joint_error_success
-        
-        if is_joint_successful:
-            st["success_count"] += 1
-        individual_successes.append(is_joint_successful)
+        # 3. SMALL STEP PENALTY: Encourage efficiency
+        step_penalty = STEP_PENALTY
 
-        # --- reward components ---
-        linear_share = linear_weights[j] / linear_weight_total
-        angular_share = angular_weights[j] / angular_weight_total
-        joint_position_error = position_error * linear_share
-        joint_orientation_error = orientation_error * angular_share
+        # Total reward for this joint
+        reward = improvement_reward + success_bonus + step_penalty
+        final_rewards[j] = np.clip(reward, MIN_REWARD, MAX_REWARD)
 
-        norm_joint_position = np.clip(joint_position_error / shaping_position_threshold, 0.0, 2.5)
-        norm_joint_orientation = np.clip(joint_orientation_error / shaping_orientation_threshold, 0.0, 2.5)
+    # 4. TEAM BONUS: Extra reward when ALL joints succeed
+    all_successful = all(individual_successes)
+    if all_successful:
+        final_rewards += TEAM_SUCCESS_BONUS / num_joints
 
-        pos_r  = POSITION_SCALE    * (1.05 - norm_joint_position)
-        ori_r  = ORIENTATION_SCALE * (1.05 - norm_joint_orientation)
-        pos_r  = np.clip(pos_r, -0.6, 0.8)
-        ori_r  = np.clip(ori_r, -0.4, 0.6)
+    # Update previous errors for next step
+    _prev_joint_errors = joint_errors.copy()
 
-        perf_r = PERFORMANCE_SCALE * (1.0 - np.clip(err / np.pi, 0.0, 1.0))
-        impr_r = IMPROVEMENT_SCALE * improvement * episode_progress
-        impr_r = np.clip(impr_r, -0.15, 0.15)
-
-        err_pen = -ERROR_PENALTY_SCALE * np.clip(err / np.pi, 0.0, 1.0)
-
-        # SUCCESS BONUS using joint_threshold
-        succ_bonus = 0.0
-        if is_joint_successful:
-            # Base success bonus
-            base_bonus = SUCCESS_BONUS_BASE * episode_progress
-            
-            # Precision bonus: the smaller the error relative to threshold, the bigger the bonus
-            precision_factor = max(0.1, (joint_threshold - err) / joint_threshold)
-            precision_bonus = base_bonus * precision_factor
-            
-            # Consistency bonus
-            recent_success_rate = st["success_count"] / max(st["total_count"], 1)
-            consistency_bonus = base_bonus * 0.5 * recent_success_rate
-
-            succ_bonus = base_bonus + precision_bonus + consistency_bonus
-            succ_bonus = np.clip(succ_bonus, 0.0, MAX_REWARD * 0.6)
-            succ_bonus *= pose_alignment
-
-        # FIXED: Extended exploration bonus with gradual decay
-        # Instead of cutting off at 30%, gradually reduce until 60%
-        if episode_progress < 0.6:
-            decay_factor = 1.0 - (episode_progress / 0.6)  # 1.0 → 0.0 over first 60%
-            expl_bonus = exploration_bonus * decay_factor
-        else:
-            expl_bonus = 0.0
-
-        time_pen = time_penalty * (linear_weights[j] + angular_weights[j])
-
-        # Staying reward encourages minimal motion after converging
-        # FIXED: Only require joint success, not full pose convergence
-        # This allows joints to get stay rewards independently
-        stay_reward = 0.0
-        if is_joint_successful:
-            stay_threshold = max(joint_threshold * STAY_THRESHOLD_RATIO, 1e-6)
-            stay_factor = np.clip(1.0 - (movement / stay_threshold), 0.0, 1.0)
-            stay_reward = STAY_REWARD_SCALE * stay_factor * pose_alignment
-
-        reward = (pos_r + ori_r + perf_r + impr_r +
-                  err_pen + succ_bonus + expl_bonus + time_pen + stay_reward)
-
-        # FIXED: Asymmetric difficulty scaling to avoid amplifying penalties
-        # Only apply difficulty scaling to positive rewards to prevent negative spiral
-        if reward > 0:
-            reward *= np.clip(diff, 0.85, 1.15)  # Gentle boost for harder problems
-        else:
-            reward *= np.clip(diff, 0.95, 1.05)  # Minimal penalty scaling
-        reward  = float(np.clip(reward, MIN_REWARD, MAX_REWARD))
-
-        final_rewards[j] = reward
-        stay_rewards_list.append(float(stay_reward))
-        st["prev_error"] = err
-
-    pose_penalty = 0.0
-    if np.isfinite(position_error) and position_error > position_threshold:
-        pos_overshoot = (position_error - position_threshold) / (position_threshold + EPS)
-        pose_penalty -= REWARD_CONSTANTS.get("POSITION_FAILURE_PENALTY", 0.0) * pos_overshoot
-    if np.isfinite(orientation_error) and orientation_error > orientation_threshold:
-        ori_overshoot = (orientation_error - orientation_threshold) / (orientation_threshold + EPS)
-        pose_penalty -= REWARD_CONSTANTS.get("ORIENTATION_FAILURE_PENALTY", 0.0) * ori_overshoot
-
-    if pose_penalty < 0.0:
-        penalty_cap = max(float(REWARD_CONSTANTS.get("POSE_PENALTY_CAP", 10.0)), 0.0)
-        pose_penalty = float(np.clip(pose_penalty, -penalty_cap, 0.0))
-        final_rewards = np.clip(
-            final_rewards + (pose_penalty / num_joints),
-            MIN_REWARD,
-            MAX_REWARD
-        )
-
-    # ---- 6. REBALANCED success detection: Progressive strictness ---------------------------
-    success_ratio = sum(individual_successes) / num_joints
-
-    # Progressive criteria: easier early (OR logic), stricter late (AND logic)
-    ramp = np.clip((episode_progress - 0.8) / 0.2, 0.0, 1.0)
-    strict_ratio = 0.35 + 0.15 * ramp  # 35% → 50% over training (was 40% → 50%)
-
-    # Early training (<80%): Need good joint ratio OR pose accuracy
-    # Late training (≥80%): Need both joint ratio AND pose accuracy
-    if episode_progress < 0.8:
-        success = (success_ratio >= strict_ratio
-                   or (position_error <= position_threshold
-                       and orientation_error <= orientation_threshold))
-    else:
-        # Late training: stricter requirements
-        success = (success_ratio >= strict_ratio
-                   and position_error <= position_threshold
-                   and orientation_error <= orientation_threshold)
-
-    # Log detailed success info occasionally
-    if episode_number % 50 == 0 and success:
-        logging.info(f"SUCCESS at episode {episode_number}:")
-        logging.info(f"  Joint success ratio: {success_ratio:.3f} (threshold: {strict_ratio:.3f})")
-        logging.info(f"  Position error: {position_error:.4f} (threshold: {position_threshold:.4f})")
-        logging.info(f"  Orientation error: {orientation_error:.4f} (threshold: {orientation_threshold:.4f})")
-        logging.info(f"  Mean joint error: {np.mean(joint_errors):.4f} (threshold: {joint_threshold:.4f})")
-
+    # Update best distance
     new_best = min(prev_best, distance)
 
-    # ---- 6a. Update relaxation schedule based on achieved success -------------
-    hist = compute_reward._success_history
-    if hist is not None:
-        hist.append(success_ratio)
-    relax_target = REWARD_CONSTANTS.get("RELAX_TARGET_SUCCESS", 0.2)
-    relax_min_factor = REWARD_CONSTANTS.get("RELAX_MIN_FACTOR", 1.2)
-    relax_decay = REWARD_CONSTANTS.get("RELAX_DECAY", 0.9)
-    relax_eval_min_count = int(REWARD_CONSTANTS.get("RELAX_EVAL_MIN_COUNT", 30))
+    # Overall success: all joints under threshold
+    success = all_successful
 
-    # Evaluate once enough data collected and only tighten when performance warrants it
-    if hist is not None and len(hist) >= relax_eval_min_count:
-        avg_success = float(sum(hist) / len(hist))
-        if avg_success >= relax_target:
-            compute_reward._relax_position = max(
-                relax_min_factor, compute_reward._relax_position * relax_decay)
-            compute_reward._relax_orientation = max(
-                relax_min_factor, compute_reward._relax_orientation * relax_decay)
-            hist.clear()
-
-    # ---- 6b. Cooperative team bonus --------------------------------------------------------
-    TEAM_BONUS_SCALE = REWARD_CONSTANTS.get("TEAM_BONUS_SCALE", 0.0)
-    team_alignment_min = REWARD_CONSTANTS.get("TEAM_ALIGNMENT_MIN", 0.0)
-    if TEAM_BONUS_SCALE and success_ratio > 0.0 and pose_alignment >= team_alignment_min:
-        # FIXED: Keep team bonus constant instead of decreasing
-        # This prevents reward collapse by maintaining cooperative incentives
-        coop_scale = TEAM_BONUS_SCALE * 1.2  # Constant, was (1.2 - 0.2 * episode_progress)
-        cooperative_total = coop_scale * success_ratio * pose_alignment
-        successful_count = sum(individual_successes)
-
-        shared_component = cooperative_total * 0.35
-        targeted_component = cooperative_total - shared_component
-
-        if shared_component > 0.0:
-            shared_bonus = shared_component / num_joints
-            final_rewards = np.clip(final_rewards + shared_bonus, MIN_REWARD, MAX_REWARD)
-
-        if targeted_component > 0.0 and successful_count > 0:
-            per_joint_bonus = targeted_component / successful_count
-            for idx, succeeded in enumerate(individual_successes):
-                if succeeded:
-                    final_rewards[idx] = float(np.clip(final_rewards[idx] + per_joint_bonus, MIN_REWARD, MAX_REWARD))
-
-        joint_specific_rewards = final_rewards.tolist()
-
-    # ---- 7. Optional variance normalisation ------------------------------------
-    if final_rewards.std() > 4.0:
-        mu, sigma = final_rewards.mean(), final_rewards.std() + EPS
-        final_rewards = np.clip((final_rewards - mu) / sigma,
-                                MIN_REWARD, MAX_REWARD)
-        joint_specific_rewards = final_rewards.tolist()
-    else:
-        joint_specific_rewards = final_rewards.tolist()
+    # Return format: (rewards, joint_rewards_list, new_best, success, stay_rewards)
+    joint_specific_rewards = final_rewards.tolist()
+    stay_rewards_list = [0.0] * num_joints  # Not used in simplified version
 
     return final_rewards, joint_specific_rewards, new_best, success, stay_rewards_list
 
