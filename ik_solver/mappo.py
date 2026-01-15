@@ -6,9 +6,9 @@ import torch.optim as optim
 import torch.nn.functional as F  # Import functional module for ELU and other activations
 import numpy as np
 import logging
-import matplotlib.pyplot as plt 
 import matplotlib
-matplotlib.use('TkAgg')
+matplotlib.use('Agg')  # Use headless backend (works on Colab and servers)
+import matplotlib.pyplot as plt
 from .tester import MAPPOAgentTester
 import seaborn as sns
 from config import config
