@@ -8,6 +8,21 @@ from typing import Dict, List
 import json
 
 
+def convert_to_serializable(obj):
+    """Convert NumPy types to native Python types for JSON serialization."""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (np.float32, np.float64, np.floating)):
+        return float(obj)
+    elif isinstance(obj, (np.int32, np.int64, np.integer)):
+        return int(obj)
+    elif isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_to_serializable(item) for item in obj]
+    return obj
+
+
 class MAPPOAgentTester:
     def __init__(self, agent, env, base_path="test_results"):
         self.agent = agent
@@ -252,16 +267,16 @@ class MAPPOAgentTester:
     def save_metrics(self):
         """Save metrics (including overall success rate) to a JSON file."""
         metrics_file = self.base_path / "test_metrics.json"
-        
+
         # We need to convert nested defaultdicts to normal dicts
-        # for JSON serialization
+        # and convert NumPy types to native Python types for JSON serialization
         serializable_metrics = {}
         for k, v in self.metrics.items():
             if k == 'joint_errors':
                 # Convert nested defaultdict to normal dict
-                serializable_metrics[k] = {joint_id: errs for joint_id, errs in v.items()}
+                serializable_metrics[k] = {joint_id: convert_to_serializable(errs) for joint_id, errs in v.items()}
             else:
-                serializable_metrics[k] = v
+                serializable_metrics[k] = convert_to_serializable(v)
 
         with open(metrics_file, "w") as f:
             json.dump(serializable_metrics, f, indent=2)
