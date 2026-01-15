@@ -13,13 +13,13 @@ config = {
     'gamma': 0.99,                         # Discount factor for rewards
     'tau': 0.95,                           # GAE parameter for advantage estimation
     'clip_param': 0.15,                    # Global default PPO clip parameter (reduced from 0.2)
-    'ppo_epochs': 3,                       # TUNED: Reduced from 5 to soften per-update drift
-    'batch_size': 128,                     # TUNED: Larger batches for steadier gradients
+    'ppo_epochs': 5,                       # IMPROVED: Increased from 3 for better learning
+    'batch_size': 256,                     # IMPROVED: Larger batches for more stable gradients
     'buffer_size': 4096,                   # Size of the replay buffer
-    'initial_epsilon': 0.40,               # FIXED: Increased from 0.30 for better early exploration
-    'epsilon_decay': 0.999,                # FIXED: Much slower decay from 0.998 - maintain exploration longer!
-    'min_epsilon': 0.10,                   # FIXED: Increased from 0.05 to maintain exploration
-    'num_episodes': 100,                  # FIXED: Increased from 500 - agents need more time to learn!
+    'initial_epsilon': 0.50,               # IMPROVED: Increased from 0.40 for better exploration
+    'epsilon_decay': 0.998,                # IMPROVED: Slower decay for longer exploration
+    'min_epsilon': 0.15,                   # IMPROVED: Increased from 0.10 to maintain exploration
+    'num_episodes': 500,                   # IMPROVED: Increased from 100 - agents need more time to learn!
     'max_steps_per_episode':100,           # OPTIMIZED: Reduced from 500 for faster episodes
     'enable_anomaly_detection': False,     # Enable PyTorch anomaly detection during debugging
     'jacobian_update_tolerance': 1e-3,     # Angle change threshold before recomputing Jacobians

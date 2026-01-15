@@ -20,10 +20,10 @@ REWARD_CONSTANTS = {
     "PERFORMANCE_SCALE": 0.3,
     "IMPROVEMENT_SCALE": 0.5,
     "ERROR_PENALTY_SCALE": 0.5,
-    "SUCCESS_BONUS_BASE": 2.5,  # REBALANCED: Increased from 1.0 (too weak) to 2.5 (strong signal without dominating)
-    "STAY_REWARD_SCALE": 0.4,    # New: reward for holding a stable pose
+    "SUCCESS_BONUS_BASE": 4.0,  # IMPROVED: Increased from 2.5 for stronger success signal
+    "STAY_REWARD_SCALE": 0.6,    # IMPROVED: Increased from 0.4 for better convergence
     "STAY_THRESHOLD_RATIO": 0.5, # Movement ratio vs joint_threshold for full staying bonus
-    "TEAM_BONUS_SCALE": 3.0,     # Cooperative bonus shared across joints
+    "TEAM_BONUS_SCALE": 5.0,     # IMPROVED: Increased from 3.0 for better cooperation
     "TEAM_ALIGNMENT_MIN": 0.5,   # Require reasonable pose alignment before granting team bonuses
     "POSITION_FAILURE_PENALTY": 2.0,
     "ORIENTATION_FAILURE_PENALTY": 3.0,

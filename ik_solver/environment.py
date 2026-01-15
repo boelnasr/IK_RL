@@ -44,18 +44,20 @@ class InverseKinematicsEnv(gym.Env):
             self.max_episode_steps = 100
 
         logging.info(f"Environment initialized: max_episode_steps={self.max_episode_steps}")
-        # Define success thresholds for joint/orientation errors (~0.01 rad)
-        self.min_success_threshold = config.get('min_success_threshold', 0.01)
-        self.max_success_threshold = config.get('max_success_threshold', 0.01)
+        # IMPROVED: Progressive threshold decay - start relaxed, end precise
+        # This allows early exploration and gradually increases precision requirement
+        self.max_success_threshold = config.get('max_success_threshold', 0.05)  # Start relaxed
+        self.min_success_threshold = config.get('min_success_threshold', 0.005)  # End precise
 
-        # Initialize to target precision (used for joint/orientation checks)
-        self.success_threshold = self.min_success_threshold
+        # Initialize to relaxed threshold (will decay over training)
+        self.success_threshold = self.max_success_threshold
         self.curriculum_manager = CurriculumManager(
-            initial_difficulty=1.0,             # Start at neutral difficulty
+            initial_difficulty=0.5,             # IMPROVED: Start easier (was 1.0)
             max_difficulty=2.0,                 # Reasonable ceiling
-            success_threshold=0.35,             # REBALANCED: Lower to 35% (was 55%) for achievable progression
+            min_difficulty=0.3,                 # IMPROVED: Lower floor for struggling agents
+            success_threshold=0.25,             # IMPROVED: Easier progression (was 0.35)
             window_size=100,                    # Long window for stable estimates
-            difficulty_increment=0.03           # Gentle increments
+            difficulty_increment=0.02           # IMPROVED: Slower increments (was 0.03)
         )
         # PyBullet setup
         self.physics_client = p.connect(p.DIRECT)  # Use p.DIRECT for headless simulation
@@ -197,11 +199,11 @@ class InverseKinematicsEnv(gym.Env):
         ep = 0                           0.9·total_episodes                  total
         succ_thresh = max  ────────────────▶  min  ──────────────────────────▶ min
         """
-        # Maintain joint/orientation threshold (min==max keeps this constant around 0.01)
-        progress = min(1.0, self.episode_number / (self.total_episodes * 0.8))
+        # IMPROVED: Decay threshold from max (relaxed) to min (precise) over 90% of training
+        progress = min(1.0, self.episode_number / (self.total_episodes * 0.9))
         self.success_threshold = (
-            self.min_success_threshold * (1.0 - progress) +
-            self.max_success_threshold * progress
+            self.max_success_threshold * (1.0 - progress) +
+            self.min_success_threshold * progress
         )
 
         return self.success_threshold
