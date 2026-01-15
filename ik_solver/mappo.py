@@ -1367,13 +1367,64 @@ class MAPPOAgent:
             total_reward = sum(episode_rewards)
             avg_error = np.mean(total_joint_errors_final)
             success_count = sum(1 for s in success_status if s)
+
+            # Update curriculum threshold based on success
+            self.env.update_success_threshold(overall_success)
+
+            # Track metrics for diagnostics
+            if not hasattr(self, 'training_history'):
+                self.training_history = {
+                    'rewards': [], 'errors': [], 'successes': [],
+                    'actor_losses': [], 'critic_losses': []
+                }
+            self.training_history['rewards'].append(total_reward)
+            self.training_history['errors'].append(avg_error)
+            self.training_history['successes'].append(1 if overall_success else 0)
+            self.training_history['actor_losses'].append(float(actor_loss))
+            self.training_history['critic_losses'].append(float(critic_loss))
+
             print(f"Episode {episode}/{self.num_episodes} | "
                   f"Reward: {total_reward:.2f} | "
-                  f"Avg Error: {avg_error:.4f} | "
+                  f"Avg Error: {avg_error*1000:.2f}mm | "
                   f"Success: {success_count}/{self.num_agents} joints | "
-                  f"Overall: {'✓' if overall_success else '✗'} | "
+                  f"Overall: {'Y' if overall_success else 'N'} | "
                   f"Steps: {step} | "
-                  f"Threshold: {self.env.success_threshold:.4f}")
+                  f"Threshold: {self.env.success_threshold*1000:.2f}mm")
+
+            # Learning diagnostics every 50 episodes
+            if (episode + 1) % 50 == 0 and episode > 0:
+                recent_rewards = self.training_history['rewards'][-50:]
+                recent_errors = self.training_history['errors'][-50:]
+                recent_successes = self.training_history['successes'][-50:]
+                recent_actor_loss = self.training_history['actor_losses'][-50:]
+                recent_critic_loss = self.training_history['critic_losses'][-50:]
+
+                prev_rewards = self.training_history['rewards'][-100:-50] if episode >= 100 else []
+                prev_errors = self.training_history['errors'][-100:-50] if episode >= 100 else []
+
+                reward_trend = np.mean(recent_rewards) - np.mean(prev_rewards) if prev_rewards else 0
+                error_trend = np.mean(prev_errors) - np.mean(recent_errors) if prev_errors else 0
+
+                print(f"\n{'='*70}")
+                print(f"LEARNING DIAGNOSTICS (Episode {episode+1})")
+                print(f"{'='*70}")
+                print(f"  Recent 50 episodes:")
+                print(f"    Avg Reward:      {np.mean(recent_rewards):.2f} (trend: {'+' if reward_trend > 0 else ''}{reward_trend:.2f})")
+                print(f"    Avg Error:       {np.mean(recent_errors)*1000:.2f}mm (trend: {'+' if error_trend > 0 else ''}{error_trend*1000:.2f}mm)")
+                print(f"    Success Rate:    {np.mean(recent_successes)*100:.1f}%")
+                print(f"    Avg Actor Loss:  {np.mean(recent_actor_loss):.4f}")
+                print(f"    Avg Critic Loss: {np.mean(recent_critic_loss):.4f}")
+                print(f"  Current threshold: {self.env.success_threshold*1000:.2f}mm")
+
+                # Learning health check
+                if len(prev_rewards) > 0:
+                    if reward_trend > 0:
+                        print(f"  Status: LEARNING (rewards improving)")
+                    elif error_trend > 0:
+                        print(f"  Status: LEARNING (errors decreasing)")
+                    else:
+                        print(f"  Status: STALLED (no improvement - consider adjusting hyperparameters)")
+                print(f"{'='*70}\n")
 
             # Log comprehensive episode data
             self.training_metrics.log_episode(

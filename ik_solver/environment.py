@@ -44,12 +44,20 @@ class InverseKinematicsEnv(gym.Env):
             self.max_episode_steps = 100
 
         logging.info(f"Environment initialized: max_episode_steps={self.max_episode_steps}")
-        # FIXED: Use constant threshold of 0.01 (no decay)
-        self.max_success_threshold = config.get('max_success_threshold', 0.01)
-        self.min_success_threshold = config.get('min_success_threshold', 0.01)
+        # CURRICULUM: Success-based threshold decay
+        # Start easy (5mm), only tighten when agent achieves >50% success
+        self.max_success_threshold = config.get('max_success_threshold', 0.005)  # 5mm start
+        self.min_success_threshold = config.get('min_success_threshold', 0.0005)  # 0.5mm target
+        self.success_threshold = self.max_success_threshold  # Start at easiest
 
-        # Fixed threshold (no decay)
-        self.success_threshold = 0.01
+        # Success tracking for curriculum
+        self.success_history = []  # Rolling window of successes
+        self.success_window_size = 50  # Episodes to average over
+        self.threshold_decay_rate = 0.95  # How much to tighten (multiply threshold by this)
+        self.min_success_rate_to_decay = 0.5  # Require 50% success before tightening
+        self.episodes_since_last_decay = 0
+        self.decay_cooldown = 20  # Minimum episodes between threshold changes
+
         self.curriculum_manager = CurriculumManager(
             initial_difficulty=0.5,             # IMPROVED: Start easier (was 1.0)
             max_difficulty=2.0,                 # Reasonable ceiling
@@ -188,7 +196,7 @@ class InverseKinematicsEnv(gym.Env):
 
 
 
-    def update_success_threshold(self):
+    def update_success_threshold(self, episode_success: bool = False):
         """
         Linearly decays the success-, position- and orientation-thresholds from
         `max_*_threshold` to `min_*_threshold` across roughly the first 90 % of the
@@ -198,12 +206,35 @@ class InverseKinematicsEnv(gym.Env):
         ep = 0                           0.9·total_episodes                  total
         succ_thresh = max  ────────────────▶  min  ──────────────────────────▶ min
         """
-        # IMPROVED: Decay threshold from max (relaxed) to min (precise) over 90% of training
-        progress = min(1.0, self.episode_number / (self.total_episodes * 0.9))
-        self.success_threshold = (
-            self.max_success_threshold * (1.0 - progress) +
-            self.min_success_threshold * progress
-        )
+        # Track success in rolling window
+        self.success_history.append(1 if episode_success else 0)
+        if len(self.success_history) > self.success_window_size:
+            self.success_history.pop(0)
+
+        self.episodes_since_last_decay += 1
+
+        # Calculate current success rate
+        if len(self.success_history) >= 10:  # Need minimum samples
+            success_rate = sum(self.success_history) / len(self.success_history)
+
+            # Only decay if success rate is high enough AND cooldown passed
+            if (success_rate >= self.min_success_rate_to_decay and
+                self.episodes_since_last_decay >= self.decay_cooldown and
+                self.success_threshold > self.min_success_threshold):
+
+                old_threshold = self.success_threshold
+                self.success_threshold = max(
+                    self.success_threshold * self.threshold_decay_rate,
+                    self.min_success_threshold
+                )
+                self.episodes_since_last_decay = 0
+                self.success_history = []  # Reset history after decay
+
+                print(f"\n{'='*60}")
+                print(f"CURRICULUM: Threshold tightened!")
+                print(f"   Success rate: {success_rate*100:.1f}% (>{self.min_success_rate_to_decay*100:.0f}% required)")
+                print(f"   Threshold: {old_threshold*1000:.2f}mm -> {self.success_threshold*1000:.2f}mm")
+                print(f"{'='*60}\n")
 
         return self.success_threshold
 
