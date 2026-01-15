@@ -1355,12 +1355,25 @@ class MAPPOAgent:
             success_status = info.get('success_per_joint', [False] * self.num_agents)
             episode_rewards = [np.sum(r) for r in total_rewards]
             total_joint_errors_final = info.get('joint_errors', [0.0] * self.num_agents)
-            
+
             # Calculate average difficulties for the episode
             mean_difficulties = [
                 float(np.mean(difficulties_history[i])) if difficulties_history[i] else 0.0
                 for i in range(self.num_agents)
             ]
+
+            # Print episode results
+            overall_success = all(success_status) if success_status else False
+            total_reward = sum(episode_rewards)
+            avg_error = np.mean(total_joint_errors_final)
+            success_count = sum(1 for s in success_status if s)
+            print(f"Episode {episode}/{num_episodes} | "
+                  f"Reward: {total_reward:.2f} | "
+                  f"Avg Error: {avg_error:.4f} | "
+                  f"Success: {success_count}/{self.num_agents} joints | "
+                  f"Overall: {'✓' if overall_success else '✗'} | "
+                  f"Steps: {step} | "
+                  f"Threshold: {self.env.success_threshold:.4f}")
 
             # Log comprehensive episode data
             self.training_metrics.log_episode(
