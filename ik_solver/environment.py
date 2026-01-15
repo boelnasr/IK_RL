@@ -44,13 +44,12 @@ class InverseKinematicsEnv(gym.Env):
             self.max_episode_steps = 100
 
         logging.info(f"Environment initialized: max_episode_steps={self.max_episode_steps}")
-        # IMPROVED: Progressive threshold decay - start relaxed, end precise
-        # This allows early exploration and gradually increases precision requirement
-        self.max_success_threshold = config.get('max_success_threshold', 0.05)  # Start relaxed
-        self.min_success_threshold = config.get('min_success_threshold', 0.005)  # End precise
+        # FIXED: Use constant threshold of 0.01 (no decay)
+        self.max_success_threshold = config.get('max_success_threshold', 0.01)
+        self.min_success_threshold = config.get('min_success_threshold', 0.01)
 
-        # Initialize to relaxed threshold (will decay over training)
-        self.success_threshold = self.max_success_threshold
+        # Fixed threshold (no decay)
+        self.success_threshold = 0.01
         self.curriculum_manager = CurriculumManager(
             initial_difficulty=0.5,             # IMPROVED: Start easier (was 1.0)
             max_difficulty=2.0,                 # Reasonable ceiling

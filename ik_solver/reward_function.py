@@ -43,7 +43,7 @@ REWARD_DEFAULT_ARGUMENTS = {
     "orientation_threshold": 0.01,  # TIGHTENED: 0.1 → 0.01 rad (5.73° → 0.57°)
     "joint_threshold": 0.01,         # TIGHTENED: 0.05 → 0.01 rad (2.86° → 0.57°)
     "ratio_threshold": 0.5,
-    "time_penalty": -0.001,
+    "time_penalty": -0.0001,  # REDUCED: From -0.001 to reduce penalty for longer episodes
     "smoothing_window": 10,
     "exploration_bonus": 0.02,
 }
