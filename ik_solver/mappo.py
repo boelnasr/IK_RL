@@ -1367,7 +1367,7 @@ class MAPPOAgent:
             total_reward = sum(episode_rewards)
             avg_error = np.mean(total_joint_errors_final)
             success_count = sum(1 for s in success_status if s)
-            print(f"Episode {episode}/{num_episodes} | "
+            print(f"Episode {episode}/{self.num_episodes} | "
                   f"Reward: {total_reward:.2f} | "
                   f"Avg Error: {avg_error:.4f} | "
                   f"Success: {success_count}/{self.num_agents} joints | "
