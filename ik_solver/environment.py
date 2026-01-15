@@ -45,9 +45,10 @@ class InverseKinematicsEnv(gym.Env):
 
         logging.info(f"Environment initialized: max_episode_steps={self.max_episode_steps}")
         # CURRICULUM: Success-based threshold decay
-        # Start easy (5mm), only tighten when agent achieves >50% success
-        self.max_success_threshold = config.get('max_success_threshold', 0.005)  # 5mm start
-        self.min_success_threshold = config.get('min_success_threshold', 0.0005)  # 0.5mm target
+        # FIXED: Start at 100mm (0.1m) which is achievable given initial errors of 40-80mm
+        # Only tighten when agent achieves >50% success
+        self.max_success_threshold = config.get('max_success_threshold', 0.1)  # 100mm start (was 5mm - too tight!)
+        self.min_success_threshold = config.get('min_success_threshold', 0.005)  # 5mm target
         self.success_threshold = self.max_success_threshold  # Start at easiest
 
         # Success tracking for curriculum
