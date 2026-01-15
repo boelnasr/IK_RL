@@ -257,21 +257,25 @@ class MAPPOAgent:
 
         
     
-        # Normalize rewards
+        # MAPPO FIX: Normalize rewards per-agent instead of globally
+        # This preserves each agent's individual reward distribution
         rewards_tensor = torch.stack(rewards, dim=1).to(torch.float32)
         # Clamp rewards before normalization
         rewards_clamped = torch.clamp(rewards_tensor, min=-10.0, max=10.0)
 
-        # Check for very small standard deviation to avoid division by zero
-        if rewards_clamped.std() < 1e-6:
-            rewards_normalized = rewards_clamped - rewards_clamped.mean()
-        else:
-            rewards_normalized = (rewards_clamped - rewards_clamped.mean()) / (rewards_clamped.std() + 1e-8)
+        # Per-agent normalization (dim=0 is timesteps, so normalize along time for each agent)
+        rewards_mean = rewards_clamped.mean(dim=0, keepdim=True)
+        rewards_std = rewards_clamped.std(dim=0, keepdim=True)
+        # Avoid division by zero per-agent
+        rewards_std = torch.where(rewards_std < 1e-6, torch.ones_like(rewards_std), rewards_std)
+        rewards_normalized = (rewards_clamped - rewards_mean) / rewards_std
 
-        mean_rewards = rewards_normalized.mean(dim=1, keepdim=True).expand(min_length, self.num_agents)
+        # MAPPO FIX: Use individual agent rewards instead of averaging across agents
+        # This preserves per-agent credit assignment which is essential for MAPPO
+        # rewards_normalized shape: [batch_size, num_agents] - each agent gets its own reward signal
 
-        # Compute GAE and returns
-        advantages, returns = self.compute_individual_gae(mean_rewards, dones, values)
+        # Compute GAE and returns using individual agent rewards
+        advantages, returns = self.compute_individual_gae(rewards_normalized, dones, values)
         advantages = advantages.transpose(0, 1).to(torch.float32)
         returns = returns.transpose(0, 1).to(torch.float32)
 
@@ -409,21 +413,28 @@ class MAPPOAgent:
         """
         Computes GAE (Generalized Advantage Estimation) individually for each agent.
 
+        MAPPO-compliant: Each agent's advantages are computed and normalized independently,
+        preserving individual credit assignment.
+
         Args:
             rewards (tensor): [batch_size, num_agents] reward tensor for all agents.
             dones (tensor): [batch_size] done flags for each timestep.
             values (tensor): [batch_size, num_agents] value predictions from critic.
         """
         advantages, returns = [], []
-        rewards = (rewards - rewards.mean(dim=0, keepdim=True)) / (rewards.std(dim=0, keepdim=True) + 1e-8)  # Normalize rewards
-        
+
+        # MAPPO FIX: Normalize rewards per-agent (along time dimension) to preserve individual signals
+        rewards_std = rewards.std(dim=0, keepdim=True)
+        rewards_std = torch.where(rewards_std < 1e-8, torch.ones_like(rewards_std), rewards_std)
+        rewards = (rewards - rewards.mean(dim=0, keepdim=True)) / rewards_std
+
         for agent_idx in range(self.num_agents):
             agent_rewards = rewards[:, agent_idx]
             agent_values = values[:, agent_idx]
-            agent_values = torch.tensor(
-                np.convolve(agent_values.cpu().numpy(), np.ones(3)/3, mode='same'), device=self.device
-            )  # Smooth critic values
-            
+
+            # MAPPO FIX: Removed value smoothing - use raw critic values
+            # Smoothing blurs temporal credit assignment and is non-standard in MAPPO
+
             gae = 0
             agent_advantages, agent_returns = [], []
             next_value = 0
@@ -441,12 +452,20 @@ class MAPPOAgent:
                 next_value = agent_values[step]
 
             agent_advantages = torch.tensor(agent_advantages, device=self.device)
+
+            # MAPPO FIX: Normalize advantages per-agent instead of globally
+            # This preserves relative advantage signals for each agent independently
+            adv_std = agent_advantages.std()
+            if adv_std > 1e-8:
+                agent_advantages = (agent_advantages - agent_advantages.mean()) / adv_std
+            else:
+                agent_advantages = agent_advantages - agent_advantages.mean()
+
             advantages.append(agent_advantages)
             returns.append(torch.tensor(agent_returns, device=self.device))
 
-        # Stack advantages and normalize
+        # Stack advantages - already normalized per-agent above
         advantages = torch.stack(advantages)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # Normalize advantages
 
         return advantages, torch.stack(returns)
 

@@ -333,11 +333,14 @@ class MAPPOAgent:
                 values = self.critic(states_cat).float()
                 values = torch.clamp(values, -50.0, 50.0)
 
-            # Process rewards
+            # MAPPO FIX: Normalize rewards per-agent instead of globally
+            # This preserves each agent's individual reward distribution
             rewards_tensor = torch.stack(rewards, dim=1).float()
             rewards_clamped = torch.clamp(rewards_tensor, min=-10.0, max=10.0)
-            rewards_mean = rewards_clamped.mean()
-            rewards_std = max(rewards_clamped.std(), 1e-6)
+            # Per-agent normalization (dim=0 is timesteps, normalize along time for each agent)
+            rewards_mean = rewards_clamped.mean(dim=0, keepdim=True)
+            rewards_std = rewards_clamped.std(dim=0, keepdim=True)
+            rewards_std = torch.where(rewards_std < 1e-6, torch.ones_like(rewards_std), rewards_std)
             rewards_normalized = (rewards_clamped - rewards_mean) / rewards_std
 
             # Compute advantages and returns
@@ -622,23 +625,24 @@ class MAPPOAgent:
 
     def compute_individual_gae(self, rewards, dones, values):
         """
-        Fixed GAE computation that prevents high critic losses.
+        MAPPO-compliant GAE computation with per-agent advantage normalization.
+        Each agent's advantages are computed and normalized independently.
         """
         batch_size = rewards.shape[0]
         num_agents = rewards.shape[1]
-        
+
         # Pre-allocate tensors
         advantages = torch.zeros(num_agents, batch_size, device=self.device)
         returns = torch.zeros(num_agents, batch_size, device=self.device)
-        
+
         # Scale rewards to reasonable range (do this BEFORE GAE)
         reward_scale = 0.01  # Adjust based on your reward magnitudes
         scaled_rewards = rewards * reward_scale
-        
+
         for agent_idx in range(num_agents):
             agent_rewards = scaled_rewards[:, agent_idx]
             agent_values = values[:, agent_idx]
-            
+
             # Bootstrap from last value
             if dones[-1]:
                 next_value = 0
@@ -646,32 +650,36 @@ class MAPPOAgent:
             else:
                 next_value = agent_values[-1].item()
                 next_gae = 0
-            
+
             # Compute GAE backwards
             for t in reversed(range(batch_size)):
                 if t == batch_size - 1:
                     next_value = 0 if dones[t] else agent_values[t].item()
                 else:
                     next_value = agent_values[t + 1].item()
-                
+
                 # Temporal difference error
                 td_error = agent_rewards[t] + self.gamma * next_value * (1 - dones[t]) - agent_values[t]
-                
+
                 # GAE
                 advantages[agent_idx, t] = td_error + self.gamma * self.tau * (1 - dones[t]) * next_gae
                 next_gae = advantages[agent_idx, t].item()
-                
+
                 # Monte Carlo return (target for value function)
                 returns[agent_idx, t] = agent_rewards[t] + self.gamma * next_value * (1 - dones[t])
-        
-        # Normalize advantages for stable policy gradients
-        adv_mean = advantages.mean()
-        adv_std = advantages.std()
-        advantages = (advantages - adv_mean) / (adv_std + 1e-8)
-        
+
+            # MAPPO FIX: Normalize advantages per-agent instead of globally
+            # This preserves individual credit assignment for each agent
+            agent_adv = advantages[agent_idx]
+            adv_std = agent_adv.std()
+            if adv_std > 1e-8:
+                advantages[agent_idx] = (agent_adv - agent_adv.mean()) / adv_std
+            else:
+                advantages[agent_idx] = agent_adv - agent_adv.mean()
+
         # Clip returns to prevent extreme values
         returns = torch.clamp(returns, min=-10.0, max=10.0)
-        
+
         return advantages, returns
 
 
