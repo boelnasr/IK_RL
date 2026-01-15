@@ -133,17 +133,23 @@ class MAPPOAgent:
         processed_state_list = self._process_state(sample_state)
         global_state = torch.cat(processed_state_list).unsqueeze(0).to(self.device)
         state_dim = global_state.shape[1]
-        # Add PD controller initialization
-        self.pd_controllers = []
-        self.pd_weight = config.get('pd_weight', 0.3)
-    
-        # Initialize PD controllers for each joint
-        for _ in range(self.num_agents):
-            self.pd_controllers.append(PDController(
-                kp=config.get('pd_kp', 1.0),
-                kd=config.get('pd_kd', 0.2),
-                dt=config.get('pd_dt', 0.01)
-            ))
+        # PD controller initialization - DISABLED by default for pure RL training
+        self.use_pd_controller = config.get('use_pd_controller', False)
+        self.pd_weight = config.get('pd_weight', 0.0)  # Set to 0 when disabled
+
+        if self.use_pd_controller:
+            self.pd_controllers = []
+            self.pd_weight = config.get('pd_weight', 0.3)
+            for _ in range(self.num_agents):
+                self.pd_controllers.append(PDController(
+                    kp=config.get('pd_kp', 1.0),
+                    kd=config.get('pd_kd', 0.2),
+                    dt=config.get('pd_dt', 0.01)
+                ))
+            logging.info("PD Controllers initialized for eval mode")
+        else:
+            self.pd_controllers = None
+            logging.info("PD Controllers DISABLED - using pure RL learning")
         # Determine action_dim
         action_dim = self.num_agents  # Assuming one action per agent
 
@@ -546,27 +552,22 @@ class MAPPOAgent:
             # Extract scalar action value
             rl_action_value = float(rl_action.squeeze().cpu().item())
             
-            if eval_mode:
-                # Calculate PD correction
+            if eval_mode and self.use_pd_controller and self.pd_controllers is not None:
+                # Calculate PD correction (only in eval mode with PD enabled)
                 current_angle = state[agent_idx]['joint_angle'].flatten()[0]
                 target_angle = self.env.target_joint_angles[agent_idx] if hasattr(self.env, 'target_joint_angles') else 0.0
                 error = target_angle - current_angle
-                
+
                 pd_correction = self.pd_controllers[agent_idx].compute(error)
-                pd_correction = np.clip(pd_correction, -1, 1)
-                
-                # Ensure PD correction is in the same range as RL action
                 pd_correction = np.clip(pd_correction, -1, 1)
 
                 # Combine RL and PD actions
                 combined_action = (1 - self.pd_weight) * rl_action_value + self.pd_weight * pd_correction
                 combined_action = np.clip(combined_action, -1, 1)
                 actions.append(combined_action)
-
             else:
-                # During training, use RL action directly
-                action = rl_action_value
-                actions.append(action)
+                # During training (or eval without PD), use pure RL action
+                actions.append(rl_action_value)
             
             # Ensure log_prob is a single scalar
             log_probs.append(log_prob.item())
@@ -587,6 +588,10 @@ class MAPPOAgent:
         # 4. Add method to update PD parameters dynamically
     def update_pd_parameters(self, agent_idx=None, kp=None, kd=None, weight=None):
         """Update PD controller parameters during training."""
+        if not self.use_pd_controller or self.pd_controllers is None:
+            logging.warning("PD controllers are disabled, cannot update parameters")
+            return
+
         if agent_idx is not None:
             if kp is not None:
                 self.pd_controllers[agent_idx].kp = kp
@@ -599,7 +604,7 @@ class MAPPOAgent:
                     controller.kp = kp
                 if kd is not None:
                     controller.kd = kd
-        
+
         if weight is not None:
             self.pd_weight = weight
 
