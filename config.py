@@ -72,6 +72,11 @@ config = {
     'her_reward_type': 'dense',            # 'dense' or 'sparse'
     'her_success_threshold': 0.05,
 
+    # SUCCESS THRESHOLD CONFIGURATION (curriculum learning)
+    # CRITICAL: Start with achievable threshold, then tighten as agent improves
+    'max_success_threshold': 0.1,     # 100mm - START HERE (achievable with 40-80mm errors)
+    'min_success_threshold': 0.005,   # 5mm - TARGET (tighten as agent succeeds)
+
     # PD Controller - DISABLED for pure RL learning
     'use_pd_controller': False,            # DISABLED: Turn off PD controller
     'pd_weight': 0.0,                      # Set to 0 to disable PD blending

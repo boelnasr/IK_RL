@@ -200,14 +200,16 @@ def compute_overall_distance(current_position, target_position, current_orientat
 # --------------------------------------------------------------------------- #
 #  SIMPLIFIED compute_reward() - Clean, minimal, effective
 # --------------------------------------------------------------------------- #
-# Previous joint errors for computing improvement (stored per-episode)
-_prev_joint_errors = None
-_prev_episode_number = -1  # Track episode to reset state
+# Track INITIAL errors at episode start (not just previous step)
+_initial_joint_errors = None  # Errors at episode start
+_prev_joint_errors = None     # Errors at previous step
+_prev_episode_number = -1     # Track episode to reset state
 
 
 def reset_reward_state():
     """Reset reward function state at episode boundaries."""
-    global _prev_joint_errors, _prev_episode_number
+    global _initial_joint_errors, _prev_joint_errors, _prev_episode_number
+    _initial_joint_errors = None
     _prev_joint_errors = None
     _prev_episode_number = -1
 
@@ -248,7 +250,7 @@ def compute_reward(
     Returns:
         tuple: (final_rewards, joint_rewards, new_best_distance, success, stay_rewards)
     """
-    global _prev_joint_errors, _prev_episode_number
+    global _initial_joint_errors, _prev_joint_errors, _prev_episode_number
 
     # Get constants
     IMPROVEMENT_SCALE = REWARD_CONSTANTS.get("IMPROVEMENT_SCALE", 10.0)
@@ -269,11 +271,13 @@ def compute_reward(
 
     # CRITICAL FIX: Reset state at episode boundaries
     if episode_number != _prev_episode_number:
+        _initial_joint_errors = None
         _prev_joint_errors = None
         _prev_episode_number = episode_number
 
-    # Initialize previous errors if needed (first step of episode)
-    if _prev_joint_errors is None or len(_prev_joint_errors) != num_joints:
+    # Initialize INITIAL errors at episode start (this is the key fix!)
+    if _initial_joint_errors is None or len(_initial_joint_errors) != num_joints:
+        _initial_joint_errors = joint_errors.copy()
         _prev_joint_errors = joint_errors.copy()
 
     # ---- 2. Compute rewards per joint ------------------------------------------
@@ -282,35 +286,51 @@ def compute_reward(
 
     for j in range(num_joints):
         err = joint_errors[j]
+        initial_err = _initial_joint_errors[j]
         prev_err = _prev_joint_errors[j]
 
-        # 1. IMPROVEMENT REWARD: Reward improvement, PENALIZE regression
-        improvement = (prev_err - err) / max(prev_err, joint_threshold, EPS)
-        improvement = np.clip(improvement, -1.0, 1.0)
+        # 1. PROGRESS REWARD: Based on improvement from INITIAL error (not step-to-step!)
+        # This is the key fix - we measure progress from episode start
+        if initial_err > joint_threshold:
+            # How much of the initial error have we eliminated?
+            progress_ratio = (initial_err - err) / initial_err
+            progress_ratio = np.clip(progress_ratio, -1.0, 1.0)
 
-        if improvement > 0:
-            # Reward for getting closer
-            improvement_reward = IMPROVEMENT_SCALE * improvement
+            if progress_ratio > 0:
+                # Reward for progress from start
+                progress_reward = IMPROVEMENT_SCALE * progress_ratio
+            else:
+                # Penalty for being worse than start (scaled down)
+                progress_reward = IMPROVEMENT_SCALE * progress_ratio * 0.3
         else:
-            # PENALTY for getting worse (scaled down to avoid too harsh punishment)
-            improvement_reward = IMPROVEMENT_SCALE * improvement * 0.5
+            # Already started near target
+            progress_reward = 0.0
 
         # 2. SUCCESS BONUS: When joint error is under threshold
         is_successful = err <= joint_threshold
         individual_successes.append(is_successful)
         success_bonus = SUCCESS_BONUS if is_successful else 0.0
 
-        # 3. PROXIMITY BONUS: Reward being close to target (dense shaping)
-        # This provides gradient even when not improving step-to-step
-        proximity = np.exp(-err / max(joint_threshold * 10, EPS))  # Exponential proximity reward
-        proximity_bonus = proximity * 2.0  # Scale factor
+        # 3. PROXIMITY REWARD: Exponential reward for being close to target
+        # Use a reasonable scale (0.1 = 100mm) for the exponential decay
+        proximity = np.exp(-err / 0.1)  # Stronger gradient when close
+        proximity_reward = proximity * 3.0  # Scale factor
 
-        # 4. SMALL STEP PENALTY: Encourage efficiency
+        # 4. STEP-TO-STEP IMPROVEMENT: Small bonus for getting closer each step
+        # (This is secondary to progress reward, helps with local optimization)
+        step_improvement = (prev_err - err) / max(prev_err, joint_threshold)
+        step_improvement = np.clip(step_improvement, -0.5, 0.5)
+        step_reward = step_improvement * 2.0  # Small contribution
+
+        # 5. SMALL STEP PENALTY: Encourage efficiency
         step_penalty = STEP_PENALTY
 
         # Total reward for this joint
-        reward = improvement_reward + success_bonus + proximity_bonus + step_penalty
+        reward = progress_reward + success_bonus + proximity_reward + step_reward + step_penalty
         final_rewards[j] = np.clip(reward, MIN_REWARD, MAX_REWARD)
+
+    # Update previous errors for next step
+    _prev_joint_errors = joint_errors.copy()
 
     # 4. TEAM BONUS: Extra reward when ALL joints succeed
     all_successful = all(individual_successes)
